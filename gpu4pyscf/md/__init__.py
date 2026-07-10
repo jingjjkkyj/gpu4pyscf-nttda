@@ -15,3 +15,4 @@
 from .wigner_sampling import wigner_samples
 from .distributions import maxwell_boltzmann_velocities
 from .fssh_tddft import FSSH_TDDFT
+from .fssh_sftda import FSSH_SFTDA
