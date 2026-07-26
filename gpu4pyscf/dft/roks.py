@@ -41,8 +41,11 @@ class ROKS(rks.KohnShamDFT, ROHF):
         return uks.UKS.get_veff(self, mol, dm, dm_last, vhf_last, hermi)
 
     energy_elec = uks.UKS.energy_elec
-    nuc_grad_method = NotImplemented
     to_hf = NotImplemented
+
+    def Gradients(self):
+        from gpu4pyscf.grad import roks as roks_grad
+        return roks_grad.Gradients(self)
 
     to_gpu = utils.to_gpu
     device = utils.device

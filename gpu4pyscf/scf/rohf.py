@@ -99,7 +99,10 @@ class ROHF(hf.RHF):
     stability = NotImplemented
     mulliken_pop = NotImplemented
     mulliken_meta = NotImplemented
-    nuc_grad_method = NotImplemented
+
+    def Gradients(self):
+        from gpu4pyscf.grad import rohf
+        return rohf.Gradients(self)
 
     canonicalize = canonicalize
 
