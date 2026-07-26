@@ -1,0 +1,590 @@
+# Copyright 2021-2026 The PySCF Developers. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+'''Noncollinear-Tensor TDA (NTTDA) excitation energies on GPU.
+
+GPU port of pyscf.sftda.nttda for a high-spin ROKS reference.  This module
+currently implements the production ``deltaS = -1`` channel.  The vref0
+(spin-flip kernel) action reuses the stock gpu4pyscf ``nr_rks_fxc`` with an
+injected reference kernel; the GGA/MGGA vref1 action is evaluated directly
+in the MO blocks on the grid (batched GEMMs), which avoids the CPU-only
+sparse-AO primitives of the reference implementation.
+'''
+
+import numpy as np
+import cupy as cp
+from pyscf import lib
+from gpu4pyscf.lib import logger
+from gpu4pyscf.lib.cupy_helper import contract
+from gpu4pyscf.dft import numint as gpu_numint
+from gpu4pyscf.scf import jk as jk_mod
+from gpu4pyscf.tdscf._lr_eig import eigh as lr_eigh
+
+
+def _get_j_range_separated(mf, dms, hermi, omega):
+    '''Long-range (erf-kernel) Coulomb J.
+
+    RSH functionals only range-separate the exchange, so the stock GPU
+    J path silently ignores ``omega``; the NTTDA vref1 term needs the
+    genuine long-range J.  Reuses (or builds) the range-separated VHFOpt
+    stored under ``mf._opt_gpu[omega]`` -- the same object the omega
+    ``get_k`` path uses.
+    '''
+    mol = mf.mol
+    vhfopt = mf._opt_gpu.get(omega)
+    if vhfopt is None:
+        with mol.with_range_coulomb(omega):
+            vhfopt = mf._opt_gpu[omega] = jk_mod._VHFOpt(
+                mol, mf.direct_scf_tol, tile=1).build()
+    vj, _vk = jk_mod.get_jk(mol, dms, hermi, vhfopt,
+                            with_j=True, with_k=False)
+    return vj
+
+
+def _orbital_indices(mf):
+    mo_occ = cp.asarray(mf.mo_occ).get()
+    csidx = np.flatnonzero(mo_occ == 2)
+    osidx = np.flatnonzero(mo_occ == 1)
+    vsidx = np.flatnonzero(mo_occ == 0)
+    return csidx, osidx, vsidx
+
+
+def spin_flip_reference_fxc(mf):
+    '''``1/2 (f_aa - f_ab - f_ba + f_bb)`` on the (sorted) grid.
+
+    Passing the SPATIAL ROKS orbitals with the 0/1/2 occupancy reproduces
+    the CPU reference exactly: ``cache_xc_kernel`` takes its restricted
+    branch and, for ``spin=1``, evaluates the spin-resolved kernel at the
+    spin-averaged density ``(rho/2, rho/2)`` -- this is the NTTDA
+    convention, not the spin-polarized ROKS density.
+    '''
+    ni = mf._numint
+    mo = cp.asarray(mf.mo_coeff)
+    occ = cp.asarray(mf.mo_occ)
+    fxc = ni.cache_xc_kernel(mf.mol, mf.grids, mf.xc, mo, occ, 1)[2]
+    return 0.5 * (
+        fxc[0, :, 0] - fxc[0, :, 1] - fxc[1, :, 0] + fxc[1, :, 1]
+    )
+
+
+def _fxc1_gga_mo_wv(fxc, t, i):
+    nvec, ngrids = t.shape[0], t.shape[-1]
+    wv = cp.empty((nvec, 4, ngrids))
+    t00 = t[:, 0, 0]
+    if i == 0:
+        wv[:, 0] = cp.einsum('ijg,xijg->xg', fxc[:4, :4], t)
+        wv[:, 1:4] = fxc[0, 1:4][None] * t00[:, None]
+        wv[:, 1:4] += cp.einsum('ijg,xig->xjg', fxc[1:4, 1:4], t[:, 1:4, 0])
+    else:
+        wv[:, 0] = fxc[i, 0][None] * t00
+        wv[:, 0] += cp.einsum('jg,xjg->xg', fxc[i, 1:4], t[:, 0, 1:4])
+        wv[:, 1:4] = fxc[i, 1:4][None] * t00[:, None]
+    return wv
+
+
+def _fxc1_mgga_mo_wv(fxc, t, i):
+    nvec, ngrids = t.shape[0], t.shape[-1]
+    wv = cp.empty((nvec, 4, ngrids))
+    t00 = t[:, 0, 0]
+    if i == 0:
+        wv[:, 0] = cp.einsum('ijg,xijg->xg', fxc[:4, :4], t)
+        wv[:, 1:4] = fxc[0, 1:4][None] * t00[:, None]
+        wv[:, 1:4] += cp.einsum('ijg,xig->xjg', fxc[1:4, 1:4], t[:, 1:4, 0])
+        wv[:, 1:4] += 0.5 * fxc[0, 4][None, None] * t[:, 0, 1:4]
+        wv[:, 1:4] += 0.5 * cp.einsum('ig,xijg->xjg', fxc[1:4, 4],
+                                      t[:, 1:4, 1:4])
+    else:
+        wv[:, 0] = fxc[i, 0][None] * t00
+        wv[:, 0] += cp.einsum('jg,xjg->xg', fxc[i, 1:4], t[:, 0, 1:4])
+        wv[:, 0] += 0.5 * fxc[4, 0][None] * t[:, i, 0]
+        wv[:, 0] += 0.5 * cp.einsum('jg,xjg->xg', fxc[4, 1:4], t[:, i, 1:4])
+        wv[:, 1:4] = fxc[i, 1:4][None] * t00[:, None]
+        wv[:, 1:4] += 0.5 * fxc[i, 4][None, None] * t[:, 0, 1:4]
+        wv[:, 1:4] += 0.5 * fxc[4, 1:4][None] * t[:, i, 0][:, None]
+        wv[:, 1:4] += 0.25 * fxc[4, 4][None, None] * t[:, i, 1:4]
+    return wv
+
+
+def nr_rks_fxc1_mo(mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref):
+    '''Contract the fxc1 kernel directly in selected MO spaces (GPU).
+
+    ``in_blocks``: name -> (X (nvec, nleft, nright) cupy, left_key,
+    right_key); ``out_blocks``: name -> (left_key, right_key); ``terms``:
+    (input_name, output_name, coefficient).  Mirrors the CPU
+    ``_nr_rks_fxc1_mo`` with the gpu4pyscf sorted-AO block loop; only
+    GGA/MGGA reach this path.
+    '''
+    ni = mf._numint
+    mol = mf.mol
+    grids = mf.grids
+    xctype = ni._xc_type(mf.xc)
+    if xctype == 'GGA':
+        fill_wv = _fxc1_gga_mo_wv
+    elif xctype == 'MGGA':
+        fill_wv = _fxc1_mgga_mo_wv
+    else:
+        raise ValueError(f'MO-grid fxc1 only supports GGA/MGGA, got {xctype}')
+
+    opt = getattr(ni, 'gdftopt', None)
+    if opt is None:
+        ni.build(mol, grids.coords)
+        opt = ni.gdftopt
+    _sorted_mol = opt._sorted_mol
+    nao = _sorted_mol.nao
+
+    sorted_blocks = {
+        key: opt.sort_orbitals(cp.asarray(coeff), axis=[0])
+        for key, coeff in mo_blocks.items()
+    }
+    needed = set()
+    for _x, left_key, right_key in in_blocks.values():
+        needed.add(left_key)
+        needed.add(right_key)
+    for left_key, right_key in out_blocks.values():
+        needed.add(left_key)
+        needed.add(right_key)
+
+    nvec = next(iter(in_blocks.values()))[0].shape[0]
+    out = {
+        name: cp.zeros((
+            nvec,
+            mo_blocks[left_key].shape[1],
+            mo_blocks[right_key].shape[1],
+        ))
+        for name, (left_key, right_key) in out_blocks.items()
+    }
+    terms_by_input = {}
+    for in_name, out_name, coef in terms:
+        terms_by_input.setdefault(in_name, []).append((out_name, coef))
+
+    p1 = 0
+    for ao_mask, idx, weight, _coords in ni.block_loop(
+            _sorted_mol, grids, nao, 1):
+        p0, p1 = p1, p1 + weight.size
+        wfxc = fxc_ref[:, :, p0:p1] * weight
+
+        mo_cache = {}
+        for key in needed:
+            coeff_mask = sorted_blocks[key][idx]
+            mo_cache[key] = contract('cig,ip->cpg', ao_mask[:4], coeff_mask)
+
+        for in_name, (x, left_key, right_key) in in_blocks.items():
+            input_terms = terms_by_input.get(in_name)
+            if not input_terms:
+                continue
+            left_mo = mo_cache[left_key]
+            right_mo = mo_cache[right_key]
+            # t[n, i, j, g] = sum_lr L[j][l, g] X[n, l, r] R[i][r, g]
+            xr = contract('nlr,irg->nilg', x, right_mo)
+            t = contract('nilg,jlg->nijg', xr, left_mo)
+            wv = cp.empty((nvec, 4, 4, weight.size))
+            for i in range(4):
+                wv[:, i] = fill_wv(wfxc, t, i)
+            for out_name, coef in input_terms:
+                out_left, out_right = out_blocks[out_name]
+                lmo = mo_cache[out_left]
+                rmo = mo_cache[out_right]
+                # out[n] += coef * sum_ij L[j] diag(wv[n,i,j]) R[i]^T
+                weighted = contract('nijg,jlg->nilg', wv, lmo)
+                out[out_name] += coef * contract(
+                    'nilg,irg->nlr', weighted, rmo,
+                )
+    return out
+
+
+def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True):
+    '''Response function for ``Sf = Si - 1`` (GPU).
+
+    Returns ``(vind, fockz)``; with ``use_mo_grid_fxc1`` the GGA/MGGA
+    vref1 action is skipped here and evaluated in MO blocks by the caller.
+    '''
+    mol = mf.mol
+    ni = mf._numint
+    ni.libxc.test_deriv_order(mf.xc, 2, raise_error=True)
+    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, mol.spin)
+    hybrid = ni.libxc.is_hybrid_xc(mf.xc)
+    xctype = ni._xc_type(mf.xc)
+    spin = (mol.nelec[0] - mol.nelec[1]) * 0.5
+
+    if xctype != 'HF' and fxc_ref is None:
+        fxc_ref = spin_flip_reference_fxc(mf)
+    skip_vref1 = use_mo_grid_fxc1 and xctype in ('GGA', 'MGGA')
+
+    def vind(dms_co, dms_cv, dms_oo, dms_ov):
+        n_co, n_cv, n_oo = len(dms_co), len(dms_cv), len(dms_oo)
+        idx1 = n_co
+        idx2 = n_co + n_cv
+        idx3 = n_co + n_cv + n_oo
+
+        dms0 = cp.concatenate((dms_co, dms_cv, dms_oo, dms_ov), axis=0)
+        dms1 = cp.concatenate((dms_co, dms_ov), axis=0)
+
+        if xctype != 'HF':
+            vref0 = gpu_numint.nr_rks_fxc(
+                ni, mol, mf.grids, mf.xc, None, dms0, 0, hermi,
+                None, None, fxc_ref,
+            )
+            vref0 = cp.asarray(vref0)
+            if skip_vref1:
+                vref1 = cp.zeros_like(dms1)
+            elif xctype == 'LDA':
+                vref1 = cp.asarray(gpu_numint.nr_rks_fxc(
+                    ni, mol, mf.grids, mf.xc, None, dms1, 0, hermi,
+                    None, None, fxc_ref,
+                ))
+            else:
+                raise NotImplementedError(
+                    'AO-basis vref1 is not ported; use the MO-grid path'
+                )
+        else:
+            vref0 = cp.zeros_like(dms0)
+            vref1 = cp.zeros_like(dms1)
+
+        if hybrid:
+            vk = mf.get_k(mol, dms0, hermi) * hyb
+            vj = mf.get_j(mol, dms1, hermi) * hyb
+            if omega != 0:
+                vk += mf.get_k(mol, dms0, hermi, omega=omega) * (alpha - hyb)
+                vj += _get_j_range_separated(
+                    mf, dms1, hermi, omega,
+                ) * (alpha - hyb)
+            vref0 -= cp.asarray(vk)
+            vref1 -= cp.asarray(vj)
+
+        vref0_co = vref0[:idx1]
+        vref0_cv = vref0[idx1:idx2]
+        vref0_oo = vref0[idx2:idx3]
+        vref0_ov = vref0[idx3:]
+        vref1_co = vref1[:n_co]
+        vref1_ov = vref1[n_co:]
+
+        s = spin
+        v1ao_co = (vref0_co + vref1_co / (2 * s - 1)
+                   + np.sqrt((2 * s + 1) / 2 / s) * vref0_cv)
+        v1ao_co += (np.sqrt(2 * s / (2 * s - 1)) * vref0_oo
+                    + 2 * s / (2 * s - 1) * vref0_ov
+                    - vref1_ov / (2 * s - 1))
+        v1ao_cv = (vref0_co * np.sqrt((2 * s + 1) / 2 / s) + vref0_cv
+                   + np.sqrt((2 * s + 1) / (2 * s - 1)) * vref0_oo)
+        v1ao_cv += np.sqrt((2 * s + 1) / 2 / s) * vref0_ov
+        v1ao_oo = (np.sqrt(2 * s / (2 * s - 1)) * vref0_co
+                   + np.sqrt((2 * s + 1) / (2 * s - 1)) * vref0_cv)
+        v1ao_oo += vref0_oo + np.sqrt(2 * s / (2 * s - 1)) * vref0_ov
+        v1ao_ov = (2 * s / (2 * s - 1) * vref0_co - vref1_co / (2 * s - 1)
+                   + np.sqrt((2 * s + 1) / 2 / s) * vref0_cv)
+        v1ao_ov += (np.sqrt(2 * s / (2 * s - 1)) * vref0_oo + vref0_ov
+                    + vref1_ov / (2 * s - 1))
+        return v1ao_co, v1ao_cv, v1ao_oo, v1ao_ov
+
+    orbos = cp.asarray(mf.mo_coeff)[:, cp.asarray(mf.mo_occ) == 1]
+    dmoo = orbos @ orbos.T
+    if xctype != 'HF':
+        delta = cp.asarray(gpu_numint.nr_rks_fxc(
+            ni, mol, mf.grids, mf.xc, None, dmoo[None], 0, 1,
+            None, None, fxc_ref,
+        ))[0]
+    else:
+        delta = cp.zeros_like(dmoo)
+    if hybrid:
+        delta -= cp.asarray(mf.get_k(mol, dmoo, 1)) * hyb
+        if omega != 0:
+            delta -= cp.asarray(
+                mf.get_k(mol, dmoo, 1, omega=omega)
+            ) * (alpha - hyb)
+    return vind, 0.5 * delta
+
+
+def gen_vind_sfd(td):
+    mf = td._scf
+    mo_coeff = cp.asarray(mf.mo_coeff)
+    mo_occ = cp.asarray(mf.mo_occ)
+
+    csidx, osidx, vsidx = _orbital_indices(mf)
+    orbcs = mo_coeff[:, csidx]
+    orbos = mo_coeff[:, osidx]
+    orbvs = mo_coeff[:, vsidx]
+    mo_blocks = {'c': orbcs, 'o': orbos, 'v': orbvs}
+    ncs, nos, nvs = len(csidx), len(osidx), len(vsidx)
+    nocc = ncs + nos
+    nvir = nos + nvs
+    core_rows = slice(None, ncs)
+    open_rows = slice(ncs, None)
+    open_cols = slice(None, nos)
+    virt_cols = slice(nos, None)
+
+    s = nos * 0.5
+    assert s >= 1.0, 'NTTDA for Sf=Si-1 only supports Si>=1.'
+
+    ni = mf._numint
+    xctype = ni._xc_type(mf.xc)
+    use_mo_grid_fxc1 = xctype in ('GGA', 'MGGA')
+    fxc_ref = None
+    if xctype != 'HF':
+        fxc_ref = spin_flip_reference_fxc(mf)
+    vresp, fockz = gen_rohf_response_sfd(
+        mf, fxc_ref=fxc_ref, hermi=0, use_mo_grid_fxc1=use_mo_grid_fxc1,
+    )
+
+    if td.nobeta:
+        dma, dmb = mf.make_rdm1()
+        dm0 = 0.5 * (cp.asarray(dma) + cp.asarray(dmb))
+        fock = mf.get_fock(dm=cp.stack((dm0, dm0)))
+    else:
+        fock = mf.get_fock()
+    fock0 = 0.5 * (cp.asarray(fock.focka) + cp.asarray(fock.fockb))
+
+    fock_coco0 = orbos.T @ (fock0 - fockz) @ orbos
+    fock_coco1 = orbcs.T @ (fock0 + fockz) @ orbcs
+    fock_coco2 = orbcs.T @ fockz @ orbcs
+    fock_cocv = orbos.T @ (fock0 - fockz) @ orbvs
+    fock_cooo0 = orbos.T @ (fock0 + fockz) @ orbcs
+    fock_cooo1 = orbos.T @ (fock0 - fockz) @ orbcs
+    fock_cvcv0 = orbvs.T @ (fock0 - fockz) @ orbvs
+    fock_cvcv1 = fock_coco1
+    fock_cvcv2 = orbvs.T @ fockz @ orbvs
+    fock_cvcv3 = fock_coco2
+    fock_cvoo = orbvs.T @ fockz @ orbcs
+    fock_cvov = fock_cooo0
+    fock_oooo0 = fock_coco0
+    fock_oooo1 = orbos.T @ (fock0 + fockz) @ orbos
+    fock_ooov0 = fock_cocv
+    fock_ooov1 = orbos.T @ (fock0 + fockz) @ orbvs
+    fock_ovov0 = fock_cvcv0
+    fock_ovov1 = fock_oooo1
+    fock_ovov2 = fock_cvcv2
+
+    hdiag_co = fock_coco0.diagonal()[None, :] - fock_coco1.diagonal()[:, None]
+    hdiag_co = hdiag_co - fock_coco2.diagonal()[:, None] * 2 / (2 * s - 1)
+    hdiag_cv = fock_cvcv0.diagonal()[None, :] - fock_cvcv1.diagonal()[:, None]
+    hdiag_cv = hdiag_cv - (fock_cvcv2.diagonal()[None, :] / s
+                           + fock_cvcv3.diagonal()[:, None] / s)
+    hdiag_oo = fock_oooo0.diagonal()[None, :] - fock_oooo1.diagonal()[:, None]
+    hdiag_ov = fock_ovov0.diagonal()[None, :] - fock_ovov1.diagonal()[:, None]
+    hdiag_ov = hdiag_ov - fock_ovov2.diagonal()[None, :] * 2 / (2 * s - 1)
+    hdiag = cp.concatenate((
+        cp.concatenate((hdiag_co, hdiag_cv), axis=1),
+        cp.concatenate((hdiag_oo, hdiag_ov), axis=1),
+    ), axis=0).ravel()
+    open_diag = np.diag_indices(nos)
+
+    def vind(zs):
+        zs = cp.asarray(zs).reshape(-1, nocc, nvir)
+        zs_co = zs[:, core_rows, open_cols]
+        zs_cv = zs[:, core_rows, virt_cols]
+        zs_oo = zs[:, open_rows, open_cols]
+        zs_ov = zs[:, open_rows, virt_cols]
+        dms_co = contract('xov,pv->xpo', zs_co, orbos)
+        dms_co = contract('xpo,qo->xpq', dms_co, orbcs)
+        dms_cv = contract('xov,pv->xpo', zs_cv, orbvs)
+        dms_cv = contract('xpo,qo->xpq', dms_cv, orbcs)
+        dms_oo = contract('xov,pv->xpo', zs_oo, orbos)
+        dms_oo = contract('xpo,qo->xpq', dms_oo, orbos)
+        dms_ov = contract('xov,pv->xpo', zs_ov, orbvs)
+        dms_ov = contract('xpo,qo->xpq', dms_ov, orbos)
+        v1ao_co, v1ao_cv, v1ao_oo, v1ao_ov = vresp(
+            dms_co, dms_cv, dms_oo, dms_ov,
+        )
+        v1mo_co = contract('xpq,qo->xpo', v1ao_co, orbcs)
+        v1mo_co = contract('xpo,pv->xov', v1mo_co, orbos)
+        v1mo_cv = contract('xpq,qo->xpo', v1ao_cv, orbcs)
+        v1mo_cv = contract('xpo,pv->xov', v1mo_cv, orbvs)
+        v1mo_oo = contract('xpq,qo->xpo', v1ao_oo, orbos)
+        v1mo_oo = contract('xpo,pv->xov', v1mo_oo, orbos)
+        v1mo_ov = contract('xpq,qo->xpo', v1ao_ov, orbos)
+        v1mo_ov = contract('xpo,pv->xov', v1mo_ov, orbvs)
+
+        if use_mo_grid_fxc1:
+            denom = 2 * s - 1
+            in_blocks = {
+                'co': (zs_co, 'c', 'o'),
+                'ov': (zs_ov, 'o', 'v'),
+            }
+            out_blocks = {
+                'co': ('c', 'o'),
+                'ov': ('o', 'v'),
+            }
+            terms = (
+                ('co', 'co', 1.0 / denom),
+                ('ov', 'co', -1.0 / denom),
+                ('co', 'ov', -1.0 / denom),
+                ('ov', 'ov', 1.0 / denom),
+            )
+            vref1_mo = nr_rks_fxc1_mo(
+                mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref,
+            )
+            v1mo_co += vref1_mo['co']
+            v1mo_ov += vref1_mo['ov']
+
+        v1mo_co += contract('uv,xiv->xiu', fock_coco0, zs_co)
+        v1mo_co -= contract('ji,xju->xiu', fock_coco1, zs_co)
+        v1mo_co -= contract('ji,xju->xiu', fock_coco2, zs_co) * 2 / (2 * s - 1)
+        v1mo_co += contract('ub,xib->xiu', fock_cocv, zs_cv) \
+            * np.sqrt((2 * s + 1) / 2 / s)
+        v1mo_co -= contract('wi,xwu->xiu', fock_cooo0, zs_oo) \
+            * np.sqrt(2 * s / (2 * s - 1))
+        v1mo_co += cp.einsum('ui,xvv->xiu', fock_cooo1, zs_oo) \
+            / np.sqrt(2 * s * (2 * s - 1))
+
+        v1mo_cv += contract('av,xiv->xia', fock_cocv.T, zs_co) \
+            * np.sqrt((2 * s + 1) / 2 / s)
+        v1mo_cv += contract('ab,xib->xia', fock_cvcv0, zs_cv)
+        v1mo_cv -= contract('ji,xja->xia', fock_cvcv1, zs_cv)
+        v1mo_cv -= contract('ab,xib->xia', fock_cvcv2, zs_cv) / s
+        v1mo_cv -= contract('ji,xja->xia', fock_cvcv3, zs_cv) / s
+        v1mo_cv -= cp.einsum('ai,xvv->xia', fock_cvoo, zs_oo) \
+            / s * np.sqrt((2 * s + 1) / (2 * s - 1))
+        v1mo_cv -= contract('vi,xva->xia', fock_cvov, zs_ov) \
+            * np.sqrt((2 * s + 1) / 2 / s)
+
+        v1mo_oo -= contract('ju,xjt->xut', fock_cooo0.T, zs_co) \
+            * np.sqrt(2 * s / (2 * s - 1))
+        v1mo_oo[:, open_diag[0], open_diag[1]] += (
+            contract('jv,xjv->x', fock_cooo1.T, zs_co)
+            / np.sqrt(2 * s * (2 * s - 1))
+        )[:, None]
+        v1mo_oo[:, open_diag[0], open_diag[1]] -= (
+            contract('jb,xjb->x', fock_cvoo.T, zs_cv)
+            / s * np.sqrt((2 * s + 1) / (2 * s - 1))
+        )[:, None]
+        v1mo_oo += contract('tv,xuv->xut', fock_oooo0, zs_oo)
+        v1mo_oo -= contract('wu,xwt->xut', fock_oooo1, zs_oo)
+        v1mo_oo += contract('tb,xub->xut', fock_ooov0, zs_ov) \
+            * np.sqrt(2 * s / (2 * s - 1))
+        v1mo_oo[:, open_diag[0], open_diag[1]] -= (
+            contract('vb,xvb->x', fock_ooov1, zs_ov)
+            / np.sqrt(2 * s * (2 * s - 1))
+        )[:, None]
+
+        v1mo_ov -= contract('ju,xja->xua', fock_cvov.T, zs_cv) \
+            * np.sqrt((2 * s + 1) / 2 / s)
+        v1mo_ov += contract('av,xuv->xua', fock_ooov0.T, zs_oo) \
+            * np.sqrt(2 * s / (2 * s - 1))
+        v1mo_ov -= cp.einsum('au,xvv->xua', fock_ooov1.T, zs_oo) \
+            / np.sqrt(2 * s * (2 * s - 1))
+        v1mo_ov += contract('ab,xub->xua', fock_ovov0, zs_ov)
+        v1mo_ov -= contract('vu,xva->xua', fock_ovov1, zs_ov)
+        v1mo_ov -= contract('ab,xub->xua', fock_ovov2, zs_ov) * 2 / (2 * s - 1)
+
+        v1mo = cp.zeros_like(zs)
+        v1mo[:, core_rows, open_cols] = v1mo_co
+        v1mo[:, core_rows, virt_cols] = v1mo_cv
+        v1mo[:, open_rows, open_cols] = v1mo_oo
+        v1mo[:, open_rows, virt_cols] = v1mo_ov
+        return v1mo.reshape(len(v1mo), -1)
+
+    return vind, hdiag
+
+
+class NTTDA(lib.StreamObject):
+    '''GPU NTTDA excitation energies for a high-spin ROKS reference.
+
+    Only ``deltaS = -1`` is implemented; the reference (M_S-lowered)
+    zero-energy root is filtered out of the returned spectrum, matching
+    the CPU implementation.
+    '''
+
+    deltaS = -1
+    nobeta = False
+
+    def __init__(self, mf):
+        self._scf = mf
+        self.mol = mf.mol
+        self.verbose = mf.verbose
+        self.stdout = mf.stdout
+        self.max_memory = mf.max_memory
+        self.nstates = 3
+        self.conv_tol = 1e-6
+        self.lindep = 1e-12
+        self.max_cycle = 100
+        self.converged = None
+        self.e = None
+        self.xy = None
+
+    gen_vind_sfd = gen_vind_sfd
+
+    def get_precond(self, hdiag):
+        def precond(x, e, *args):
+            x = cp.asarray(x)
+            e = cp.asarray(e)
+            if x.ndim == 1:
+                diag = hdiag - e
+            else:
+                diag = hdiag[None, :] - e.reshape(-1, 1)
+            diag = cp.where(
+                cp.abs(diag) < 1e-8,
+                cp.where(diag < 0, -1e-8, 1e-8),
+                diag,
+            )
+            return x / diag
+        return precond
+
+    def init_guess(self, hdiag, nstates=None):
+        if nstates is None:
+            nstates = self.nstates
+        n_init = min(nstates + 3, hdiag.size)
+        idx = cp.argsort(hdiag)[:n_init]
+        x0 = cp.zeros((n_init, hdiag.size))
+        x0[cp.arange(n_init), idx] = 1.0
+        return x0
+
+    def kernel(self, x0=None, nstates=None):
+        log = logger.new_logger(self)
+        t0 = log.init_timer()
+        if self.deltaS != -1:
+            raise NotImplementedError(
+                'GPU NTTDA currently implements only deltaS=-1'
+            )
+        if nstates is None:
+            nstates = self.nstates
+        else:
+            self.nstates = nstates
+        nroots = nstates + 1  # the reference root is filtered afterwards
+
+        vind, hdiag = self.gen_vind_sfd()
+        precond = self.get_precond(hdiag)
+        if x0 is None:
+            x0 = self.init_guess(hdiag, nstates)
+
+        def all_eigs(w, v, nroots, envs):
+            return w, v, np.arange(w.size)
+
+        self.converged, energies, x1 = lr_eigh(
+            vind, x0, precond,
+            tol_residual=self.conv_tol,
+            lindep=self.lindep,
+            nroots=nroots,
+            pick=all_eigs,
+            max_cycle=self.max_cycle,
+            verbose=log,
+        )
+        energies = np.asarray(cp.asnumpy(cp.asarray(energies)))
+
+        csidx, osidx, vsidx = _orbital_indices(self._scf)
+        nocc = len(csidx) + len(osidx)
+        nvir = len(osidx) + len(vsidx)
+        xy = [(cp.asarray(xi).reshape(nocc, nvir), 0) for xi in x1]
+        mask = np.abs(energies) > 1e-8
+        self.e = energies[mask]
+        self.xy = [pair for pair, keep in zip(xy, mask) if keep]
+        self.nstates = len(self.e)
+        if isinstance(self.converged, (list, tuple, np.ndarray)):
+            self.converged = np.asarray(self.converged)[mask]
+        log.timer('GPU NTTDA', *t0)
+        return self.e, self.xy
+
+    def run(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+        self.kernel()
+        return self
