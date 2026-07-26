@@ -588,3 +588,15 @@ class NTTDA(lib.StreamObject):
             setattr(self, key, value)
         self.kernel()
         return self
+
+    def nuc_grad_method(self):
+        from gpu4pyscf.grad.nttda import Gradients
+        return Gradients(self)
+
+    Gradients = nuc_grad_method
+
+    def nac_method(self):
+        from gpu4pyscf.nac.nttda import NAC
+        return NAC(self)
+
+    NAC = nac_method
