@@ -141,6 +141,13 @@ def route_jk_to_gpu(cpu_mf, gmf):
     def get_j(mol=None, dm=None, hermi=0, omega=None, **_kw):
         dms = cp.asarray(dm).reshape(-1, nao, nao)
         if omega:
+            from gpu4pyscf.df.df_jk import _DFHF
+
+            if isinstance(gmf, _DFHF):
+                raise NotImplementedError(
+                    'range-separated hybrids with density fitting are not '
+                    'supported yet (the long-range J path is conventional)'
+                )
             vj = _get_j_range_separated(gmf, dms, hermi, omega)
         else:
             vj = gmf.get_j(gmf.mol, dms, hermi)
@@ -165,6 +172,85 @@ def route_jk_to_gpu(cpu_mf, gmf):
     cpu_mf.get_jk = get_jk
     cpu_mf._nttda_gpu_routed = True
     return cpu_mf
+
+
+class DFLedgerBackend:
+    '''Density-fitted GPU evaluation of a CPU ``_JKDerivativeLedger``.
+
+    Same term mapping as :class:`LedgerBackend` (the DF per-atom kernels
+    implement the same pair-energy derivative semantics), evaluated with
+    the ``df.grad`` machinery so the auxiliary-basis response is included
+    -- the result is the exact derivative of the DF energy surface.
+    '''
+
+    def __init__(self, gmf):
+        from gpu4pyscf.df.df_jk import _DFHF
+
+        assert isinstance(gmf, _DFHF)
+        self._gmf = gmf
+        self._opt = {}
+
+    def _get_opt(self, omega):
+        key = float(omega or 0.0)
+        if key not in self._opt:
+            from gpu4pyscf.df.grad.rhf import Int3c2eOpt
+
+            with_df = self._gmf.with_df
+            mol = with_df.mol
+            auxmol = with_df.auxmol
+            if auxmol is None:
+                with_df.build()
+                auxmol = with_df.auxmol
+            with_df.reset()
+            with mol.with_range_coulomb(key), \
+                    auxmol.with_range_coulomb(key):
+                self._opt[key] = Int3c2eOpt(mol, auxmol).build()
+        return self._opt[key]
+
+    def __call__(self, terms, mol, atoms, slots=()):
+        from gpu4pyscf.df.grad.tdrhf import (
+            _jk_energies_per_atom as _df_jk_energies_per_atom,
+        )
+
+        atoms = list(atoms)
+        shape = (len(atoms), 3)
+        gradients = {slot: np.zeros(shape) for slot in slots}
+        groups = {}
+        for operator in ('j', 'k'):
+            for term in terms[operator]:
+                gradients.setdefault(term.slot, np.zeros(shape))
+                groups.setdefault(float(term.omega or 0.0), []).append(
+                    (operator, term),
+                )
+        for omega, items in groups.items():
+            pairs = []
+            j_factors = []
+            k_factors = []
+            slot_index = []
+            for operator, term in items:
+                left = cp.asarray(term.left)
+                right = cp.asarray(term.right)
+                if operator == 'j':
+                    pairs.append([left, right])
+                    j_factors.append(2.0 * term.scale)
+                    k_factors.append(0.0)
+                    slot_index.append(term.slot)
+                else:
+                    pairs.append([left, cp.ascontiguousarray(right.T)])
+                    pairs.append([cp.ascontiguousarray(left.T), right])
+                    j_factors.extend((0.0, 0.0))
+                    k_factors.extend((-2.0 * term.scale, -2.0 * term.scale))
+                    slot_index.extend((term.slot, term.slot))
+            if not pairs:
+                continue
+            energies = _df_jk_energies_per_atom(
+                self._get_opt(omega), pairs,
+                j_factor=j_factors, k_factor=k_factors, sum_results=False,
+            )
+            energies = cp.asnumpy(cp.asarray(energies))
+            for row, slot in zip(energies, slot_index):
+                gradients[slot] += row[atoms]
+        return gradients
 
 
 class LedgerBackend:
@@ -275,10 +361,16 @@ def _make_gradients_class():
         '''GPU-accelerated NTTDA gradients (CPU formulas, GPU integrals).'''
 
         def __init__(self, td):
+            from gpu4pyscf.df.df_jk import _DFHF
+
             cpu_td, gmf = _resolve_input(td)
             super().__init__(cpu_td)
             self._gmf = gmf
-            self.nttda_jk_ledger_backend = LedgerBackend(gmf)
+            self._with_df = isinstance(gmf, _DFHF)
+            if self._with_df:
+                self.nttda_jk_ledger_backend = DFLedgerBackend(gmf)
+            else:
+                self.nttda_jk_ledger_backend = LedgerBackend(gmf)
 
         def _analytic_components(self, xy, atmlst, response_cache=None):
             if response_cache is None:
@@ -292,7 +384,14 @@ def _make_gradients_class():
         def grad_nuc(self, atmlst=None):
             if self._gmf.grids.coords is None:
                 self._gmf.grids.build(sort_grids=True)
-            value = np.asarray(self._gmf.nuc_grad_method().kernel())
+            if self._with_df:
+                from gpu4pyscf.df.grad.roks import Gradients as DFRoksGrad
+
+                driver = DFRoksGrad(self._gmf)
+            else:
+                driver = self._gmf.nuc_grad_method()
+            driver.verbose = 0
+            value = np.asarray(driver.kernel())
             if atmlst is not None:
                 value = value[list(atmlst)]
             return value
