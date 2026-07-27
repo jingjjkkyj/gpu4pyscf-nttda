@@ -141,13 +141,8 @@ def route_jk_to_gpu(cpu_mf, gmf):
     def get_j(mol=None, dm=None, hermi=0, omega=None, **_kw):
         dms = cp.asarray(dm).reshape(-1, nao, nao)
         if omega:
-            from gpu4pyscf.df.df_jk import _DFHF
-
-            if isinstance(gmf, _DFHF):
-                raise NotImplementedError(
-                    'range-separated hybrids with density fitting are not '
-                    'supported yet (the long-range J path is conventional)'
-                )
+            # _get_j_range_separated dispatches internally: per-omega
+            # cderi for DF references, erf-kernel VHFOpt otherwise.
             vj = _get_j_range_separated(gmf, dms, hermi, omega)
         else:
             vj = gmf.get_j(gmf.mol, dms, hermi)

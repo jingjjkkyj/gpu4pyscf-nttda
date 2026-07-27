@@ -36,11 +36,17 @@ def _get_j_range_separated(mf, dms, hermi, omega):
     '''Long-range (erf-kernel) Coulomb J.
 
     RSH functionals only range-separate the exchange, so the stock GPU
-    J path silently ignores ``omega``; the NTTDA vref1 term needs the
-    genuine long-range J.  Reuses (or builds) the range-separated VHFOpt
-    stored under ``mf._opt_gpu[omega]`` -- the same object the omega
-    ``get_k`` path uses.
+    J engine silently ignores ``omega``; the NTTDA vref1 term needs the
+    genuine long-range J.  For a density-fitted SCF the per-omega cderi
+    path computes the erf-kernel J correctly, so it is used directly;
+    otherwise the range-separated VHFOpt stored under
+    ``mf._opt_gpu[omega]`` (the same object the omega ``get_k`` path
+    uses) drives the conventional integrals.
     '''
+    from gpu4pyscf.df.df_jk import _DFHF
+
+    if isinstance(mf, _DFHF):
+        return mf.get_j(mf.mol, dms, hermi, omega=omega)
     mol = mf.mol
     vhfopt = mf._opt_gpu.get(omega)
     if vhfopt is None:
