@@ -24,6 +24,7 @@ from gpu4pyscf.grad.nttda import (
     DFLedgerBackend,
     LedgerBackend,
     _import_forge,
+    _is_gpu_object,
     _resolve_input,
     make_gpu_response_cache,
 )
@@ -66,9 +67,14 @@ _NAC_CLASS = None
 def NAC(td):
     '''Build the hybrid GPU NTTDA NAC driver for ``td``.
 
-    ``td`` may be a converged ``gpu4pyscf.sftda.NTTDA`` or a CPU forge
-    NTTDA object.
+    ``td`` must be a converged ``gpu4pyscf.sftda.NTTDA``.  CPU forge inputs
+    are intentionally rejected to avoid mixing independently configured
+    energy and derivative models.
     '''
+    if not _is_gpu_object(td):
+        raise TypeError(
+            'The hybrid derivative driver accepts only a GPU NTTDA object'
+        )
     global _NAC_CLASS
     if _NAC_CLASS is None:
         _import_forge()

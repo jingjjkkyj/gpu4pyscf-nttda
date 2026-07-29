@@ -31,7 +31,10 @@ XC derivative quadrature (the forge ``xc`` backend) stays on CPU in this
 version; for hybrid functionals the four-center work dominates.
 '''
 
+import importlib
+import inspect
 import os
+import sys
 
 import numpy as np
 import cupy as cp
@@ -40,25 +43,77 @@ from gpu4pyscf.grad.tdrhf import _jk_energies_per_atom
 from gpu4pyscf.scf.jk import _VHFOpt
 
 
-def _import_forge():
-    '''Import the CPU forge NTTDA packages, injecting paths if needed.'''
+def _assert_module_under_root(module, root, label):
+    '''Reject an already-loaded forge module from another checkout.'''
+    module_file = getattr(module, '__file__', None)
+    if not module_file:
+        raise ImportError(f'CPU forge {label} module has no source path')
+    root = os.path.realpath(root)
+    module_file = os.path.realpath(module_file)
     try:
-        import pyscf.grad.nttda  # noqa: F401
-        import pyscf.nac.nttda  # noqa: F401
-        import pyscf.sftda.nttda  # noqa: F401
-    except ImportError:
-        root = os.environ.get('NTTDA_FORGE_PATH')
-        if not root:
-            raise ImportError(
-                'The CPU pyscf-forge NTTDA package is required for the '
-                'hybrid GPU driver.  Load it via PYSCF_EXT_PATH or set '
-                'NTTDA_FORGE_PATH to the forge checkout root.'
-            )
-        import pyscf
+        matches = os.path.commonpath((root, module_file)) == root
+    except ValueError:
+        matches = False
+    if not matches:
+        raise ImportError(
+            f'CPU forge {label} module was loaded from {module_file}, '
+            f'outside requested NTTDA_FORGE_PATH {root}'
+        )
 
-        path = os.path.join(root, 'pyscf')
-        if path not in pyscf.__path__:
-            pyscf.__path__.insert(0, path)
+
+def _prepend_path(package, path):
+    path = os.path.realpath(path)
+    existing = [os.path.realpath(item) for item in package.__path__]
+    if path in existing:
+        package.__path__.remove(package.__path__[existing.index(path)])
+    package.__path__.insert(0, path)
+
+
+def _validate_forge_capabilities(forge_grad, forge_roks):
+    parameters = inspect.signature(
+        forge_grad.Gradients._analytic_components,
+    ).parameters
+    if 'response_cache' not in parameters:
+        raise ImportError(
+            'Loaded CPU forge NTTDA lacks the response_cache accelerator seam'
+        )
+    if not hasattr(forge_roks, 'ResponseCache'):
+        raise ImportError(
+            'Loaded CPU forge NTTDA lacks the ResponseCache accelerator seam'
+        )
+    delta = importlib.import_module(
+        'pyscf.grad.nttda.delta_s_minus_one',
+    )
+    contract = delta._JKDerivativeLedger.contract
+    code = contract.__code__
+    if (
+            'nttda_jk_ledger_backend' not in code.co_names
+            and 'nttda_jk_ledger_backend' not in code.co_consts):
+        raise ImportError(
+            'Loaded CPU forge NTTDA lacks the derivative-ledger backend seam'
+        )
+
+
+def _import_forge():
+    '''Import one verified CPU forge checkout for the hybrid driver.'''
+    requested_root = os.environ.get('NTTDA_FORGE_PATH')
+    if requested_root:
+        requested_root = os.path.realpath(requested_root)
+        path = os.path.join(requested_root, 'pyscf')
+        required = (
+            path,
+            os.path.join(path, 'grad', 'nttda'),
+            os.path.join(path, 'nac', 'nttda.py'),
+            os.path.join(path, 'sftda', 'nttda.py'),
+        )
+        if not all(os.path.exists(item) for item in required):
+            raise ImportError(
+                'NTTDA_FORGE_PATH does not contain the required optimized '
+                f'forge modules: {requested_root}'
+            )
+
+        import pyscf
+        _prepend_path(pyscf, path)
         import pyscf.grad
         import pyscf.nac
         import pyscf.sftda
@@ -67,17 +122,88 @@ def _import_forge():
                 (pyscf.grad, os.path.join(path, 'grad')),
                 (pyscf.nac, os.path.join(path, 'nac')),
                 (pyscf.sftda, os.path.join(path, 'sftda'))):
-            if sub not in package.__path__:
-                package.__path__.insert(0, sub)
-    from pyscf.grad import nttda as forge_grad
-    from pyscf.grad.nttda import roks as forge_roks
-    from pyscf.sftda import nttda as forge_solver
+            _prepend_path(package, sub)
 
+        for name, label in (
+                ('pyscf.grad.nttda', 'gradient'),
+                ('pyscf.nac.nttda', 'NAC'),
+                ('pyscf.sftda.nttda', 'solver')):
+            if name in sys.modules:
+                _assert_module_under_root(
+                    sys.modules[name], requested_root, label,
+                )
+        importlib.invalidate_caches()
+
+    try:
+        forge_grad = importlib.import_module('pyscf.grad.nttda')
+        importlib.import_module('pyscf.nac.nttda')
+        forge_solver = importlib.import_module('pyscf.sftda.nttda')
+        forge_roks = importlib.import_module('pyscf.grad.nttda.roks')
+    except ImportError as error:
+        raise ImportError(
+            'The optimized CPU pyscf-forge NTTDA package is required for '
+            'the hybrid GPU driver. Set NTTDA_FORGE_PATH to its checkout root.'
+        ) from error
+
+    _validate_forge_capabilities(forge_grad, forge_roks)
+    if requested_root:
+        for module, label in (
+                (forge_grad, 'gradient'),
+                (forge_roks, 'gradient response'),
+                (forge_solver, 'solver'),
+                (sys.modules['pyscf.nac.nttda'], 'NAC'),
+                (
+                    sys.modules['pyscf.grad.nttda.delta_s_minus_one'],
+                    'gradient ledger',
+                )):
+            _assert_module_under_root(
+                module, requested_root, label,
+            )
     return forge_grad, forge_roks, forge_solver
 
 
 def _is_gpu_object(obj):
     return type(obj).__module__.startswith('gpu4pyscf')
+
+
+def _validate_supported_reference(gmf):
+    '''Fail before mixing energy and derivative models we cannot preserve.'''
+    if bool(getattr(gmf, 'only_dfj', False)):
+        raise NotImplementedError(
+            'NTTDA gradients/NAC/FSSH do not yet support only_dfj because '
+            'the conventional-K derivative ledger is not implemented'
+        )
+    for marker, attribute, label in (
+            ('_Solvation', 'with_solvent', 'solvent'),
+            ('_QMMM', 'mm_mol', 'QM/MM')):
+        wrapped = getattr(gmf, attribute, None) is not None
+        istype = getattr(gmf, 'istype', None)
+        if callable(istype):
+            wrapped = wrapped or bool(istype(marker))
+        if wrapped:
+            raise NotImplementedError(
+                f'NTTDA gradients/NAC/FSSH do not support {label} wrappers'
+            )
+    if getattr(gmf, 'disp', None) not in (None, False, ''):
+        raise NotImplementedError(
+            'NTTDA gradients/NAC/FSSH do not support dispersion corrections'
+        )
+    has_nlc = getattr(gmf, 'nlc', None) not in (None, False, '')
+    do_nlc = getattr(gmf, 'do_nlc', None)
+    if callable(do_nlc):
+        has_nlc = has_nlc or bool(do_nlc())
+    if has_nlc:
+        raise NotImplementedError(
+            'NTTDA gradients/NAC/FSSH do not support nonlocal correlation'
+        )
+    numint = getattr(gmf, '_numint', None)
+    if numint is not None:
+        from gpu4pyscf.dft import numint as gpu_numint
+
+        if type(numint) is not gpu_numint.NumInt:
+            raise NotImplementedError(
+                'NTTDA gradients/NAC/FSSH require the standard GPU NumInt'
+            )
 
 
 def build_cpu_twin(gpu_td):
@@ -91,9 +217,12 @@ def build_cpu_twin(gpu_td):
 
     _forge_grad, _forge_roks, forge_solver = _import_forge()
     gmf = gpu_td._scf
+    _validate_supported_reference(gmf)
     mol = gmf.mol
     cpu_mf = dft.ROKS(mol)
     cpu_mf.xc = gmf.xc
+    if hasattr(gmf, 'omega'):
+        cpu_mf.omega = gmf.omega
     cpu_mf.verbose = 0
     cpu_mf.max_memory = gmf.max_memory
     cpu_mf.mo_coeff = cp.asnumpy(cp.asarray(gmf.mo_coeff))
@@ -329,22 +458,15 @@ def make_gpu_response_cache(cpu_td, gmf):
 
 
 def _resolve_input(td):
-    '''Return (cpu_td, gmf) for a GPU NTTDA or an already-CPU NTTDA.'''
-    if _is_gpu_object(td):
-        cpu_td = build_cpu_twin(td)
-        gmf = td._scf
-    else:
-        from gpu4pyscf.dft import roks as gpu_roks
-
-        _import_forge()
-        cpu_td = td
-        cpu_mf = td._scf
-        gmf = gpu_roks.ROKS(cpu_mf.mol, xc=cpu_mf.xc)
-        gmf.verbose = 0
-        gmf.mo_coeff = cp.asarray(cpu_mf.mo_coeff)
-        gmf.mo_occ = cp.asarray(cpu_mf.mo_occ)
-        gmf.mo_energy = cp.asarray(cpu_mf.mo_energy)
-        gmf.converged = True
+    '''Return the private CPU twin and GPU reference for a GPU NTTDA.'''
+    if not _is_gpu_object(td):
+        raise TypeError(
+            'The hybrid derivative driver accepts only a GPU NTTDA object; '
+            'CPU forge inputs are intentionally unsupported'
+        )
+    gmf = td._scf
+    _validate_supported_reference(gmf)
+    cpu_td = build_cpu_twin(td)
     route_jk_to_gpu(cpu_td._scf, gmf)
     return cpu_td, gmf
 
@@ -404,10 +526,13 @@ _GRADIENTS_CLASS = None
 def Gradients(td):
     '''Build the hybrid GPU NTTDA gradient driver for ``td``.
 
-    ``td`` may be a converged ``gpu4pyscf.sftda.NTTDA`` (a CPU twin is
-    created internally) or a CPU forge NTTDA (a GPU integral backend is
-    attached).
+    ``td`` must be a converged ``gpu4pyscf.sftda.NTTDA``.  A private CPU
+    formula twin is created internally without mutating a user-owned object.
     '''
+    if not _is_gpu_object(td):
+        raise TypeError(
+            'The hybrid derivative driver accepts only a GPU NTTDA object'
+        )
     global _GRADIENTS_CLASS
     if _GRADIENTS_CLASS is None:
         _GRADIENTS_CLASS = _make_gradients_class()
