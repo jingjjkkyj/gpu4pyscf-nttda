@@ -336,13 +336,34 @@ class FSSH:
 
         # Current state coefficient
         c_i = coeffs[state_idx]
+        population = np.abs(c_i)**2
+        if not np.isfinite(population) or population <= np.finfo(float).eps:
+            raise RuntimeError(
+                "The active-state population is numerically zero; "
+                "reduce the time step or inspect the electronic propagation."
+            )
 
         # Calculate hopping probabilities
-        g_ij = 2 * (nact[state_idx] * c_i.conj() * coeffs).real * self.dt / (np.abs(c_i)**2)
+        g_ij = (
+            2 * (nact[state_idx] * c_i.conj() * coeffs).real
+            * self.dt / population
+        )
 
         # Adjust hopping probabilities
-        p_ij = np.where(g_ij < 0, 0, g_ij)
-        p_ij = np.where(p_ij > 1, 1, p_ij)
+        p_ij = np.maximum(g_ij, 0.0)
+        p_ij[state_idx] = 0.0
+        if not np.all(np.isfinite(p_ij)):
+            raise RuntimeError("Non-finite FSSH hopping probability encountered.")
+
+        total_probability = float(np.sum(p_ij))
+        if total_probability > 1.0 + 1e-12:
+            raise RuntimeError(
+                "FSSH hopping probabilities sum to "
+                f"{total_probability:.8g} (> 1). Reduce the nuclear time step "
+                "or introduce electronic substeps."
+            )
+        if total_probability > 1.0:
+            p_ij /= total_probability
 
         return p_ij
 
@@ -715,6 +736,7 @@ class FSSH:
             # 6. adjust nuclear velocity
             cur_idx = self.states.index(cur_state)
             if hop_index != -1 and hop_index != cur_idx:
+                hop_pes = None
 
                 # Calculate d_vec for velocity rescaling
                 if self.coupling_method in ('nac', 'direct'):
@@ -738,6 +760,13 @@ class FSSH:
 
                 if hop_allowed:
                     cur_state, old_state = self.states[hop_index], cur_state
+                    if hop_pes is None:
+                        hop_pes = self.evaluate_pes(
+                            position, cur_state, with_nacv=False)
+                    # Keep the energies and NACs used for this frame, but use
+                    # the target-state force for the second velocity half-step
+                    # and as the force carried into the next step.
+                    pes.force = hop_pes.force
 
                     log.info(f"Hop: {old_state} → {cur_state} at step {step}")
 
