@@ -176,6 +176,55 @@ class KnownValues(unittest.TestCase):
                         td, states=[1, 2], cphf_max_cycle=value,
                     )
 
+    def test_only_dfj_surface_is_rejected(self):
+        td = FakeNTTDA(self.mol)
+        td._scf.only_dfj = True
+        with self.assertRaisesRegex(NotImplementedError, 'only_dfj'):
+            FSSH_NTTDA(td, states=[1, 2])
+
+    def test_restart_is_disabled_until_electronic_gauge_is_checkpointed(self):
+        driver = FSSH_NTTDA(FakeNTTDA(self.mol), states=[1, 2])
+        with self.assertRaisesRegex(NotImplementedError, 'electronic'):
+            driver.restore('unused.h5')
+
+    def test_loose_initial_solutions_are_not_reused(self):
+        td = FakeNTTDA(self.mol)
+        td._scf.converged = True
+        td._scf.conv_tol = 1e-6
+        td._scf.mo_coeff = np.eye(2)
+        td._scf.mo_occ = np.array([1.0, 0.0])
+        td.conv_tol = 1e-5
+        td.e = np.array([0.1, 0.2, 0.3])
+        td.xy = [
+            (np.ones((1, 1)), 0),
+            (np.ones((1, 1)), 0),
+            (np.ones((1, 1)), 0),
+        ]
+        td.converged = np.ones(3, dtype=bool)
+
+        driver = FSSH_NTTDA(
+            td,
+            states=[1, 2],
+            scf_conv_tol=1e-10,
+            td_conv_tol=1e-8,
+        )
+
+        self.assertIsNone(driver._last_mf)
+        self.assertIsNone(driver._last_td)
+        self.assertFalse(driver._initial_frame_available)
+
+    def test_rebuilt_scf_preserves_tuned_range_separation(self):
+        from gpu4pyscf.dft import roks
+
+        td = FakeNTTDA(self.mol)
+        td._scf = roks.ROKS(self.mol, xc='CAM-B3LYP')
+        td._scf.omega = 0.37
+        driver = FSSH_NTTDA(td, states=[1, 2])
+
+        rebuilt = driver._new_scf(self.mol.copy())
+
+        self.assertAlmostEqual(rebuilt.omega, 0.37)
+
 
 if __name__ == '__main__':
     unittest.main()

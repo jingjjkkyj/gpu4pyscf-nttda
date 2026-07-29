@@ -32,7 +32,10 @@ import numpy as np
 from pyscf import gto
 
 from gpu4pyscf.fssh.fssh import FSSH, PES
-from gpu4pyscf.grad.nttda import compute_frame
+from gpu4pyscf.grad.nttda import (
+    _validate_supported_reference,
+    compute_frame,
+)
 from gpu4pyscf.sftda.nttda import NTTDA
 
 
@@ -65,6 +68,7 @@ class FSSH_NTTDA(FSSH):
             raise TypeError('td must be a GPU NTTDA object with a reference SCF')
         if getattr(td, 'deltaS', None) != -1:
             raise ValueError('FSSH_NTTDA supports only NTTDA deltaS=-1')
+        _validate_supported_reference(td._scf)
         if (cphf_max_cycle is not None
                 and (
                     isinstance(cphf_max_cycle, (bool, np.bool_))
@@ -96,10 +100,17 @@ class FSSH_NTTDA(FSSH):
             for i in range(len(states))
             for j in range(i + 1, len(states))
         ]
-        self._last_mf = (
-            td._scf if bool(getattr(td._scf, 'converged', False)) else None
+        scf_ready = (
+            bool(getattr(td._scf, 'converged', False))
+            and float(getattr(td._scf, 'conv_tol', np.inf))
+            <= self.scf_conv_tol
         )
-        self._last_td = td if self._td_solution_ready(td) else None
+        td_ready = (
+            self._td_solution_ready(td)
+            and float(getattr(td, 'conv_tol', np.inf)) <= self.td_conv_tol
+        )
+        self._last_mf = td._scf if scf_ready else None
+        self._last_td = td if scf_ready and td_ready else None
         self._prev = None  # (mol, C, occ, xy_list), all arrays on the CPU
         if self._last_mf is not None and self._last_td is not None:
             self._prev = self._make_snapshot(
@@ -140,6 +151,8 @@ class FSSH_NTTDA(FSSH):
                 'init_guess', 'level_shift', 'damp', 'diis_space',
                 'diis_damp', 'diis_start_cycle', 'diis_space_rollback',
                 'conv_check', 'disp', 'nlc', 'small_rho_cutoff', 'DIIS'):
+            self._copy_setting(template, mf, name)
+        for name in ('omega', 'disp_with_3body'):
             self._copy_setting(template, mf, name)
         if isinstance(getattr(template, 'diis', None), (bool, int)):
             mf.diis = template.diis
@@ -388,3 +401,10 @@ class FSSH_NTTDA(FSSH):
             position, cur_state=cur_state, with_nacv=with_nacv,
         )
         return PES(energy=energy, force=force, nacv=nacv)
+
+    def restore(self, trajectory_file):
+        raise NotImplementedError(
+            'FSSH_NTTDA restart is disabled until MO orbitals, NTTDA '
+            'amplitudes, root assignments, and electronic phase/gauge are '
+            'checkpointed together with the nuclear trajectory'
+        )
