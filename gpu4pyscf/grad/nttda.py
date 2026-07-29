@@ -221,8 +221,9 @@ def build_cpu_twin(gpu_td):
     mol = gmf.mol
     cpu_mf = dft.ROKS(mol)
     cpu_mf.xc = gmf.xc
-    if hasattr(gmf, 'omega'):
-        cpu_mf.omega = gmf.omega
+    omega = getattr(gmf, 'omega', None)
+    if omega is not None:
+        cpu_mf.omega = omega
     cpu_mf.verbose = 0
     cpu_mf.max_memory = gmf.max_memory
     cpu_mf.mo_coeff = cp.asnumpy(cp.asarray(gmf.mo_coeff))

@@ -99,6 +99,61 @@ class KnownValues(unittest.TestCase):
 
         self.assertAlmostEqual(cpu_td._scf.omega, 0.37)
 
+    def test_cpu_twin_does_not_assign_an_unset_range_separation(self):
+        class FakeCpuMF:
+            def __init__(self):
+                self._omega = 0.0
+                self.grids = types.SimpleNamespace(
+                    coords=None, weights=None, non0tab=None,
+                )
+
+            @property
+            def omega(self):
+                return self._omega
+
+            @omega.setter
+            def omega(self, value):
+                if value is None:
+                    raise TypeError("omega must be numeric")
+                self._omega = float(value)
+
+        class FakeForgeTD:
+            def __init__(self, mf):
+                self._scf = mf
+
+        cpu_mf = FakeCpuMF()
+        forge_solver = types.SimpleNamespace(NTTDA=FakeForgeTD)
+        gpu_mf = types.SimpleNamespace(
+            mol=object(),
+            xc="B3LYP",
+            omega=None,
+            verbose=0,
+            max_memory=4000,
+            mo_coeff=np.eye(2),
+            mo_occ=np.array([1.0, 0.0]),
+            mo_energy=np.array([-0.5, 0.2]),
+            grids=types.SimpleNamespace(
+                coords=np.zeros((2, 3)),
+                weights=np.ones(2),
+            ),
+        )
+        gpu_td = types.SimpleNamespace(
+            _scf=gpu_mf,
+            deltaS=-1,
+            nobeta=False,
+            e=np.array([0.1, 0.2]),
+            xy=[(np.ones((1, 1)), 0), (np.ones((1, 1)), 0)],
+            converged=np.array([True, True]),
+        )
+
+        with mock.patch.object(
+                nttda, "_import_forge",
+                return_value=(None, None, forge_solver)), \
+                mock.patch("pyscf.dft.ROKS", return_value=cpu_mf):
+            cpu_td = nttda.build_cpu_twin(gpu_td)
+
+        self.assertEqual(cpu_td._scf.omega, 0.0)
+
     def test_requested_forge_root_must_match_loaded_module(self):
         with tempfile.TemporaryDirectory() as root:
             module = types.SimpleNamespace(
