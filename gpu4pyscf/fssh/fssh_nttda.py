@@ -15,9 +15,11 @@
 '''FSSH adapter for GPU NTTDA (deltaS = -1) surfaces.
 
 Per electronic step: GPU ROKS SCF (previous-density warm start) -> GPU
-NTTDA -> cheap MO-overlap root tracking and phase alignment against the
+NTTDA -> energy-ordered roots with same-index phase alignment against the
 previous frame -> one joint frame evaluation (shared response cache and
-derivative engines) for the active-state force and all NAC pairs.
+derivative engines) for the active-state force and all NAC pairs.  A
+character-following Hungarian assignment remains available as the explicit
+``state_ordering='overlap'`` research mode.
 
 ``states`` are 1-based NTTDA root indices (the zero-energy reference
 root is already filtered by the solver).
@@ -43,7 +45,7 @@ class FSSH_NTTDA(FSSH):
     def __init__(self, td, states, scf_conv_tol=1e-10, td_conv_tol=1e-8,
                  cphf_conv_tol=1e-9, cphf_max_cycle=None,
                  root_overlap_tol=0.4, use_etfs=True,
-                 root_tracking_buffer=1):
+                 root_tracking_buffer=1, state_ordering='energy'):
         if not isinstance(states, (list, tuple)) or len(states) < 2:
             raise ValueError('at least two NTTDA states must be specified')
         if any(
@@ -70,6 +72,10 @@ class FSSH_NTTDA(FSSH):
                     or cphf_max_cycle < 1
                 )):
             raise ValueError('cphf_max_cycle must be a positive integer or None')
+        if state_ordering not in ('energy', 'overlap'):
+            raise ValueError(
+                "state_ordering must be either 'energy' or 'overlap'"
+            )
 
         super().__init__(td._scf.mol, states)
         self.tddft = td
@@ -80,6 +86,7 @@ class FSSH_NTTDA(FSSH):
             None if cphf_max_cycle is None else int(cphf_max_cycle)
         )
         self.root_overlap_tol = root_overlap_tol
+        self.state_ordering = state_ordering
         self.use_etfs = bool(use_etfs)
         self.root_tracking_buffer = int(root_tracking_buffer)
         self.nstates_solver = max(states) + self.root_tracking_buffer
@@ -244,10 +251,7 @@ class FSSH_NTTDA(FSSH):
         return cp.asarray(np.asarray(guesses))
 
     def _track_roots(self, mol, td, tracking):
-        '''Reorder/phase-align roots against the previous frame (cheap
-        MO-overlap-corrected amplitude overlaps, Hungarian assignment).'''
-        from scipy.optimize import linear_sum_assignment
-
+        '''Phase-align energy roots, or opt into character-following order.'''
         C = tracking['C']
         occ = tracking['occ']
         xy = [_asnumpy(x) for x, _ in td.xy]
@@ -264,7 +268,13 @@ class FSSH_NTTDA(FSSH):
                 left = x_p.T @ s_occ
                 for j, x in enumerate(xy):
                     overlaps[i, j] = np.trace(left @ x @ s_vir.T)
-            rows_a, cols_a = linear_sum_assignment(-np.abs(overlaps))
+
+            if self.state_ordering == 'overlap':
+                from scipy.optimize import linear_sum_assignment
+                rows_a, cols_a = linear_sum_assignment(-np.abs(overlaps))
+            else:
+                rows_a = np.arange(n_track)
+                cols_a = np.arange(n_track)
             order = [None] * n
             signs = np.ones(n)
             for i, j in zip(rows_a, cols_a):

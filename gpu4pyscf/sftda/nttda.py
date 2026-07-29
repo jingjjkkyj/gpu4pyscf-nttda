@@ -66,6 +66,51 @@ def _orbital_indices(mf):
     return csidx, osidx, vsidx
 
 
+def _spin_lowered_reference_vector(nocc, nvir, nopen):
+    '''Normalized amplitude of ``S_- |Phi_S,S>`` in the NTTDA layout.
+
+    Closed-shell alpha-to-beta flips vanish by Pauli exclusion.  The
+    reference therefore has equal amplitudes only on the diagonal of the
+    open-occupied/open-virtual block.
+    '''
+    if nopen < 1 or nopen > min(nocc, nvir):
+        raise ValueError('nopen must fit in both NTTDA orbital dimensions')
+    reference = np.zeros((nocc, nvir))
+    indices = np.arange(nopen)
+    reference[nocc - nopen + indices, indices] = 1.0 / np.sqrt(nopen)
+    return reference.ravel()
+
+
+def _select_physical_root_order(
+        energies, reference_overlaps, nstates, overlap_tol, energy_tol):
+    '''Identify one spin-lowered reference root and energy-sort the rest.'''
+    energies = np.asarray(energies)
+    overlaps = np.asarray(reference_overlaps)
+    if energies.ndim != 1 or overlaps.shape != energies.shape:
+        raise ValueError('root energies and reference overlaps must be 1D peers')
+    if len(energies) < nstates + 1:
+        raise RuntimeError(
+            f'NTTDA returned {len(energies)} roots; {nstates + 1} are required'
+        )
+    reference = int(np.argmax(overlaps))
+    if overlaps[reference] < overlap_tol:
+        raise RuntimeError(
+            'NTTDA reference-root overlap '
+            f'{overlaps[reference]:.6f} is below {overlap_tol:.6f}'
+        )
+    if abs(energies[reference]) > energy_tol:
+        raise RuntimeError(
+            'NTTDA spin-lowered reference root has energy '
+            f'{energies[reference]:.6e} Ha, exceeding {energy_tol:.3e} Ha'
+        )
+
+    physical = np.delete(np.arange(len(energies)), reference)
+    physical = physical[
+        np.argsort(energies[physical], kind='stable')
+    ][:nstates]
+    return reference, physical
+
+
 def spin_flip_reference_fxc(mf):
     '''``1/2 (f_aa - f_ab - f_ba + f_bb)`` on the (sorted) grid.
 
@@ -501,6 +546,8 @@ class NTTDA(lib.StreamObject):
 
     deltaS = -1
     nobeta = False
+    reference_overlap_tol = 0.8
+    reference_energy_tol = 1e-6
 
     def __init__(self, mf):
         self._scf = mf
@@ -515,6 +562,9 @@ class NTTDA(lib.StreamObject):
         self.converged = None
         self.e = None
         self.xy = None
+        self.reference_root_index = None
+        self.reference_root_energy = None
+        self.reference_root_overlap = None
 
     gen_vind_sfd = gen_vind_sfd
 
@@ -583,6 +633,7 @@ class NTTDA(lib.StreamObject):
             nroots=nroots,
             pick=all_eigs,
             max_cycle=self.max_cycle,
+            max_memory=self.max_memory,
             verbose=log,
         )
         energies = np.asarray(cp.asnumpy(cp.asarray(energies)))
@@ -601,12 +652,40 @@ class NTTDA(lib.StreamObject):
         csidx, osidx, vsidx = _orbital_indices(self._scf)
         nocc = len(csidx) + len(osidx)
         nvir = len(osidx) + len(vsidx)
-        xy = [(cp.asarray(xi).reshape(nocc, nvir), 0) for xi in x1]
-        mask = np.abs(energies) > 1e-8
-        self.e = energies[mask]
-        self.xy = [pair for pair, keep in zip(xy, mask) if keep]
+        reference = cp.asarray(
+            _spin_lowered_reference_vector(
+                nocc, nvir, len(osidx),
+            )
+        )
+        vectors = cp.stack([cp.asarray(xi).ravel() for xi in x1])
+        vector_norms = cp.linalg.norm(vectors, axis=1)
+        if bool(cp.any(vector_norms <= np.finfo(float).eps)):
+            raise RuntimeError('NTTDA Davidson returned a zero-norm eigenvector')
+        reference_overlaps = cp.asnumpy(
+            cp.abs(vectors.conj() @ reference) / vector_norms
+        )
+        reference_index, physical_order = _select_physical_root_order(
+            energies,
+            reference_overlaps,
+            nstates,
+            overlap_tol=self.reference_overlap_tol,
+            energy_tol=max(
+                self.reference_energy_tol, 100.0 * self.conv_tol,
+            ),
+        )
+
+        self.reference_root_index = reference_index
+        self.reference_root_energy = float(energies[reference_index])
+        self.reference_root_overlap = float(
+            reference_overlaps[reference_index]
+        )
+        self.e = energies[physical_order]
+        self.xy = [
+            (cp.asarray(x1[index]).reshape(nocc, nvir), 0)
+            for index in physical_order
+        ]
         self.nstates = len(self.e)
-        self.converged = converged[mask]
+        self.converged = converged[physical_order]
         log.timer('GPU NTTDA', *t0)
         return self.e, self.xy
 

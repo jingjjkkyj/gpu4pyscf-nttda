@@ -85,6 +85,69 @@ class KnownValues(unittest.TestCase):
         self.assertFalse(driver.use_etfs)
         self.assertEqual(driver.nstates_solver, 4)
         self.assertEqual(driver.cphf_max_cycle, 77)
+        self.assertEqual(driver.state_ordering, 'energy')
+
+    def test_energy_ordering_keeps_solver_order_and_aligns_phase(self):
+        driver = FSSH_NTTDA(
+            FakeNTTDA(self.mol), states=[1, 2], root_overlap_tol=0.4,
+        )
+        td = types.SimpleNamespace(
+            e=np.array([0.1, 0.2]),
+            xy=[
+                (np.array([[1.0, 0.0]]), 0),
+                (np.array([[0.0, 1.0]]), 0),
+            ],
+            converged=np.array([True, True]),
+        )
+        tracking = {
+            'C': np.eye(2),
+            'occ': np.array([1.0, 0.0]),
+            'xy_p': [
+                np.array([[0.6, 0.8]]),
+                np.array([[0.8, -0.6]]),
+            ],
+            's_occ': np.eye(1),
+            's_vir': np.eye(2),
+        }
+
+        driver._track_roots(self.mol, td, tracking)
+
+        self.assertTrue(np.allclose(td.e, [0.1, 0.2]))
+        self.assertEqual(driver.root_assignment, [0, 1])
+        self.assertTrue(np.allclose(td.xy[0][0], [[1.0, 0.0]]))
+        self.assertTrue(np.allclose(td.xy[1][0], [[0.0, -1.0]]))
+        self.assertTrue(np.allclose(driver.root_overlaps, [0.6, 0.6]))
+
+    def test_overlap_ordering_is_explicit_opt_in(self):
+        driver = FSSH_NTTDA(
+            FakeNTTDA(self.mol),
+            states=[1, 2],
+            state_ordering='overlap',
+            root_overlap_tol=0.4,
+        )
+        td = types.SimpleNamespace(
+            e=np.array([0.1, 0.2]),
+            xy=[
+                (np.array([[1.0, 0.0]]), 0),
+                (np.array([[0.0, 1.0]]), 0),
+            ],
+            converged=np.array([True, True]),
+        )
+        tracking = {
+            'C': np.eye(2),
+            'occ': np.array([1.0, 0.0]),
+            'xy_p': [
+                np.array([[0.6, 0.8]]),
+                np.array([[0.8, -0.6]]),
+            ],
+            's_occ': np.eye(1),
+            's_vir': np.eye(2),
+        }
+
+        driver._track_roots(self.mol, td, tracking)
+
+        self.assertTrue(np.allclose(td.e, [0.2, 0.1]))
+        self.assertEqual(driver.root_assignment, [1, 0])
 
     def test_invalid_root_tracking_buffer_is_rejected(self):
         td = FakeNTTDA(self.mol)
@@ -95,6 +158,14 @@ class KnownValues(unittest.TestCase):
                     FSSH_NTTDA(
                         td, states=[1, 2], root_tracking_buffer=value,
                     )
+
+    def test_invalid_state_ordering_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'state_ordering'):
+            FSSH_NTTDA(
+                FakeNTTDA(self.mol),
+                states=[1, 2],
+                state_ordering='character',
+            )
 
     def test_invalid_cphf_max_cycle_is_rejected(self):
         td = FakeNTTDA(self.mol)
