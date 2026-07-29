@@ -369,6 +369,10 @@ def _make_gradients_class():
 
         def _analytic_components(self, xy, atmlst, response_cache=None):
             if response_cache is None:
+                response_cache = getattr(
+                    self, 'shared_response_cache', None,
+                )
+            if response_cache is None:
                 response_cache = make_gpu_response_cache(
                     self.base, self._gmf,
                 )
@@ -411,3 +415,64 @@ def Gradients(td):
 
 
 Grad = Gradients
+
+
+def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
+                  cphf_max_cycle=None, use_etfs=True):
+    '''One dynamics frame: gradient of the active state plus NAC pairs.
+
+    All geometry-fixed intermediates -- the spin-flip reference kernel,
+    UKS response closures, spin Fock pair, F0/Fz, and the J/K derivative
+    engines (VHFOpt / Int3c2eOpt) -- are built once and shared across the
+    gradient and every NAC pair.
+
+    Returns ``{'grad': (natm, 3), 'nac': {(i, j): (natm, 3)}}``.  NAC
+    entries are derivative couplings (the energy-scaled numerator divided
+    by the state gap); ``use_etfs=False`` includes the moving-CSF term,
+    while ``use_etfs=True`` retains the ETF/Hellmann--Feynman term.
+    '''
+    from gpu4pyscf.nac.nttda import NAC as make_nac
+
+    nstates = len(td.e)
+    if not 1 <= active_state <= nstates:
+        raise ValueError(
+            'active_state must be in [1, %d]' % nstates,
+        )
+    nac_pairs = tuple((int(i), int(j)) for i, j in nac_pairs)
+    for state_i, state_j in nac_pairs:
+        if not 1 <= state_i <= nstates or not 1 <= state_j <= nstates:
+            raise ValueError(
+                'NAC states must be in [1, %d]' % nstates,
+            )
+        if state_i == state_j:
+            raise ValueError('NAC pairs require two distinct states')
+
+    grad = Gradients(td)
+    grad.verbose = 0
+    grad.cphf_conv_tol = cphf_conv_tol
+    grad.cphf_max_cycle = cphf_max_cycle
+    cache = make_gpu_response_cache(grad.base, grad._gmf)
+    grad.shared_response_cache = cache
+    backend = grad.nttda_jk_ledger_backend
+
+    result = {'grad': np.asarray(grad.kernel(state=active_state)),
+              'nac': {}}
+    if nac_pairs:
+        nac = make_nac(td)
+        nac.verbose = 0
+        nac.cphf_conv_tol = cphf_conv_tol
+        nac.cphf_max_cycle = cphf_max_cycle
+        nac.use_etfs = use_etfs
+        nac.shared_response_cache = cache
+        nac.nttda_jk_ledger_backend = backend
+        for state_i, state_j in nac_pairs:
+            # ``td.xy`` already carries one globally aligned phase per root.
+            # The forge NAC driver's two-slot history is intended for one
+            # fixed pair across geometries; reusing it across different pairs
+            # would compare unrelated roots and can introduce a spurious sign.
+            nac.reset_phase()
+            value = nac.kernel(
+                state_I=state_i, state_J=state_j, ediff=True,
+            )
+            result['nac'][(state_i, state_j)] = np.asarray(value)
+    return result

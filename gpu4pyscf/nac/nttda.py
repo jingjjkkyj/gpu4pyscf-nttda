@@ -21,6 +21,7 @@ derivative-ledger contractions run on GPU.
 '''
 
 from gpu4pyscf.grad.nttda import (
+    DFLedgerBackend,
     LedgerBackend,
     _import_forge,
     _resolve_input,
@@ -35,12 +36,20 @@ def _make_nac_class():
         '''GPU-accelerated NTTDA NACs (CPU formulas, GPU integrals).'''
 
         def __init__(self, td):
+            from gpu4pyscf.df.df_jk import _DFHF
+
             cpu_td, gmf = _resolve_input(td)
             super().__init__(cpu_td)
             self._gmf = gmf
-            self.nttda_jk_ledger_backend = LedgerBackend(gmf)
+            if isinstance(gmf, _DFHF):
+                self.nttda_jk_ledger_backend = DFLedgerBackend(gmf)
+            else:
+                self.nttda_jk_ledger_backend = LedgerBackend(gmf)
 
         def _make_response_cache(self):
+            shared = getattr(self, 'shared_response_cache', None)
+            if shared is not None:
+                return shared
             return make_gpu_response_cache(self.base, self._gmf)
 
         def _gradient_driver(self, verbose=None):

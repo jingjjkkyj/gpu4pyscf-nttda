@@ -314,7 +314,6 @@ def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True):
 def gen_vind_sfd(td):
     mf = td._scf
     mo_coeff = cp.asarray(mf.mo_coeff)
-    mo_occ = cp.asarray(mf.mo_occ)
 
     csidx, osidx, vsidx = _orbital_indices(mf)
     orbcs = mo_coeff[:, csidx]
@@ -561,20 +560,43 @@ class NTTDA(lib.StreamObject):
         precond = self.get_precond(hdiag)
         if x0 is None:
             x0 = self.init_guess(hdiag, nstates)
+        else:
+            x0 = cp.asarray(x0).reshape(-1, hdiag.size)
+            # Keep diagonal guesses alongside cross-geometry warm starts.
+            # The latter contain only the physical roots because the
+            # spin-lowered zero-energy reference is filtered after each
+            # frame; diagonal guesses ensure that reference root and any new
+            # crossing root remain discoverable.
+            x0 = cp.concatenate((x0, self.init_guess(hdiag, nstates)), axis=0)
 
         def all_eigs(w, v, nroots, envs):
             return w, v, np.arange(w.size)
 
-        self.converged, energies, x1 = lr_eigh(
+        converged, energies, x1 = lr_eigh(
             vind, x0, precond,
             tol_residual=self.conv_tol,
-            lindep=self.lindep,
+            # ``lr_eigh`` compares the squared norm of a preconditioned trial
+            # vector against ``lindep``.  Keep a small margin below the target
+            # residual squared so the last useful correction is not discarded
+            # before a tightly converged root reaches ``conv_tol``.
+            lindep=min(self.lindep, 1e-2 * self.conv_tol ** 2),
             nroots=nroots,
             pick=all_eigs,
             max_cycle=self.max_cycle,
             verbose=log,
         )
         energies = np.asarray(cp.asnumpy(cp.asarray(energies)))
+        converged = np.atleast_1d(
+            cp.asnumpy(cp.asarray(converged)),
+        ).astype(bool, copy=False)
+        if len(converged) != len(energies):
+            raise RuntimeError(
+                'Davidson convergence flags are inconsistent with roots'
+            )
+        if len(x1) != len(energies):
+            raise RuntimeError(
+                'Davidson eigenvectors are inconsistent with roots'
+            )
 
         csidx, osidx, vsidx = _orbital_indices(self._scf)
         nocc = len(csidx) + len(osidx)
@@ -584,8 +606,7 @@ class NTTDA(lib.StreamObject):
         self.e = energies[mask]
         self.xy = [pair for pair, keep in zip(xy, mask) if keep]
         self.nstates = len(self.e)
-        if isinstance(self.converged, (list, tuple, np.ndarray)):
-            self.converged = np.asarray(self.converged)[mask]
+        self.converged = converged[mask]
         log.timer('GPU NTTDA', *t0)
         return self.e, self.xy
 

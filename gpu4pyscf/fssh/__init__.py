@@ -13,6 +13,7 @@ nonadiabatic couplings are evaluated by GPU4PySCF drivers.
 """
 
 from .fssh import FSSH, PES, h5_to_xyz
+from .fssh_nttda import FSSH_NTTDA
 from .fssh_sf import FSSH_SF
 from .wigner_sampling import wigner, wigner_samples
 
@@ -21,6 +22,7 @@ FSSH_SFTDDFT = FSSH_SF
 
 __all__ = [
     "FSSH",
+    "FSSH_NTTDA",
     "FSSH_SF",
     "FSSH_SFTDA",
     "FSSH_SFTDDFT",
