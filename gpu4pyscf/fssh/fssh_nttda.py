@@ -152,8 +152,9 @@ class FSSH_NTTDA(FSSH):
                 'diis_damp', 'diis_start_cycle', 'diis_space_rollback',
                 'conv_check', 'disp', 'nlc', 'small_rho_cutoff', 'DIIS'):
             self._copy_setting(template, mf, name)
-        for name in ('omega', 'disp_with_3body'):
-            self._copy_setting(template, mf, name)
+        if getattr(template, 'omega', None) is not None:
+            self._copy_setting(template, mf, 'omega')
+        self._copy_setting(template, mf, 'disp_with_3body')
         if isinstance(getattr(template, 'diis', None), (bool, int)):
             mf.diis = template.diis
         self._copy_grid_settings(template.grids, mf.grids)

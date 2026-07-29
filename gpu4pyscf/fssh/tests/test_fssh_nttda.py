@@ -225,6 +225,18 @@ class KnownValues(unittest.TestCase):
 
         self.assertAlmostEqual(rebuilt.omega, 0.37)
 
+    def test_rebuilt_scf_does_not_assign_unset_range_separation(self):
+        from gpu4pyscf.dft import roks
+
+        td = FakeNTTDA(self.mol)
+        td._scf = roks.ROKS(self.mol, xc='B3LYP')
+        self.assertIsNone(td._scf.omega)
+        driver = FSSH_NTTDA(td, states=[1, 2])
+
+        rebuilt = driver._new_scf(self.mol.copy())
+
+        self.assertIsNone(rebuilt.omega)
+
 
 if __name__ == '__main__':
     unittest.main()
