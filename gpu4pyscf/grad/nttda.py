@@ -508,6 +508,9 @@ class DFLedgerBackend:
             'zero_rank_pairs_skipped': 0,
             'compression_seconds': 0.0,
             'integral_seconds': 0.0,
+            'integral_layer_stats': [],
+            'lower_bound_gates': 0,
+            'lower_bound_rejected': 0,
             'compression_enabled': self.compress_slots,
             'compression_details': [],
         }
@@ -644,6 +647,8 @@ class DFLedgerBackend:
         for omega, items in groups.items():
             factorize = any(operator == 'k' for operator, _term in items)
             opt = self._get_opt(omega)
+            nao = opt.mol.nao
+            naux = opt.auxmol.nao
             if factorize:
                 # Seed factors in the original orientation.  K pairs below
                 # then obtain transposes by swapping factor tags, matching the
@@ -676,13 +681,26 @@ class DFLedgerBackend:
                     selected_factors = candidate_factors
                 elif details['compressed']:
                     raw_gpu = gpu_pairs(raw_pairs, factorize=True)
-                    candidate_gpu = gpu_pairs(candidate, factorize=True)
-                    if pair_cost(candidate_gpu, opt) < pair_cost(raw_gpu, opt):
-                        selected = candidate
-                        selected_factors = candidate_factors
-                        selected_gpu = candidate_gpu
-                    else:
+                    raw_cost = pair_cost(raw_gpu, opt)
+                    candidate_min_rank = details.get(
+                        'coefficient_rank', 1,
+                    )
+                    candidate_lower_bound = (
+                        2 * candidate_min_rank * candidate_min_rank * naux
+                        + 2 * nao**2
+                    ) * len(candidate)
+                    self.stats['lower_bound_gates'] += 1
+                    if candidate_lower_bound >= raw_cost:
+                        self.stats['lower_bound_rejected'] += 1
                         selected_gpu = raw_gpu
+                    else:
+                        candidate_gpu = gpu_pairs(candidate, factorize=True)
+                        if pair_cost(candidate_gpu, opt) < raw_cost:
+                            selected = candidate
+                            selected_factors = candidate_factors
+                            selected_gpu = candidate_gpu
+                        else:
+                            selected_gpu = raw_gpu
                 if details['compressed'] and selected is candidate:
                     self.stats['compression_accepted'] += 1
                 elif details['compressed']:
@@ -727,14 +745,17 @@ class DFLedgerBackend:
             if not pairs:
                 continue
             integral_started = time.perf_counter()
+            layer_stats = []
             energies = _df_jk_energies_per_atom(
                 opt, pairs,
                 j_factor=j_factors, k_factor=k_factors, sum_results=False,
+                stats_sink=layer_stats,
             )
             energies = cp.asnumpy(cp.asarray(energies))
             self.stats['integral_seconds'] += (
                 time.perf_counter() - integral_started
             )
+            self.stats['integral_layer_stats'].extend(layer_stats)
             for row, slot in zip(energies, slot_index):
                 gradients[slot] += row[atoms]
         return gradients

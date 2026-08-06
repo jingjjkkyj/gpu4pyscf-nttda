@@ -292,7 +292,7 @@ def _j_energy_per_atom(int3c2e_opt, dms, j_factor, hermi=0, verbose=None):
     return ej
 
 def _jk_energies_per_atom(int3c2e_opt, dm_pairs, j_factor=None, k_factor=None,
-                          sum_results=False, verbose=None):
+                          sum_results=False, verbose=None, stats_sink=None):
     '''
     Computes a set of first-order derivatives of J/K contributions for each
     element (density matrix or a pair of density matrices) in dm_pairs.
@@ -316,6 +316,8 @@ def _jk_energies_per_atom(int3c2e_opt, dm_pairs, j_factor=None, k_factor=None,
             No effects
         sum_results : bool
             If True, aggregate all sets of derivatives into a single result.
+        stats_sink : list or None
+            If not None, per-split layer timing dicts are appended here.
 
     Returns:
         An numpy ndarray of shape (*, Natm, 3)
@@ -362,20 +364,22 @@ def _jk_energies_per_atom(int3c2e_opt, dm_pairs, j_factor=None, k_factor=None,
             j_factor_batch = j_factor[p0:p1]
         out.append(_jk_energies_by_dm_factors(
             int3c2e_opt, dm_factors[p0:p1], j_factor_batch, k_factor[p0:p1],
-            sum_results, verbose))
+            sum_results, verbose, stats_sink=stats_sink))
     if sum_results:
         return sum(out)
     else:
         return np.vstack(out)
 
 def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
-                               sum_results, verbose):
+                               sum_results, verbose, stats_sink=None):
     from gpu4pyscf.pbc.df.int2c2e import int2c2e_ip1_per_atom
+    import time as _time
     n_dm = len(dm_factors)
     mol = int3c2e_opt.mol
     auxmol = int3c2e_opt.auxmol
     log = logger.new_logger(mol, verbose)
     t0 = log.init_timer()
+    _layer_t = {}
 
     dm1_factor_l, dm1_factor_r, dm2_factor_l, dm2_factor_r = zip(*dm_factors)
     dm1_noccs = [x.shape[1] for x in dm1_factor_l]
@@ -420,6 +424,7 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     buf1 = cp.empty((blksize, nocc_max, nao))
     j3c_o2o1 = [cp.empty((naux, n2, n1)) for n1, n2 in zip(dm1_noccs, dm2_noccs)]
     j3c_o1o2 = [cp.empty((naux, n1, n2)) for n1, n2 in zip(dm1_noccs, dm2_noccs)]
+    _t_contract_dm = _time.perf_counter()
     for kbatch in range(aux_batches):
         compressed = eval_j3c(aux_batch_id=kbatch, out=buf)
         naux_in_batch = compressed.shape[1]
@@ -440,8 +445,10 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
                 auxvec1[:,aux0:aux1] = cp.einsum('pqr,nqp->nr', j3c, dm1)
                 auxvec2[:,aux0:aux1] = cp.einsum('pqr,nqp->nr', j3c, dm2)
     j3c_full = buf = buf1 = eval_j3c = j3c = tmp = compressed = None
+    _layer_t['contract_dm'] = _time.perf_counter() - _t_contract_dm
     t0 = log.timer_debug1('contract dm', *t0)
 
+    _t_metric = _time.perf_counter()
     aux_coeff = cp.asarray(auxmol.ctr_coeff)
     aux_coeff, tmp = cp.empty_like(aux_coeff), aux_coeff
     aux_coeff[aux_sorting] = tmp
@@ -465,8 +472,10 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
         auxvec1_jfac = j_factor[:,None] * auxvec1
         auxvec2_jfac = j_factor[:,None] * auxvec2
     metric = None
+    _layer_t['metric_transform'] = _time.perf_counter() - _t_metric
 
     # (d/dX P|Q) contributions
+    _t_int2c2e = _time.perf_counter()
     if sum_results:
         dm_aux = cp.zeros((naux, naux))
         buf = cp.empty_like(dm_aux)
@@ -497,9 +506,11 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             ejk_aux.append(-int2c2e_ip1_per_atom(auxmol, dm_aux))
         ejk_aux = cp.array(np.stack(ejk_aux))
     t0 = log.timer_debug1('contract int2c2e_ip1', *t0)
+    _layer_t['int2c2e_ip1'] = _time.perf_counter() - _t_int2c2e
     auxvec1 = auxvec2 = dm_aux = None
 
     # contract the derivatives and the pseudo DM/rho
+    _t_ejk_kernel = _time.perf_counter()
     nsp_per_block, gout_stride, shm_size = int3c2e_scheme(mol.omega, 54)
     gout_stride = cp.asarray(gout_stride, dtype=np.int32)
     lmax = mol.uniq_l_ctr[:,0].max()
@@ -591,6 +602,12 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     ejk *= .5
     ejk = ejk.get()
     t0 = log.timer_debug1('contract int3c2e_ejk_ip1', *t0)
+    _layer_t['ejk_kernel'] = _time.perf_counter() - _t_ejk_kernel
+    _layer_t['n_dm'] = n_dm
+    _layer_t['naux'] = int(naux)
+    _layer_t['nao'] = int(nao)
+    if stats_sink is not None:
+        stats_sink.append(dict(_layer_t))
     return ejk
 
 def _j_energies_per_atom(int3c2e_opt, dm_pairs, j_factor,
