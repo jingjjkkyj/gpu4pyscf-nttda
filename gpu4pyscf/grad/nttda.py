@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-'''Hybrid GPU driver for NTTDA ``deltaS = -1`` excited-state gradients.
+'''GPU driver for NTTDA ``deltaS = -1`` excited-state gradients.
 
-Orchestration and XC quadrature reuse the validated CPU forge
+Orchestration and scientific formulas reuse the validated CPU forge
 implementation (pyscf-forge NTTDA, importable side by side with
-gpu4pyscf); every four-center integral task runs on GPU:
+gpu4pyscf); expensive integral and GGA grid work run on GPU:
 
 - response J/K builds (M matrix, Fock builds, Z-vector iterations) are
   routed from the CPU twin objects to a GPU ROKS/UKS backend;
@@ -27,8 +27,9 @@ gpu4pyscf); every four-center integral task runs on GPU:
   ``cpu_K = -2*[gpu(L, R^T) + gpu(L^T, R)]``);
 - the ground-state ROKS gradient uses the native GPU implementation.
 
-XC derivative quadrature (the forge ``xc`` backend) stays on CPU in this
-version; for hybrid functionals the four-center work dominates.
+For GGA functionals, response, Fock-Z, post-Z derivative contractions, and
+the iterative UKS fxc action are evaluated by one geometry-fixed GPU XC
+backend.  The CPU forge remains the formula and orchestration reference.
 '''
 
 import importlib
@@ -81,6 +82,13 @@ def _validate_forge_capabilities(forge_grad, forge_roks):
     if not hasattr(forge_roks, 'ResponseCache'):
         raise ImportError(
             'Loaded CPU forge NTTDA lacks the ResponseCache accelerator seam'
+        )
+    frame_stage = getattr(forge_roks, '_stage_frame_jk', None)
+    if (
+            frame_stage is None
+            or 'frame_xc_backend' not in frame_stage.__code__.co_consts):
+        raise ImportError(
+            'Loaded CPU forge NTTDA lacks the GPU frame-XC backend seam'
         )
     delta = importlib.import_module(
         'pyscf.grad.nttda.delta_s_minus_one',
@@ -248,6 +256,9 @@ def build_cpu_twin(gpu_td):
     if converged is None:
         converged = []
     cpu_td.converged = cp.asnumpy(cp.asarray(converged))
+    for name in ('_nttda_gpu_fxc_ref', '_nttda_gpu_fock0_fockz'):
+        if hasattr(gpu_td, name):
+            setattr(cpu_td, name, getattr(gpu_td, name))
     return cpu_td
 
 
@@ -520,16 +531,66 @@ class LedgerBackend:
         return gradients
 
 
-def make_gpu_response_cache(cpu_td, gmf):
-    '''Forge ResponseCache whose UKS response view is GPU-JK-routed.'''
+def make_gpu_xc_backend(cpu_td, gmf):
+    '''Build the geometry-fixed GPU XC backend where it is supported.'''
+    if gmf._numint._xc_type(gmf.xc) != 'GGA':
+        return None
+    from gpu4pyscf.grad.nttda_xc import GPUXCFrameBackend
+
+    return GPUXCFrameBackend(gmf, cpu_td)
+
+
+def make_gpu_response_cache(cpu_td, gmf, xc_backend=None):
+    '''Forge ResponseCache with GPU-native GGA response and GPU J/K.'''
     _forge_grad, forge_roks, _forge_solver = _import_forge()
+    if xc_backend is None:
+        xc_backend = make_gpu_xc_backend(cpu_td, gmf)
 
     class _GPUResponseCache(forge_roks.ResponseCache):
+        def __init__(self, tdobj):
+            super().__init__(tdobj)
+            self.frame_xc_backend = xc_backend
+            if xc_backend is not None:
+                self.extra['fock0_fockz'] = (
+                    xc_backend.spin_lowering_fock0_fockz()
+                )
+
         def reference(self):
             reference = super().reference()
             if reference is not self._tdobj._scf:
                 route_jk_to_gpu(reference, gmf)
             return reference
+
+        def response(self, hermi):
+            if xc_backend is None:
+                return super().response(hermi)
+            if hermi not in self._responses:
+                response = xc_backend.response(hermi)
+                self.stats['response_builds'] += 1
+
+                def counted_response(*args, **kwargs):
+                    density = np.asarray(args[0])
+                    if density.ndim <= 3:
+                        width = 1
+                    elif density.shape[0] == 2:
+                        width = int(np.prod(density.shape[1:-2]))
+                    else:
+                        width = int(np.prod(density.shape[:-2]))
+                    self.stats['response_calls'] += 1
+                    self.stats['response_rhs'] += width
+                    self.stats['response_batch_widths'].append(width)
+                    return response(*args, **kwargs)
+
+                self._responses[hermi] = counted_response
+            return self._responses[hermi]
+
+        def fxc_ref(self):
+            if xc_backend is not None:
+                raise RuntimeError(
+                    'GPU-native GGA frame unexpectedly requested the CPU '
+                    'spin-flip fxc reference'
+                )
+            return super().fxc_ref()
 
     return _GPUResponseCache(cpu_td)
 
@@ -679,7 +740,11 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     grad.verbose = 0
     grad.cphf_conv_tol = cphf_conv_tol
     grad.cphf_max_cycle = cphf_max_cycle
-    cache = make_gpu_response_cache(grad.base, grad._gmf)
+    xctype = grad.base._scf._numint._xc_type(grad.base._scf.xc)
+    gpu_xc_backend = make_gpu_xc_backend(grad.base, grad._gmf)
+    cache = make_gpu_response_cache(
+        grad.base, grad._gmf, xc_backend=gpu_xc_backend,
+    )
     grad.shared_response_cache = cache
     backend = grad.nttda_jk_ledger_backend
 
@@ -705,9 +770,7 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     xc_started = time.perf_counter()
     grad_xc_terms = None
     nac_xc_terms = [None] * len(nac_pairs)
-    xctype = grad.base._scf._numint._xc_type(grad.base._scf.xc)
-    if xctype == 'GGA' and nac_pairs:
-        xc_backend = importlib.import_module('pyscf.grad.nttda.xc')
+    if xctype == 'GGA':
         grad_channel, spaces, grad_pz = delta.gradient_xc_request(
             grad.base, grad.base.xy[active_state - 1],
         )
@@ -721,10 +784,10 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
             )
             channels.extend(request[0])
             pz_batch.append(request[2])
-        response_xc = xc_backend.gga_response_terms_batch(
+        response_xc = gpu_xc_backend.gga_response_terms_batch(
             grad, grad.base, channels, atmlst=atmlst,
         )
-        fockz_xc = xc_backend.gga_fockz_terms_batch(
+        fockz_xc = gpu_xc_backend.gga_fockz_terms_batch(
             grad, grad.base, spaces, pz_batch, atmlst=atmlst,
         )
         grad_xc_terms = (response_xc[0], fockz_xc[0])
@@ -792,11 +855,11 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
             'xc_type': xctype,
             'xc_response_channels': (
                 1 + 2 * len(nac_pairs)
-                if xctype == 'GGA' and nac_pairs else 0
+                if xctype == 'GGA' else 0
             ),
             'xc_fockz_tasks': (
                 1 + len(nac_pairs)
-                if xctype == 'GGA' and nac_pairs else 0
+                if xctype == 'GGA' else 0
             ),
             'timings': {
                 'drivers': driver_seconds,
@@ -808,6 +871,7 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
                 'total': time.perf_counter() - frame_started,
             },
             'jk_backend': dict(getattr(backend, 'stats', {})),
+            'xc_backend': dict(getattr(gpu_xc_backend, 'stats', {})),
             'response_cache': dict(getattr(cache, 'stats', {})),
             'response_jk': dict(getattr(
                 cache.reference(), '_nttda_jk_route_stats', {},

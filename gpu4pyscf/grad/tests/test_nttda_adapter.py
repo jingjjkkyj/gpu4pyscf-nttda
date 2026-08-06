@@ -122,6 +122,8 @@ class KnownValues(unittest.TestCase):
             e=np.array([0.1, 0.2]),
             xy=[(np.ones((1, 1)), 0), (np.ones((1, 1)), 0)],
             converged=np.array([True, True]),
+            _nttda_gpu_fxc_ref=object(),
+            _nttda_gpu_fock0_fockz=object(),
         )
 
         with mock.patch.object(
@@ -131,6 +133,13 @@ class KnownValues(unittest.TestCase):
             cpu_td = nttda.build_cpu_twin(gpu_td)
 
         self.assertAlmostEqual(cpu_td._scf.omega, 0.37)
+        self.assertIs(
+            cpu_td._nttda_gpu_fxc_ref, gpu_td._nttda_gpu_fxc_ref,
+        )
+        self.assertIs(
+            cpu_td._nttda_gpu_fock0_fockz,
+            gpu_td._nttda_gpu_fock0_fockz,
+        )
 
     def test_cpu_twin_does_not_assign_an_unset_range_separation(self):
         class FakeCpuMF:

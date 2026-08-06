@@ -393,6 +393,11 @@ def gen_vind_sfd(td):
     else:
         fock = mf.get_fock()
     fock0 = 0.5 * (cp.asarray(fock.focka) + cp.asarray(fock.fockb))
+    # The derivative of the same electronic frame needs both objects again.
+    # Keep them device-resident so the gradient/NAC driver does not rebuild a
+    # spin-GGA kernel and an open-shell Fock after the Davidson solve.
+    td._nttda_gpu_fxc_ref = fxc_ref
+    td._nttda_gpu_fock0_fockz = (fock0, fockz)
 
     fock_coco0 = orbos.T @ (fock0 - fockz) @ orbos
     fock_coco1 = orbcs.T @ (fock0 + fockz) @ orbcs
