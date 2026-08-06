@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""GPU-native fixed-grid GGA contractions for one NTTDA frame.
+"""GPU-native fixed-grid GGA/MGGA contractions for one NTTDA frame.
 
 The CPU forge remains the formula/reference implementation.  This module
 evaluates its expensive grid algebra with the native gpu4pyscf NumInt and
@@ -57,13 +57,17 @@ class _DensityDerivativeWorkspace:
 
     contracted: cp.ndarray
     contracted_transpose: cp.ndarray
+    xctype: str
 
     def derivatives(self, delta, atom_indices):
         contracted = self.contracted[:, :, atom_indices]
         contracted_t = self.contracted_transpose[:, :, atom_indices]
         density_count = len(contracted)
         grids = contracted.shape[-1]
-        output = cp.empty((density_count, 4, grids), dtype=contracted.dtype)
+        feature_count = 4 if self.xctype == "GGA" else 5
+        output = cp.empty(
+            (density_count, feature_count, grids), dtype=contracted.dtype,
+        )
 
         output[:, 0] = cp.einsum(
             "ag,nag->ng", delta[0], contracted_t[:, 0],
@@ -84,10 +88,19 @@ class _DensityDerivativeWorkspace:
             output[:, feature] += cp.einsum(
                 "nag,ag->ng", contracted[:, 0], delta[feature],
             )
+        if self.xctype == "MGGA":
+            output[:, 4] = 0.5 * cp.einsum(
+                "fag,nfag->ng", delta[1:4], contracted_t[:, 1:4],
+            )
+            output[:, 4] += 0.5 * cp.einsum(
+                "nfag,fag->ng", contracted[:, 1:4], delta[1:4],
+            )
         return output
 
 
-def _density_workspace(ao, densities, hermitian=False):
+def _density_workspace(ao, densities, hermitian=False, xctype="GGA"):
+    if xctype not in ("GGA", "MGGA"):
+        raise ValueError(f"unsupported density workspace XC type {xctype}")
     densities = cp.asarray(densities)
     contracted = cp.einsum(
         "nba,fbg->nfag", densities, ao[:4],
@@ -98,7 +111,7 @@ def _density_workspace(ao, densities, hermitian=False):
         contracted_t = cp.einsum(
             "nab,fbg->nfag", densities, ao[:4],
         )
-    return _DensityDerivativeWorkspace(contracted, contracted_t)
+    return _DensityDerivativeWorkspace(contracted, contracted_t, xctype)
 
 
 def _pair_feature_batches(ao, densities):
@@ -166,12 +179,75 @@ def _gga_pair_kernel_cross(left, right):
     return output
 
 
+def _mgga_pair_potential(kernel, features):
+    """Differentiate an MGGA kernel contracted with AO-pair features."""
+    output = cp.zeros_like(features)
+    output[0, 0] = cp.einsum(
+        "abg,abg->g", kernel[:4, :4], features,
+    )
+    output[1:4, 0] = kernel[1:4, 0] * features[0, 0]
+    output[1:4, 0] += cp.einsum(
+        "ijg,jg->ig", kernel[1:4, 1:4], features[0, 1:4],
+    )
+    output[1:4, 0] += 0.5 * kernel[4, 0][None] * features[1:4, 0]
+    output[1:4, 0] += 0.5 * cp.einsum(
+        "jg,ijg->ig", kernel[4, 1:4], features[1:4, 1:4],
+    )
+    output[0, 1:4] = kernel[0, 1:4] * features[0, 0]
+    output[0, 1:4] += cp.einsum(
+        "ijg,ig->jg", kernel[1:4, 1:4], features[1:4, 0],
+    )
+    output[0, 1:4] += 0.5 * kernel[0, 4][None] * features[0, 1:4]
+    output[0, 1:4] += 0.5 * cp.einsum(
+        "ig,ijg->jg", kernel[1:4, 4], features[1:4, 1:4],
+    )
+    output[1:4, 1:4] = kernel[1:4, 1:4] * features[0, 0]
+    output[1:4, 1:4] += 0.5 * cp.einsum(
+        "ig,jg->ijg", kernel[1:4, 4], features[0, 1:4],
+    )
+    output[1:4, 1:4] += 0.5 * cp.einsum(
+        "jg,ig->ijg", kernel[4, 1:4], features[1:4, 0],
+    )
+    output[1:4, 1:4] += (
+        0.25 * kernel[4, 4][None, None] * features[1:4, 1:4]
+    )
+    return output
+
+
+def _mgga_pair_kernel_cross(left, right):
+    grids = left.shape[-1]
+    output = cp.zeros((5, 5, grids), dtype=left.dtype)
+    output[:4, :4] = _gga_pair_kernel_cross(left, right)
+    output[4, 0] = 0.5 * cp.einsum(
+        "ig,ig->g", left[1:4, 0], right[1:4, 0],
+    )
+    output[0, 4] = 0.5 * cp.einsum(
+        "jg,jg->g", left[0, 1:4], right[0, 1:4],
+    )
+    output[4, 1:4] = 0.5 * cp.einsum(
+        "ig,ijg->jg", left[1:4, 0], right[1:4, 1:4],
+    )
+    output[4, 1:4] += 0.5 * cp.einsum(
+        "ijg,ig->jg", left[1:4, 1:4], right[1:4, 0],
+    )
+    output[1:4, 4] = 0.5 * cp.einsum(
+        "jg,ijg->ig", left[0, 1:4], right[1:4, 1:4],
+    )
+    output[1:4, 4] += 0.5 * cp.einsum(
+        "ijg,jg->ig", left[1:4, 1:4], right[0, 1:4],
+    )
+    output[4, 4] = 0.25 * cp.einsum(
+        "ijg,ijg->g", left[1:4, 1:4], right[1:4, 1:4],
+    )
+    return output
+
+
 def _forge_xc():
     return importlib.import_module("pyscf.grad.nttda.xc")
 
 
 class GPUXCFrameBackend:
-    """Geometry-fixed GPU GGA backend shared by all derivative tasks."""
+    """Geometry-fixed GPU GGA/MGGA backend shared by derivative tasks."""
 
     def __init__(self, gmf, cpu_td):
         self.gmf = gmf
@@ -181,9 +257,10 @@ class GPUXCFrameBackend:
         self.grids = gmf.grids
         if self.grids.coords is None:
             self.grids.build(sort_grids=True)
-        if self.ni._xc_type(gmf.xc) != "GGA":
+        self.xctype = self.ni._xc_type(gmf.xc)
+        if self.xctype not in ("GGA", "MGGA"):
             raise NotImplementedError(
-                "GPU-native NTTDA XC currently supports GGA functionals"
+                "GPU-native NTTDA XC currently supports GGA/MGGA functionals"
             )
         xcfuns = self.ni._init_xcfuns(gmf.xc, spin=1)
         if not all(getattr(function, "on_gpu", False)
@@ -265,12 +342,16 @@ class GPUXCFrameBackend:
         actual runtime capability instead of trusting the ``on_gpu`` flag.
         """
         rho = cp.asarray((
-            ((0.37, 0.43), (0.05, -0.03), (0.02, 0.04), (-0.01, 0.03)),
-            ((0.21, 0.29), (-0.02, 0.01), (0.03, -0.02), (0.04, 0.02)),
+            ((0.37, 0.43), (0.05, -0.03), (0.02, 0.04),
+             (-0.01, 0.03), (0.11, 0.13)),
+            ((0.21, 0.29), (-0.02, 0.01), (0.03, -0.02),
+             (0.04, 0.02), (0.07, 0.09)),
         ))
+        if self.xctype == "GGA":
+            rho = rho[:, :4]
         try:
             values = self.ni.eval_xc_eff(
-                self.gmf.xc, rho, deriv=3, xctype="GGA", spin=1,
+                self.gmf.xc, rho, deriv=3, xctype=self.xctype, spin=1,
             )
             fxc, kxc = values[2], values[3]
             valid = (
@@ -281,12 +362,13 @@ class GPUXCFrameBackend:
             )
         except Exception as error:
             raise RuntimeError(
-                "GPU-native NTTDA derivatives require working spin-GGA "
+                f"GPU-native NTTDA derivatives require working spin-{self.xctype} "
                 "fxc/kxc kernels (gpu4pyscf-libxc-cuda12x>=0.8.1)"
             ) from error
         if not valid:
             raise RuntimeError(
-                "GPU libxc returned an invalid spin-GGA fxc/kxc kernel; "
+                f"GPU libxc returned an invalid spin-{self.xctype} fxc/kxc "
+                "kernel; "
                 "install gpu4pyscf-libxc-cuda12x>=0.8.1"
             )
 
@@ -403,8 +485,11 @@ class GPUXCFrameBackend:
         # in the Fock-Z and post-Z grid passes.
         free_bytes, _total_bytes = cp.cuda.runtime.memGetInfo()
         components = (deriv + 1) * (deriv + 2) * (deriv + 3) // 6
+        feature_count = 4 if self.xctype == "GGA" else 5
+        kernel_arrays = feature_count**2 + 2 * feature_count**3
         estimated_bytes = (
-            (components * self.nao + 144) * len(self.grids.weights) * 8
+            (components * self.nao + kernel_arrays)
+            * len(self.grids.weights) * 8
         )
         cache_budget = min(int(0.35 * free_bytes), 12 * 1024**3)
         cache_blocks = deriv == 2 and estimated_bytes <= cache_budget
@@ -451,14 +536,14 @@ class GPUXCFrameBackend:
             self.mo_sorted[indices],
             self.mo_occ,
             None,
-            "GGA",
+            self.xctype,
             with_lapl=False,
         ) * 0.5
         _exc, _vxc, fxc, kxc = self.ni.eval_xc_eff(
             self.gmf.xc,
             cp.stack((rho0, rho0)),
             deriv=3,
-            xctype="GGA",
+            xctype=self.xctype,
             spin=1,
         )
         fref = 0.5 * (
@@ -490,6 +575,22 @@ class GPUXCFrameBackend:
         add_sparse(output, matrix + matrix.T, indices)
 
     @staticmethod
+    def _add_mgga_matrix(output, ao, weights, indices):
+        weights = cp.array(weights, copy=True, order="C")
+        weights[0] *= 0.5
+        scaled = gpu_numint._scale_ao(ao[:4], weights[:4])
+        matrix = ao[0].dot(scaled.T)
+        matrix += matrix.T
+        matrix += gpu_numint._tau_dot(ao, ao, weights[4])
+        add_sparse(output, matrix, indices)
+
+    def _add_xc_matrix(self, output, ao, weights, indices):
+        if self.xctype == "GGA":
+            self._add_gga_matrix(output, ao, weights, indices)
+        else:
+            self._add_mgga_matrix(output, ao, weights, indices)
+
+    @staticmethod
     def _add_pair_matrix(output, ao, tensor, indices):
         matrix = cp.zeros((len(indices), len(indices)), dtype=ao.dtype)
         for left in range(4):
@@ -506,7 +607,7 @@ class GPUXCFrameBackend:
         )
         return cp.asnumpy(matrix)
 
-    def gga_response_terms_batch(
+    def _response_terms_batch(
             self, gradient_driver, tdobj, channel_data_batch,
             atmlst=None, with_direct=True):
         """Evaluate all NTTDA response channels in one GPU grid pass."""
@@ -568,7 +669,9 @@ class GPUXCFrameBackend:
                     ctx["density_stack"], indices,
                 )
                 workspace = (
-                    _density_workspace(ao, masked_stack)
+                    _density_workspace(
+                        ao, masked_stack, xctype=self.xctype,
+                    )
                     if with_direct else None
                 )
                 rho = {}
@@ -578,7 +681,7 @@ class GPUXCFrameBackend:
                         ao,
                         self._masked_density(density, indices),
                         None,
-                        "GGA",
+                        self.xctype,
                         hermi=0,
                         with_lapl=False,
                     )
@@ -589,19 +692,30 @@ class GPUXCFrameBackend:
                     _pair_feature_batches(ao, pair_densities)
                 )
                 pairs = dict(zip(ctx["pair_labels"], pair_values))
+                pair_potential = (
+                    _gga_pair_potential
+                    if self.xctype == "GGA" else _mgga_pair_potential
+                )
+                pair_kernel_cross = (
+                    _gga_pair_kernel_cross
+                    if self.xctype == "GGA" else _mgga_pair_kernel_cross
+                )
+                feature_count = 4 if self.xctype == "GGA" else 5
                 pair_potentials = {
-                    label: _gga_pair_potential(fref, pairs[label])
+                    label: pair_potential(fref, pairs[label])
                     for label in ctx["pair_labels"]
                 }
                 ordinary = {
-                    label: cp.zeros((4, len(grid_weights)))
+                    label: cp.zeros((feature_count, len(grid_weights)))
                     for label in ctx["labels"]
                 }
                 special = {
                     label: cp.zeros((4, 4, len(grid_weights)))
                     for label in ctx["pair_labels"]
                 }
-                reference_alpha = cp.zeros((4, len(grid_weights)))
+                reference_alpha = cp.zeros(
+                    (feature_count, len(grid_weights)),
+                )
                 reference_beta = cp.zeros_like(reference_alpha)
 
                 for term in ctx["terms"]:
@@ -629,7 +743,7 @@ class GPUXCFrameBackend:
                         special[term.source] += (
                             term.vref1 * pair_potentials[term.target]
                         )
-                        pair = term.vref1 * _gga_pair_kernel_cross(
+                        pair = term.vref1 * pair_kernel_cross(
                             pairs[term.target], pairs[term.source],
                         )
                         reference_alpha += cp.einsum(
@@ -648,7 +762,7 @@ class GPUXCFrameBackend:
                     (0, 4, 4, len(grid_weights)),
                 )
                 for label in ctx["labels"]:
-                    self._add_gga_matrix(
+                    self._add_xc_matrix(
                         ctx["potentials"][label], ao,
                         ordinary[label] * grid_weights, indices,
                     )
@@ -657,11 +771,11 @@ class GPUXCFrameBackend:
                         ctx["potentials"][label], ao,
                         special[label] * grid_weights, indices,
                     )
-                self._add_gga_matrix(
+                self._add_xc_matrix(
                     ctx["reference_alpha"], ao,
                     reference_alpha * grid_weights, indices,
                 )
-                self._add_gga_matrix(
+                self._add_xc_matrix(
                     ctx["reference_beta"], ao,
                     reference_beta * grid_weights, indices,
                 )
@@ -723,7 +837,17 @@ class GPUXCFrameBackend:
             ))
         return tuple(output)
 
-    def gga_fockz_terms_batch(
+    def gga_response_terms_batch(self, *args, **kwargs):
+        if self.xctype != "GGA":
+            raise ValueError("GGA response requested from an MGGA backend")
+        return self._response_terms_batch(*args, **kwargs)
+
+    def mgga_response_terms_batch(self, *args, **kwargs):
+        if self.xctype != "MGGA":
+            raise ValueError("MGGA response requested from a GGA backend")
+        return self._response_terms_batch(*args, **kwargs)
+
+    def _fockz_terms_batch(
             self, gradient_driver, tdobj, spaces, pz_batch,
             atmlst=None, with_direct=True):
         """Evaluate every frame ``Pz:Fz`` task in one GPU grid pass."""
@@ -766,7 +890,7 @@ class GPUXCFrameBackend:
                     ao,
                     masked_stack[index],
                     None,
-                    "GGA",
+                    self.xctype,
                     hermi=1,
                     with_lapl=False,
                 )
@@ -777,7 +901,7 @@ class GPUXCFrameBackend:
                 ao,
                 self._masked_density(open_sorted, indices),
                 None,
-                "GGA",
+                self.xctype,
                 hermi=1,
                 with_lapl=False,
             )
@@ -785,7 +909,7 @@ class GPUXCFrameBackend:
                 "xyg,nyg->nxg", fref, rho_pz,
             ) * grid_weights
             for index in range(ntask):
-                self._add_gga_matrix(
+                self._add_xc_matrix(
                     open_potential[index], ao, open_weights[index], indices,
                 )
             pair = 0.5 * cp.einsum(
@@ -798,11 +922,11 @@ class GPUXCFrameBackend:
                 "nxyg,xyzg->nzg", pair, kref_beta,
             ) * grid_weights
             for index in range(ntask):
-                self._add_gga_matrix(
+                self._add_xc_matrix(
                     reference_alpha[index], ao,
                     alpha_weights[index], indices,
                 )
-                self._add_gga_matrix(
+                self._add_xc_matrix(
                     reference_beta[index], ao,
                     beta_weights[index], indices,
                 )
@@ -810,7 +934,7 @@ class GPUXCFrameBackend:
             if not with_direct:
                 continue
             workspace = _density_workspace(
-                ao, masked_stack, hermitian=True,
+                ao, masked_stack, hermitian=True, xctype=self.xctype,
             )
             for atom_index, atom in enumerate(atmlst):
                 local = self._atom_indices(indices, atom)
@@ -862,7 +986,17 @@ class GPUXCFrameBackend:
             ))
         return tuple(output)
 
-    def contract_gga_vxc_derivative(
+    def gga_fockz_terms_batch(self, *args, **kwargs):
+        if self.xctype != "GGA":
+            raise ValueError("GGA Fock-Z requested from an MGGA backend")
+        return self._fockz_terms_batch(*args, **kwargs)
+
+    def mgga_fockz_terms_batch(self, *args, **kwargs):
+        if self.xctype != "MGGA":
+            raise ValueError("MGGA Fock-Z requested from a GGA backend")
+        return self._fockz_terms_batch(*args, **kwargs)
+
+    def _contract_vxc_derivative(
             self, density_alpha, density_beta, probe_alpha, probe_beta,
             atmlst=None):
         """Contract all post-Z fixed-grid XC derivatives on the GPU."""
@@ -898,7 +1032,7 @@ class GPUXCFrameBackend:
         for ao, indices, grid_weights, _coords in self._blocks(deriv=2):
             masked_stack = self._masked_density(density_stack, indices)
             workspace = _density_workspace(
-                ao, masked_stack, hermitian=True,
+                ao, masked_stack, hermitian=True, xctype=self.xctype,
             )
             rho = cp.stack([
                 self.ni.eval_rho(
@@ -906,21 +1040,22 @@ class GPUXCFrameBackend:
                     ao,
                     density,
                     None,
-                    "GGA",
+                    self.xctype,
                     hermi=1,
                     with_lapl=False,
                 )
                 for density in masked_stack
             ])
             reference_rho = rho[:2]
+            feature_count = 4 if self.xctype == "GGA" else 5
             probe_rho = rho[2:].reshape(
-                len(probe_alpha), 2, 4, len(grid_weights),
+                len(probe_alpha), 2, feature_count, len(grid_weights),
             )
             _exc, vxc, fxc = self.ni.eval_xc_eff(
                 self.gmf.xc,
                 reference_rho,
                 deriv=2,
-                xctype="GGA",
+                xctype=self.xctype,
                 spin=1,
             )[:3]
             for atom_index, atom in enumerate(atmlst):
@@ -932,7 +1067,8 @@ class GPUXCFrameBackend:
                     derivatives = workspace.derivatives(delta, local)
                     reference_derivative = derivatives[:2]
                     probe_derivative = derivatives[2:].reshape(
-                        len(probe_alpha), 2, 4, len(grid_weights),
+                        len(probe_alpha), 2, feature_count,
+                        len(grid_weights),
                     )
                     output[:, atom_index, xyz] += cp.einsum(
                         "nsxg,sxg,g->n",
@@ -947,3 +1083,13 @@ class GPUXCFrameBackend:
                     )
         output = cp.asnumpy(output)
         return output[0] if single_probe else output
+
+    def contract_gga_vxc_derivative(self, *args, **kwargs):
+        if self.xctype != "GGA":
+            raise ValueError("GGA post-Z requested from an MGGA backend")
+        return self._contract_vxc_derivative(*args, **kwargs)
+
+    def contract_mgga_vxc_derivative(self, *args, **kwargs):
+        if self.xctype != "MGGA":
+            raise ValueError("MGGA post-Z requested from a GGA backend")
+        return self._contract_vxc_derivative(*args, **kwargs)
