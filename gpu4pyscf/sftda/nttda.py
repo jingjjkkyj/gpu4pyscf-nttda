@@ -24,6 +24,8 @@ sparse-AO primitives of the reference implementation.
 
 import numpy as np
 import cupy as cp
+import os
+
 from pyscf import lib
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import contract
@@ -570,6 +572,7 @@ class NTTDA(lib.StreamObject):
         self.reference_root_index = None
         self.reference_root_energy = None
         self.reference_root_overlap = None
+        self._nttda_solver_stats = {}
 
     gen_vind_sfd = gen_vind_sfd
 
@@ -611,8 +614,9 @@ class NTTDA(lib.StreamObject):
             self.nstates = nstates
         nroots = nstates + 1  # the reference root is filtered afterwards
 
-        vind, hdiag = self.gen_vind_sfd()
+        vind_orig, hdiag = self.gen_vind_sfd()
         precond = self.get_precond(hdiag)
+        warm_start = x0 is not None
         if x0 is None:
             x0 = self.init_guess(hdiag, nstates)
         else:
@@ -623,12 +627,26 @@ class NTTDA(lib.StreamObject):
             # frame; diagonal guesses ensure that reference root and any new
             # crossing root remain discoverable.
             x0 = cp.concatenate((x0, self.init_guess(hdiag, nstates)), axis=0)
+        initial_subspace_width = int(x0.shape[0])
+
+        vind_widths = []
+        def counted_vind(zs):
+            vind_widths.append(int(zs.shape[0]))
+            return vind_orig(zs)
+
+        profile_mode = os.environ.get('NTTDA_PROFILE', '0') != '0'
+        davidson_iterations = []
+        callback = None
+        if profile_mode:
+            def on_iter(info):
+                davidson_iterations.append(info)
+            callback = on_iter
 
         def all_eigs(w, v, nroots, envs):
             return w, v, np.arange(w.size)
 
         converged, energies, x1 = lr_eigh(
-            vind, x0, precond,
+            counted_vind, x0, precond,
             tol_residual=self.conv_tol,
             # ``lr_eigh`` compares the squared norm of a preconditioned trial
             # vector against ``lindep``.  Keep a small margin below the target
@@ -640,6 +658,7 @@ class NTTDA(lib.StreamObject):
             max_cycle=self.max_cycle,
             max_memory=self.max_memory,
             verbose=log,
+            callback=callback,
         )
         energies = np.asarray(cp.asnumpy(cp.asarray(energies)))
         converged = np.atleast_1d(
@@ -691,6 +710,20 @@ class NTTDA(lib.StreamObject):
         ]
         self.nstates = len(self.e)
         self.converged = converged[physical_order]
+        self._nttda_solver_stats = {
+            'vind_calls': len(vind_widths),
+            'vind_widths': vind_widths,
+            'total_vector_applications': sum(vind_widths),
+            'davidson_iterations': len(davidson_iterations),
+            'initial_subspace_width': initial_subspace_width,
+            'warm_start': warm_start,
+            'nroots': int(nroots),
+            'final_residuals': (
+                davidson_iterations[-1]['residuals'].tolist()
+                if davidson_iterations else None
+            ),
+            'converged': self.converged.tolist(),
+        }
         log.timer('GPU NTTDA', *t0)
         return self.e, self.xy
 

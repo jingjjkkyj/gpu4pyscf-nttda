@@ -43,7 +43,7 @@ MAX_SPACE_INC = None
 
 def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
          x0sym=None, pick=None, max_cycle=50, max_memory=MAX_MEMORY,
-         verbose=logger.WARN):
+         verbose=logger.WARN, callback=None):
     '''
     Solve symmetric eigenvalues.
 
@@ -77,6 +77,12 @@ def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
             max number of iterations.
         max_memory : int or float
             Allowed memory in MB.
+        callback : function(dict) => None
+            Optional per-iteration callback.  When not None, called once per
+            Davidson cycle with a dict containing ``cycle``, ``aop_input_width``,
+            ``subspace_size``, ``residuals`` (numpy), ``converged`` (numpy),
+            and ``energies`` (numpy).  When None (default), no overhead is
+            incurred.
 
     Returns:
         e : list of floats
@@ -133,6 +139,7 @@ def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
             xt_idx = xt_idx[:space_inc]
 
         row0 = len(xs)
+        aop_input_width = xt.shape[0]
         axt = aop(xt)
         xs = cp.vstack([xs, xt])
         ax = cp.vstack([ax, axt])
@@ -214,6 +221,15 @@ def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
         dx_norm = cp.linalg.norm(xt, axis=1)
         max_dx_norm = max(dx_norm[:nroots])
         conv = dx_norm[:nroots] < tol_residual
+        if callback is not None:
+            callback({
+                'cycle': icyc,
+                'aop_input_width': int(aop_input_width),
+                'subspace_size': int(len(xs)),
+                'residuals': cp.asnumpy(dx_norm[:nroots]),
+                'converged': cp.asnumpy(conv),
+                'energies': cp.asnumpy(e),
+            })
         for k, ek in enumerate(e[:nroots]):
             if conv[k] and not conv_last[k]:
                 log.debug('root %d converged  |r|= %4.3g  e= %s  max|de|= %4.3g',

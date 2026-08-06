@@ -995,6 +995,7 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     from gpu4pyscf.nac.nttda import NAC as make_nac
 
     frame_started = time.perf_counter()
+    gpu_mem_start = cp.get_default_memory_pool().used_bytes()
     nstates = len(td.e)
     if (
             isinstance(active_state, (bool, np.bool_))
@@ -1142,6 +1143,11 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     nuclear_seconds = time.perf_counter() - nuclear_started
 
     def record_stats(nac_postprocess_seconds=0.0):
+        scf_obj = getattr(td, '_scf', None)
+        scf_stats = {
+            'cycles': int(getattr(scf_obj, 'cycles', 0)),
+            'converged': bool(getattr(scf_obj, 'converged', False)),
+        } if scf_obj is not None else {}
         stats = {
             'active_state': active_state,
             'nac_pairs': len(nac_pairs),
@@ -1164,6 +1170,12 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
                 'nuclear': nuclear_seconds,
                 'nac_postprocess': nac_postprocess_seconds,
                 'total': time.perf_counter() - frame_started,
+            },
+            'nttda_solver': dict(getattr(td, '_nttda_solver_stats', {})),
+            'scf': scf_stats,
+            'gpu_memory': {
+                'start_bytes': int(gpu_mem_start),
+                'end_bytes': int(cp.get_default_memory_pool().used_bytes()),
             },
             'jk_backend': dict(getattr(backend, 'stats', {})),
             'xc_backend': dict(getattr(gpu_xc_backend, 'stats', {})),
