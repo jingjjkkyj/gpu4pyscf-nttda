@@ -544,6 +544,8 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
         ejk = cp.zeros((n_dm, mol.natm, 3))
         buf = cp.empty((n_dm*nao_pair*batch_size))
 
+    _t_compressed_build = 0.0
+    _t_kern_call = 0.0
     for kbatch, lk, in enumerate(uniq_l_ctr_aux[:,0]):
         naux_in_batch = nf[lk] * l_ctr_aux_counts[kbatch]
         aux_ao_offset = aux_loc[ksh_offsets_cpu[kbatch]]
@@ -556,6 +558,7 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             aux0, aux1 = aux1, aux1 + dk
             dm_tensor = ndarray((nao,nao,dk), buffer=buf2)
             dm_tensor1 = ndarray((nao,nao,dk), buffer=buf1)
+            _t_cb = _time.perf_counter()
             for i in range(n_dm):
                 if j_factor is None:
                     dm_tensor[:] = 0
@@ -563,12 +566,13 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
                     cp.multiply(dm1[i][:,:,None], auxvec2_jfac[i,None,None,aux0:aux1], out=dm_tensor)
                     cp.multiply(dm2[i][:,:,None], auxvec1_jfac[i,None,None,aux0:aux1], out=dm_tensor1)
                     dm_tensor += dm_tensor1
-                tmp = ndarray((dm2_noccs[i],nao,dk), buffer=buf1)
-                contract('rji,qj->iqr', j3c_o1o2[i][aux0:aux1], dm1_factor_l[i], out=tmp)
-                contract('iqr,pi->pqr', tmp, dm2_factor_r[i], -.5*k_factor[i], 1, out=dm_tensor)
-                tmp = ndarray((dm1_noccs[i],nao,dk), buffer=buf1)
-                contract('rji,qj->iqr', j3c_o2o1[i][aux0:aux1], dm2_factor_l[i], out=tmp)
-                contract('iqr,pi->pqr', tmp, dm1_factor_r[i], -.5*k_factor[i], 1, out=dm_tensor)
+                if k_factor[i] != 0:
+                    tmp = ndarray((dm2_noccs[i],nao,dk), buffer=buf1)
+                    contract('rji,qj->iqr', j3c_o1o2[i][aux0:aux1], dm1_factor_l[i], out=tmp)
+                    contract('iqr,pi->pqr', tmp, dm2_factor_r[i], -.5*k_factor[i], 1, out=dm_tensor)
+                    tmp = ndarray((dm1_noccs[i],nao,dk), buffer=buf1)
+                    contract('rji,qj->iqr', j3c_o2o1[i][aux0:aux1], dm2_factor_l[i], out=tmp)
+                    contract('iqr,pi->pqr', tmp, dm1_factor_r[i], -.5*k_factor[i], 1, out=dm_tensor)
                 dm_tensor1[:] = dm_tensor.transpose(1,0,2)
                 dm_tensor1[:] += dm_tensor
                 if sum_results:
@@ -578,6 +582,8 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
                 else:
                     cp.take(dm_tensor1.reshape(-1,dk), pair_addresses, axis=0,
                             out=compressed[i,:,k0:k1])
+            _t_compressed_build += _time.perf_counter() - _t_cb
+            _t_kc = _time.perf_counter()
         err = kern(
             ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
             ctypes.cast(ejk_aux.data.ptr, ctypes.c_void_p),
@@ -598,11 +604,14 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             ctypes.c_int(naux_in_batch), ctypes.c_int(mol.natm))
         if err != 0:
             raise RuntimeError('int3c2e_ejk_ip1 failed')
+        _t_kern_call += _time.perf_counter() - _t_kc
     ejk += ejk_aux
     ejk *= .5
     ejk = ejk.get()
     t0 = log.timer_debug1('contract int3c2e_ejk_ip1', *t0)
     _layer_t['ejk_kernel'] = _time.perf_counter() - _t_ejk_kernel
+    _layer_t['compressed_build'] = _t_compressed_build
+    _layer_t['kern_call'] = _t_kern_call
     _layer_t['n_dm'] = n_dm
     _layer_t['naux'] = int(naux)
     _layer_t['nao'] = int(nao)
