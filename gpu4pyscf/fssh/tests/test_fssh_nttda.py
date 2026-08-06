@@ -44,7 +44,8 @@ class KnownValues(unittest.TestCase):
         calls = []
 
         def fake_electronic(
-                self, position, cur_state=None, with_nacv=True):
+                self, position, cur_state=None, with_nacv=True,
+                with_frame=True):
             calls.append((cur_state, with_nacv))
             natm = self.mol.natm
             return (

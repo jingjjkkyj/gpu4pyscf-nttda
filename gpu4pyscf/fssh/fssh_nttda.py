@@ -26,6 +26,7 @@ root is already filtered by the solver).
 '''
 
 import copy
+import time
 
 import cupy as cp
 import numpy as np
@@ -124,6 +125,7 @@ class FSSH_NTTDA(FSSH):
         self._reused_initial_reference = False
         self.root_assignment = None
         self.root_overlaps = None
+        self._step_phase_timing = {}
 
     @staticmethod
     def _copy_setting(source, target, name):
@@ -325,7 +327,8 @@ class FSSH_NTTDA(FSSH):
                 td.converged = converged[order]
         return (mol.copy(), C, occ, xy)
 
-    def calc_electronic(self, position, cur_state=None, with_nacv=True):
+    def calc_electronic(self, position, cur_state=None, with_nacv=True,
+                        with_frame=True):
         position = np.asarray(position, dtype=float).reshape(-1, 3)
         if len(position) != self.tddft.mol.natm:
             raise ValueError('position must contain one xyz row per atom')
@@ -340,6 +343,7 @@ class FSSH_NTTDA(FSSH):
                 rtol=0.0, atol=1e-12,
             )
         )
+        phase_timing = {}
         if reuse_initial:
             mol = self.tddft.mol
             mf = self.tddft._scf
@@ -355,14 +359,22 @@ class FSSH_NTTDA(FSSH):
             if self._last_mf is not None:
                 dm0 = cp.asarray(self._last_mf.make_rdm1())
             mf = self._new_scf(mol)
+
+            t = time.perf_counter()
             mf.kernel(dm0=dm0) if dm0 is not None else mf.kernel()
+            phase_timing['scf'] = time.perf_counter() - t
             if not mf.converged:
                 raise RuntimeError('GPU ROKS SCF did not converge')
 
+            t = time.perf_counter()
             tracking = self._tracking_data(mol, mf)
             td = self._new_td(mf)
             td.kernel(x0=self._project_previous_roots(tracking))
+            phase_timing['nttda'] = time.perf_counter() - t
+
+            t = time.perf_counter()
             snapshot = self._track_roots(mol, td, tracking)
+            phase_timing['root_tracking'] = time.perf_counter() - t
         self._validate_td_solution(td)
 
         e_scf = float(_asnumpy(mf.e_tot))
@@ -375,19 +387,28 @@ class FSSH_NTTDA(FSSH):
             pairs = [
                 (self.states[i], self.states[j]) for i, j in self.nac_idx
             ]
-        frame = compute_frame(
-            td, active_state=cur_state, nac_pairs=pairs,
-            cphf_conv_tol=self.cphf_conv_tol,
-            cphf_max_cycle=self.cphf_max_cycle,
-            use_etfs=self.use_etfs,
-            frame_cache=self._frame_cache,
-        )
-        force = -frame['grad']
-        nacv = np.zeros((self.Nstates, self.Nstates, mol.natm, 3))
-        for (i, j), (si, sj) in zip(self.nac_idx, pairs):
-            value = frame['nac'][(si, sj)]
-            nacv[i, j] = value
-            nacv[j, i] = -value
+        if with_frame:
+            t = time.perf_counter()
+            frame = compute_frame(
+                td, active_state=cur_state, nac_pairs=pairs,
+                cphf_conv_tol=self.cphf_conv_tol,
+                cphf_max_cycle=self.cphf_max_cycle,
+                use_etfs=self.use_etfs,
+                frame_cache=self._frame_cache,
+            )
+            phase_timing['frame'] = time.perf_counter() - t
+            force = -frame['grad']
+            nacv = np.zeros((self.Nstates, self.Nstates, mol.natm, 3))
+            for (i, j), (si, sj) in zip(self.nac_idx, pairs):
+                value = frame['nac'][(si, sj)]
+                nacv[i, j] = value
+                nacv[j, i] = -value
+        else:
+            force = np.zeros((mol.natm, 3))
+            nacv = np.zeros((self.Nstates, self.Nstates, mol.natm, 3))
+
+        phase_timing['total'] = sum(phase_timing.values())
+        self._step_phase_timing = phase_timing
 
         # Commit cross-frame warm-start and gauge state only after the entire
         # electronic frame has completed successfully.
@@ -400,9 +421,10 @@ class FSSH_NTTDA(FSSH):
         )
         return energy, force, nacv
 
-    def evaluate_pes(self, position, cur_state, with_nacv=True):
+    def evaluate_pes(self, position, cur_state, with_nacv=True, with_frame=True):
         energy, force, nacv = self.calc_electronic(
             position, cur_state=cur_state, with_nacv=with_nacv,
+            with_frame=with_frame,
         )
         return PES(energy=energy, force=force, nacv=nacv)
 
