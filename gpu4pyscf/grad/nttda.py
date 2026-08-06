@@ -35,6 +35,7 @@ import importlib
 import inspect
 import os
 import sys
+import time
 
 import numpy as np
 import cupy as cp
@@ -260,9 +261,16 @@ def route_jk_to_gpu(cpu_mf, gmf):
     '''
     if getattr(cpu_mf, '_nttda_gpu_routed', False):
         return cpu_mf
-    from gpu4pyscf.sftda.nttda import _get_j_range_separated
+    from gpu4pyscf.df.df_jk import _DFHF
 
     nao = cpu_mf.mol.nao_nr()
+    route_stats = {
+        'j_calls': 0,
+        'k_calls': 0,
+        'jk_calls': 0,
+        'combined_jk_calls': 0,
+        'density_matrices': 0,
+    }
 
     def _shape_back(value, dm):
         value = cp.asnumpy(cp.asarray(value))
@@ -270,7 +278,11 @@ def route_jk_to_gpu(cpu_mf, gmf):
 
     def get_j(mol=None, dm=None, hermi=0, omega=None, **_kw):
         dms = cp.asarray(dm).reshape(-1, nao, nao)
+        route_stats['j_calls'] += 1
+        route_stats['density_matrices'] += len(dms)
         if omega:
+            from gpu4pyscf.sftda.nttda import _get_j_range_separated
+
             # _get_j_range_separated dispatches internally: per-omega
             # cderi for DF references, erf-kernel VHFOpt otherwise.
             vj = _get_j_range_separated(gmf, dms, hermi, omega)
@@ -280,6 +292,8 @@ def route_jk_to_gpu(cpu_mf, gmf):
 
     def get_k(mol=None, dm=None, hermi=0, omega=None, **_kw):
         dms = cp.asarray(dm).reshape(-1, nao, nao)
+        route_stats['k_calls'] += 1
+        route_stats['density_matrices'] += len(dms)
         if omega:
             vk = gmf.get_k(gmf.mol, dms, hermi, omega=omega)
         else:
@@ -288,6 +302,19 @@ def route_jk_to_gpu(cpu_mf, gmf):
 
     def get_jk(mol=None, dm=None, hermi=1, with_j=True, with_k=True,
                omega=None, **_kw):
+        route_stats['jk_calls'] += 1
+        if with_j and with_k and (not omega or isinstance(gmf, _DFHF)):
+            # DF J and K share the same resident three-centre tensors.  Calling
+            # the combined entry is materially cheaper than two independent
+            # passes, especially for the block-RHS response action.
+            dms = cp.asarray(dm).reshape(-1, nao, nao)
+            vj, vk = gmf.get_jk(
+                gmf.mol, dms, hermi, with_j=True, with_k=True,
+                omega=omega,
+            )
+            route_stats['combined_jk_calls'] += 1
+            route_stats['density_matrices'] += len(dms)
+            return _shape_back(vj, dm), _shape_back(vk, dm)
         vj = get_j(mol, dm, hermi, omega) if with_j else None
         vk = get_k(mol, dm, hermi, omega) if with_k else None
         return vj, vk
@@ -295,6 +322,7 @@ def route_jk_to_gpu(cpu_mf, gmf):
     cpu_mf.get_j = get_j
     cpu_mf.get_k = get_k
     cpu_mf.get_jk = get_jk
+    cpu_mf._nttda_jk_route_stats = route_stats
     cpu_mf._nttda_gpu_routed = True
     return cpu_mf
 
@@ -314,6 +342,13 @@ class DFLedgerBackend:
         assert isinstance(gmf, _DFHF)
         self._gmf = gmf
         self._opt = {}
+        self.stats = {
+            'calls': 0,
+            'terms': 0,
+            'density_uploads': 0,
+            'density_reuses': 0,
+            'omega_batches': 0,
+        }
 
     def _get_opt(self, omega):
         key = float(omega or 0.0)
@@ -333,6 +368,10 @@ class DFLedgerBackend:
         return self._opt[key]
 
     def __call__(self, terms, mol, atoms, slots=()):
+        from gpu4pyscf.df.df_jk import (
+            _tag_factorize_dm,
+            _transpose_dm,
+        )
         from gpu4pyscf.df.grad.tdrhf import (
             _jk_energies_per_atom as _df_jk_energies_per_atom,
         )
@@ -341,28 +380,57 @@ class DFLedgerBackend:
         shape = (len(atoms), 3)
         gradients = {slot: np.zeros(shape) for slot in slots}
         groups = {}
+        self.stats['calls'] += 1
         for operator in ('j', 'k'):
             for term in terms[operator]:
                 gradients.setdefault(term.slot, np.zeros(shape))
                 groups.setdefault(float(term.omega or 0.0), []).append(
                     (operator, term),
                 )
+                self.stats['terms'] += 1
+        self.stats['omega_batches'] += len(groups)
+
+        # A frame ledger contains many repeated views of the same AO density.
+        # Upload and factorize each unique view only once.  The factor tags are
+        # consumed directly by df.grad.tdrhf, avoiding another SVD for every
+        # J/K pair.  Transposition preserves and swaps those factors.
+        density_cache = {}
+
+        def gpu_density(value, factorize):
+            array = np.asarray(value)
+            interface = array.__array_interface__
+            key = (
+                interface['data'][0], array.shape, array.strides,
+                array.dtype.str, bool(factorize),
+            )
+            density = density_cache.get(key)
+            if density is None:
+                density = cp.asarray(array)
+                if factorize:
+                    density = _tag_factorize_dm(density, hermi=0)
+                density_cache[key] = density
+                self.stats['density_uploads'] += 1
+            else:
+                self.stats['density_reuses'] += 1
+            return density
+
         for omega, items in groups.items():
+            factorize = any(operator == 'k' for operator, _term in items)
             pairs = []
             j_factors = []
             k_factors = []
             slot_index = []
             for operator, term in items:
-                left = cp.asarray(term.left)
-                right = cp.asarray(term.right)
+                left = gpu_density(term.left, factorize)
+                right = gpu_density(term.right, factorize)
                 if operator == 'j':
                     pairs.append([left, right])
                     j_factors.append(2.0 * term.scale)
                     k_factors.append(0.0)
                     slot_index.append(term.slot)
                 else:
-                    pairs.append([left, cp.ascontiguousarray(right.T)])
-                    pairs.append([cp.ascontiguousarray(left.T), right])
+                    pairs.append([left, _transpose_dm(right)])
+                    pairs.append([_transpose_dm(left), right])
                     j_factors.extend((0.0, 0.0))
                     k_factors.extend((-2.0 * term.scale, -2.0 * term.scale))
                     slot_index.extend((term.slot, term.slot))
@@ -389,6 +457,11 @@ class LedgerBackend:
     def __init__(self, gmf):
         self._gmf = gmf
         self._vhfopt = {}
+        self.stats = {
+            'calls': 0,
+            'terms': 0,
+            'omega_batches': 0,
+        }
 
     def _get_vhfopt(self, omega):
         key = float(omega or 0.0)
@@ -407,12 +480,15 @@ class LedgerBackend:
         shape = (len(atoms), 3)
         gradients = {slot: np.zeros(shape) for slot in slots}
         groups = {}
+        self.stats['calls'] += 1
         for operator in ('j', 'k'):
             for term in terms[operator]:
                 gradients.setdefault(term.slot, np.zeros(shape))
                 groups.setdefault(float(term.omega or 0.0), []).append(
                     (operator, term),
                 )
+                self.stats['terms'] += 1
+        self.stats['omega_batches'] += len(groups)
         for omega, items in groups.items():
             pairs = []
             j_factors = []
@@ -456,6 +532,12 @@ def make_gpu_response_cache(cpu_td, gmf):
             return reference
 
     return _GPUResponseCache(cpu_td)
+
+
+def make_frame_cache():
+    """Persistent AO Z-vector guesses for consecutive dynamics frames."""
+    _forge_grad, forge_roks, _forge_solver = _import_forge()
+    return forge_roks.ZVectorFrameCache()
 
 
 def _resolve_input(td):
@@ -544,13 +626,16 @@ Grad = Gradients
 
 
 def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
-                  cphf_max_cycle=None, use_etfs=True):
+                  cphf_max_cycle=None, use_etfs=True, frame_cache=None):
     '''One dynamics frame: gradient of the active state plus NAC pairs.
 
     All geometry-fixed intermediates -- the spin-flip reference kernel,
     UKS response closures, spin Fock pair, F0/Fz, and the J/K derivative
     engines (VHFOpt / Int3c2eOpt) -- are built once and shared across the
     gradient and every NAC pair.
+
+    ``frame_cache`` may be a forge ``ZVectorFrameCache`` owned by a dynamics
+    driver.  It is updated only after every requested property succeeds.
 
     Returns ``{'grad': (natm, 3), 'nac': {(i, j): (natm, 3)}}``.  NAC
     entries are derivative couplings (the energy-scaled numerator divided
@@ -559,12 +644,28 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     '''
     from gpu4pyscf.nac.nttda import NAC as make_nac
 
+    frame_started = time.perf_counter()
     nstates = len(td.e)
-    if not 1 <= active_state <= nstates:
+    if (
+            isinstance(active_state, (bool, np.bool_))
+            or not isinstance(active_state, (int, np.integer))
+            or not 1 <= active_state <= nstates):
         raise ValueError(
             'active_state must be in [1, %d]' % nstates,
         )
-    nac_pairs = tuple((int(i), int(j)) for i, j in nac_pairs)
+    active_state = int(active_state)
+    parsed_pairs = []
+    for pair in nac_pairs:
+        if len(pair) != 2:
+            raise ValueError('each NAC pair must contain two state indices')
+        state_i, state_j = pair
+        if any(
+                isinstance(state, (bool, np.bool_))
+                or not isinstance(state, (int, np.integer))
+                for state in (state_i, state_j)):
+            raise ValueError('NAC states must be integer root indices')
+        parsed_pairs.append((int(state_i), int(state_j)))
+    nac_pairs = tuple(parsed_pairs)
     for state_i, state_j in nac_pairs:
         if not 1 <= state_i <= nstates or not 1 <= state_j <= nstates:
             raise ValueError(
@@ -573,6 +674,7 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
         if state_i == state_j:
             raise ValueError('NAC pairs require two distinct states')
 
+    driver_started = time.perf_counter()
     grad = Gradients(td)
     grad.verbose = 0
     grad.cphf_conv_tol = cphf_conv_tol
@@ -581,8 +683,14 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     grad.shared_response_cache = cache
     backend = grad.nttda_jk_ledger_backend
 
-    result = {'grad': np.asarray(grad.kernel(state=active_state)),
-              'nac': {}}
+    delta = importlib.import_module(
+        'pyscf.grad.nttda.delta_s_minus_one',
+    )
+    forge_roks = importlib.import_module('pyscf.grad.nttda.roks')
+    atmlst = tuple(range(td.mol.natm))
+    task_keys = [('grad', active_state)]
+    nac = None
+    nac_gradient = None
     if nac_pairs:
         nac = make_nac(td)
         nac.verbose = 0
@@ -591,14 +699,162 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
         nac.use_etfs = use_etfs
         nac.shared_response_cache = cache
         nac.nttda_jk_ledger_backend = backend
+        nac_gradient = nac._gradient_driver(verbose=0)
+    driver_seconds = time.perf_counter() - driver_started
+
+    xc_started = time.perf_counter()
+    grad_xc_terms = None
+    nac_xc_terms = [None] * len(nac_pairs)
+    xctype = grad.base._scf._numint._xc_type(grad.base._scf.xc)
+    if xctype == 'GGA' and nac_pairs:
+        xc_backend = importlib.import_module('pyscf.grad.nttda.xc')
+        grad_channel, spaces, grad_pz = delta.gradient_xc_request(
+            grad.base, grad.base.xy[active_state - 1],
+        )
+        channels = [grad_channel]
+        pz_batch = [grad_pz]
         for state_i, state_j in nac_pairs:
-            # ``td.xy`` already carries one globally aligned phase per root.
-            # The forge NAC driver's two-slot history is intended for one
-            # fixed pair across geometries; reusing it across different pairs
-            # would compare unrelated roots and can introduce a spurious sign.
-            nac.reset_phase()
-            value = nac.kernel(
-                state_I=state_i, state_J=state_j, ediff=True,
+            request = delta.cross_xc_request(
+                nac.base,
+                nac.base.xy[state_i - 1],
+                nac.base.xy[state_j - 1],
             )
-            result['nac'][(state_i, state_j)] = np.asarray(value)
+            channels.extend(request[0])
+            pz_batch.append(request[2])
+        response_xc = xc_backend.gga_response_terms_batch(
+            grad, grad.base, channels, atmlst=atmlst,
+        )
+        fockz_xc = xc_backend.gga_fockz_terms_batch(
+            grad, grad.base, spaces, pz_batch, atmlst=atmlst,
+        )
+        grad_xc_terms = (response_xc[0], fockz_xc[0])
+        for index in range(len(nac_pairs)):
+            offset = 1 + 2 * index
+            nac_xc_terms[index] = (
+                response_xc[offset],
+                response_xc[offset + 1],
+                fockz_xc[index + 1],
+            )
+    xc_seconds = time.perf_counter() - xc_started
+
+    prepare_started = time.perf_counter()
+    prepared = [delta.prepare_grad_elec(
+        grad,
+        grad.base,
+        grad.base.xy[active_state - 1],
+        atmlst=atmlst,
+        tolerance=cphf_conv_tol,
+        max_cycle=cphf_max_cycle,
+        cache=cache,
+        xc_terms=grad_xc_terms,
+    )]
+    for index, (state_i, state_j) in enumerate(nac_pairs):
+        task_keys.append(('nac', state_i, state_j, bool(use_etfs)))
+        prepared.append(delta.prepare_grad_elec_cross(
+            nac_gradient,
+            nac.base,
+            nac.base.xy[state_i - 1],
+            nac.base.xy[state_j - 1],
+            atmlst=atmlst,
+            tolerance=cphf_conv_tol,
+            max_cycle=cphf_max_cycle,
+            cache=cache,
+            xc_terms=nac_xc_terms[index],
+        ))
+    prepare_seconds = time.perf_counter() - prepare_started
+
+    pairs = forge_roks.canonical_pairs(grad.base, compact=True)
+    initial = None
+    cache_hits = 0
+    if frame_cache is not None:
+        initial, cache_hits = frame_cache.project(
+            grad.base, pairs, task_keys,
+        )
+    finish_started = time.perf_counter()
+    components = forge_roks.finish_prepared_gradients(
+        prepared, initial=initial,
+    )
+    finish_seconds = time.perf_counter() - finish_started
+    grad.nttda_details = components[0]
+    nuclear_started = time.perf_counter()
+    result = {
+        'grad': np.asarray(grad.grad_nuc()) + components[0].total,
+        'nac': {},
+    }
+    nuclear_seconds = time.perf_counter() - nuclear_started
+
+    def record_stats(nac_postprocess_seconds=0.0):
+        stats = {
+            'active_state': active_state,
+            'nac_pairs': len(nac_pairs),
+            'zvector_batch_width': len(prepared),
+            'zvector_cache_hits': int(np.count_nonzero(cache_hits)),
+            'xc_type': xctype,
+            'xc_response_channels': (
+                1 + 2 * len(nac_pairs)
+                if xctype == 'GGA' and nac_pairs else 0
+            ),
+            'xc_fockz_tasks': (
+                1 + len(nac_pairs)
+                if xctype == 'GGA' and nac_pairs else 0
+            ),
+            'timings': {
+                'drivers': driver_seconds,
+                'xc_batch': xc_seconds,
+                'prepare': prepare_seconds,
+                'zvector_and_derivatives': finish_seconds,
+                'nuclear': nuclear_seconds,
+                'nac_postprocess': nac_postprocess_seconds,
+                'total': time.perf_counter() - frame_started,
+            },
+            'jk_backend': dict(getattr(backend, 'stats', {})),
+            'response_cache': dict(getattr(cache, 'stats', {})),
+            'response_jk': dict(getattr(
+                cache.reference(), '_nttda_jk_route_stats', {},
+            )),
+        }
+        td._nttda_frame_stats = stats
+        if frame_cache is not None:
+            frame_cache.last_stats = stats
+
+    if not nac_pairs:
+        if frame_cache is not None:
+            frame_cache.commit(
+                grad.base,
+                pairs,
+                task_keys,
+                np.asarray([components[0].zvector]),
+            )
+        record_stats()
+        return result
+
+    forge_nac = importlib.import_module('pyscf.nac.nttda')
+    csf_started = time.perf_counter()
+    for (state_i, state_j), item in zip(nac_pairs, components[1:]):
+        gap = float(nac.base.e[state_j - 1] - nac.base.e[state_i - 1])
+        if abs(gap) < nac.gap_tol:
+            raise ZeroDivisionError(
+                'NTTDA state gap %.6e is below gap_tol %.6e'
+                % (gap, nac.gap_tol)
+            )
+        numerator = np.asarray(item.total)
+        if not use_etfs:
+            csf = forge_nac.nac_csf_components(
+                nac,
+                nac.base.xy[state_i - 1],
+                nac.base.xy[state_j - 1],
+                cache=cache,
+            )
+            numerator = numerator + gap * np.asarray(csf.total)
+        result['nac'][(state_i, state_j)] = np.real_if_close(
+            numerator / gap,
+        )
+    if frame_cache is not None:
+        frame_cache.commit(
+            grad.base,
+            pairs,
+            task_keys,
+            np.asarray([item.zvector for item in components]),
+        )
+    record_stats(time.perf_counter() - csf_started)
     return result

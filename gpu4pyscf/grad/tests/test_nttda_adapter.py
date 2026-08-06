@@ -15,6 +15,39 @@ from gpu4pyscf.nac import nttda as nac_nttda
 
 
 class KnownValues(unittest.TestCase):
+    def test_gpu_route_combines_jk_for_one_density_batch(self):
+        calls = []
+
+        class FakeGPUReference:
+            mol = object()
+
+            @staticmethod
+            def get_jk(mol, dms, hermi, with_j, with_k, omega=None):
+                calls.append((np.asarray(dms).shape, hermi, omega))
+                return np.asarray(dms) + 1.0, np.asarray(dms) + 2.0
+
+        cpu_mf = types.SimpleNamespace(
+            mol=types.SimpleNamespace(nao_nr=lambda: 2),
+        )
+        numpy_backend = types.SimpleNamespace(
+            asarray=np.asarray,
+            asnumpy=np.asarray,
+        )
+        with mock.patch.object(nttda, "cp", numpy_backend):
+            nttda.route_jk_to_gpu(cpu_mf, FakeGPUReference())
+            dm = np.arange(4.0).reshape(2, 2)
+            vj, vk = cpu_mf.get_jk(dm=dm, hermi=0)
+
+        self.assertEqual(calls, [((1, 2, 2), 0, None)])
+        np.testing.assert_allclose(vj, dm + 1.0)
+        np.testing.assert_allclose(vk, dm + 2.0)
+        self.assertEqual(
+            cpu_mf._nttda_jk_route_stats["combined_jk_calls"], 1,
+        )
+        self.assertEqual(
+            cpu_mf._nttda_jk_route_stats["density_matrices"], 1,
+        )
+
     def test_cpu_forge_input_is_rejected_without_mutation(self):
         get_j = object()
         cpu_mf = types.SimpleNamespace(get_j=get_j)

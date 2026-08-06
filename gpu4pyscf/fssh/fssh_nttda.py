@@ -35,6 +35,7 @@ from gpu4pyscf.fssh.fssh import FSSH, PES
 from gpu4pyscf.grad.nttda import (
     _validate_supported_reference,
     compute_frame,
+    make_frame_cache,
 )
 from gpu4pyscf.sftda.nttda import NTTDA
 
@@ -119,6 +120,7 @@ class FSSH_NTTDA(FSSH):
         self._initial_frame_available = bool(
             self._prev is not None and len(self._last_td.e) >= self.nstates_solver
         )
+        self._frame_cache = make_frame_cache()
         self._reused_initial_reference = False
         self.root_assignment = None
         self.root_overlaps = None
@@ -378,6 +380,7 @@ class FSSH_NTTDA(FSSH):
             cphf_conv_tol=self.cphf_conv_tol,
             cphf_max_cycle=self.cphf_max_cycle,
             use_etfs=self.use_etfs,
+            frame_cache=self._frame_cache,
         )
         force = -frame['grad']
         nacv = np.zeros((self.Nstates, self.Nstates, mol.natm, 3))
