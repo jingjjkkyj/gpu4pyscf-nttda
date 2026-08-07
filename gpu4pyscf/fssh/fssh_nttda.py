@@ -38,6 +38,7 @@ from gpu4pyscf.grad.nttda import (
     compute_frame,
     make_frame_cache,
 )
+from gpu4pyscf.grad.nttda_params import PARAMS as _NTTDA_PARAMS
 from gpu4pyscf.sftda.nttda import NTTDA
 
 
@@ -88,9 +89,10 @@ class FSSH_NTTDA(FSSH):
         self.scf_conv_tol = scf_conv_tol
         self.td_conv_tol = td_conv_tol
         self.cphf_conv_tol = cphf_conv_tol
-        self.cphf_max_cycle = (
-            None if cphf_max_cycle is None else int(cphf_max_cycle)
-        )
+        if cphf_max_cycle is not None:
+            self.cphf_max_cycle = int(cphf_max_cycle)
+        else:
+            self.cphf_max_cycle = _NTTDA_PARAMS.get('cphf_max_cycle')
         self.root_overlap_tol = root_overlap_tol
         self.state_ordering = state_ordering
         self.use_etfs = bool(use_etfs)

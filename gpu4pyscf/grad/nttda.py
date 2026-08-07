@@ -42,6 +42,7 @@ import numpy as np
 import cupy as cp
 
 from gpu4pyscf.grad.tdrhf import _jk_energies_per_atom
+from gpu4pyscf.grad.nttda_params import PARAMS as _NTTDA_PARAMS
 from gpu4pyscf.scf.jk import _VHFOpt
 
 
@@ -1198,6 +1199,7 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
                 'start_bytes': int(gpu_mem_start),
                 'end_bytes': int(cp.get_default_memory_pool().used_bytes()),
             },
+            'runtime_params': dict(_NTTDA_PARAMS),
             'jk_backend': dict(getattr(backend, 'stats', {})),
             'xc_backend': dict(getattr(gpu_xc_backend, 'stats', {})),
             'response_cache': dict(getattr(cache, 'stats', {})),
