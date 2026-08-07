@@ -140,7 +140,7 @@ def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
 
         row0 = len(xs)
         aop_input_width = xt.shape[0]
-        axt = aop(xt)
+        axt = aop(xt)  # matrix-vector product; one call per Davidson iteration
         xs = cp.vstack([xs, xt])
         ax = cp.vstack([ax, axt])
         axt = None
@@ -221,6 +221,11 @@ def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
         dx_norm = cp.linalg.norm(xt, axis=1)
         max_dx_norm = max(dx_norm[:nroots])
         conv = dx_norm[:nroots] < tol_residual
+        # Per-iteration callback for profiling (Task 1).
+        # When callback is None (default), this block is skipped with zero
+        # overhead.  When NTTDA_PROFILE=1, the callback records residuals,
+        # convergence flags, and energies per iteration.  Note: cp.asnumpy
+        # inside the callback triggers an implicit GPU sync.
         if callback is not None:
             callback({
                 'cycle': icyc,

@@ -115,6 +115,8 @@ def reload_params():
     """Re-read environment variables.
 
     Useful in tests that patch ``os.environ`` after import time.
+    Also useful for A100: call after setting env vars to activate
+    swept parameter values without restarting the Python process.
     """
     global PARAMS
     PARAMS = _load_params()

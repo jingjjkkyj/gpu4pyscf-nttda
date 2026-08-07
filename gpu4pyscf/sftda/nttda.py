@@ -629,11 +629,18 @@ class NTTDA(lib.StreamObject):
             x0 = cp.concatenate((x0, self.init_guess(hdiag, nstates)), axis=0)
         initial_subspace_width = int(x0.shape[0])
 
+        # --- Low-overhead solver profiler (Task 1) ---
+        # `counted_vind` wraps the real vind to record batch widths without
+        # any GPU synchronization.  `vind_widths` is a plain Python list of
+        # ints (one per Davidson iteration), so the overhead is negligible.
         vind_widths = []
         def counted_vind(zs):
             vind_widths.append(int(zs.shape[0]))
             return vind_orig(zs)
 
+        # NTTDA_PROFILE=1 enables per-iteration Davidson callback for full
+        # residual/energy recording.  Default (unset) avoids the cp.asnumpy
+        # sync inside the callback, keeping timing clean.
         profile_mode = os.environ.get('NTTDA_PROFILE', '0') != '0'
         davidson_iterations = []
         callback = None
@@ -710,6 +717,15 @@ class NTTDA(lib.StreamObject):
         ]
         self.nstates = len(self.e)
         self.converged = converged[physical_order]
+        # Solver stats consumed by compute_frame's record_stats and the
+        # FSSH profile script.  Fields:
+        #   vind_calls              — number of Davidson iterations
+        #   vind_widths             — batch width per iteration (Python list)
+        #   total_vector_applications — sum(vind_widths)
+        #   davidson_iterations     — per-iteration info (only if NTTDA_PROFILE=1)
+        #   initial_subspace_width  — x0 width after warm-start concatenation
+        #   warm_start              — whether x0 was provided (cross-frame)
+        #   final_residuals        — last-iteration residual norms (profile only)
         self._nttda_solver_stats = {
             'vind_calls': len(vind_widths),
             'vind_widths': vind_widths,

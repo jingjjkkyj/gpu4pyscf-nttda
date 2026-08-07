@@ -686,6 +686,12 @@ class DFLedgerBackend:
                     candidate_min_rank = details.get(
                         'coefficient_rank', 1,
                     )
+                    # Safe lower-bound gate (Task 4):
+                    # Estimate the candidate's theoretical minimum cost from
+                    # its coefficient_rank before constructing expensive
+                    # factorized candidate_gpu.  Only construct the candidate
+                    # if its lower bound is below the raw cost.  This gate
+                    # can only reject (never accept) — it is conservative.
                     candidate_lower_bound = (
                         2 * candidate_min_rank * candidate_min_rank * naux
                         + 2 * nao**2
@@ -1165,6 +1171,23 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     nuclear_seconds = time.perf_counter() - nuclear_started
 
     def record_stats(nac_postprocess_seconds=0.0):
+        '''Collect per-frame stats from all backends into ``td._nttda_frame_stats``.
+
+        Called once at the end of ``compute_frame`` (after all gradient/NAC
+        work succeeds).  The stats dict is read by the FSSH profile script
+        and by ``frame_cache.last_stats``.  Fields:
+
+        - ``timings`` — phase-level wall seconds (drivers, xc_batch, prepare,
+          zvector_and_derivatives, nuclear, nac_postprocess, total).
+        - ``nttda_solver`` — Davidson vind/Davidson stats from
+          ``NTTDA._nttda_solver_stats``.
+        - ``scf`` — SCF cycle count and convergence.
+        - ``gpu_memory`` — cupy memory pool usage at frame start/end.
+        - ``runtime_params`` — snapshot of ``nttda_params.PARAMS``.
+        - ``jk_backend`` — DFLedgerBackend stats (pair counts, compression,
+          layer timing, lower-bound gate counters).
+        - ``xc_backend`` / ``response_cache`` / ``response_jk`` — backend stats.
+        '''
         scf_obj = getattr(td, '_scf', None)
         scf_stats = {
             'cycles': int(getattr(scf_obj, 'cycles', 0)),

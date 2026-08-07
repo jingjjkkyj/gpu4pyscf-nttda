@@ -331,6 +331,22 @@ class FSSH_NTTDA(FSSH):
 
     def calc_electronic(self, position, cur_state=None, with_nacv=True,
                         with_frame=True):
+        '''Evaluate electronic structure for one FSSH step.
+
+        Executes four phases, each timed separately into ``self._step_phase_timing``:
+
+        1. **scf** — GPU ROKS SCF kernel (warm-started from previous frame density).
+        2. **nttda** — NTTDA kernel (tracking data prep + root projection + solve).
+        3. **root_tracking** — phase-aligned energy ordering or Hungarian assignment.
+        4. **frame** — ``compute_frame`` call (gradient + NAC pairs).
+
+        When ``with_frame=False`` (solver-only mode), phase 4 is skipped
+        entirely and force/nacv are returned as zeros.  This is used by the
+        profiler to isolate SCF+NTTDA timing from gradient/NAC overhead.
+
+        The phase timing dict is read by
+        ``tests/profile_fssh_nttda_steady_state.py`` after each step.
+        '''
         position = np.asarray(position, dtype=float).reshape(-1, 3)
         if len(position) != self.tddft.mol.natm:
             raise ValueError('position must contain one xyz row per atom')

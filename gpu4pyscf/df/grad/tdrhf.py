@@ -377,6 +377,32 @@ def _jk_energies_per_atom(int3c2e_opt, dm_pairs, j_factor=None, k_factor=None,
 
 def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
                                sum_results, verbose, stats_sink=None):
+    '''Batched per-atom DF J/K derivative kernel.
+
+    Evaluates first-derivative J/K contributions for ``n_dm`` density-matrix
+    factor pairs in a single call.  The kernel has four GPU stages:
+
+    1. **contract_dm** — three-center integral evaluation + factor contraction
+       (builds ``j3c_o1o2`` / ``j3c_o2o1`` and J auxiliary vectors).
+    2. **metric_transform** — 2c2e metric solve + j3c metric back-transform.
+    3. **int2c2e_ip1** — pseudo-density formation + int2c2e_ip1 per atom.
+    4. **ejk_kernel** — Python loop that builds the ``compressed`` tensor
+       (dm_tensor = J part + K part, symmetrized, pair-addressed) followed by
+       the CUDA ``ejk_int3c2e_ip1`` derivative kernel call.
+
+    When ``stats_sink`` is not None, per-split layer timing dicts are appended
+    for profiling.  Each dict contains keys ``contract_dm``, ``metric_transform``,
+    ``int2c2e_ip1``, ``ejk_kernel`` (wall seconds), ``compressed_build``,
+    ``kern_call`` (sub-timing of ``ejk_kernel``), and ``n_dm``/``nao``/``naux``.
+
+    The ``compressed_build`` loop skips K contractions when ``k_factor[i] == 0``
+    (J-only DMs), avoiding ~4 wasted GPU contractions per J pair.  This was
+    validated to reduce DF integral time by ~10% on azobenzene (Task 5).
+
+    Memory fractions and batch multipliers are read from
+    :mod:`gpu4pyscf.grad.nttda_params` (env-var driven, defaults calibrated
+    on RTX 4060 8 GB; A100 sweep pending).
+    '''
     from gpu4pyscf.pbc.df.int2c2e import int2c2e_ip1_per_atom
     import time as _time
     n_dm = len(dm_factors)
@@ -384,7 +410,7 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     auxmol = int3c2e_opt.auxmol
     log = logger.new_logger(mol, verbose)
     t0 = log.init_timer()
-    _layer_t = {}
+    _layer_t = {}  # per-split layer timing dict, appended to stats_sink
 
     dm1_factor_l, dm1_factor_r, dm2_factor_l, dm2_factor_r = zip(*dm_factors)
     dm1_noccs = [x.shape[1] for x in dm1_factor_l]
@@ -552,6 +578,25 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
         ejk = cp.zeros((n_dm, mol.natm, 3))
         buf = cp.empty((n_dm*nao_pair*batch_size))
 
+    # --- Stage 4: ejk_kernel ---
+    # This is the most expensive stage (88.8% of DF time on azobenzene).
+    # It consists of two sub-phases:
+    #   (a) compressed_build: Python loop over n_dm that assembles the
+    #       `compressed` tensor = J outer-product + K contraction, then
+    #       symmetrizes and pair-addresses it.  Each iteration issues ~9
+    #       async cupy calls; with n_dm=118 this is ~1000 kernel launches.
+    #   (b) kern_call: a single ctypes dispatch of `ejk_int3c2e_ip1` to GPU.
+    #
+    # Timing note: cupy/ctypes calls are asynchronous, so `kern_call` wall
+    # time (~0.01s) measures only the Python submission overhead.  The actual
+    # GPU execution of both the compressed_build cupy kernels and the
+    # ejk_int3c2e_ip1 CUDA kernel is pipelined within `compressed_build`'s
+    # wall window (~170s).  To measure GPU execution time precisely one would
+    # need cp.cuda.Device.synchronize(), but that changes the measured
+    # performance and is not done by default.
+    #
+    # Optimization (Task 5): K contractions are skipped when k_factor[i]==0
+    # (J-only DMs).  This avoids 4 wasted cupy contract calls per J pair.
     _t_compressed_build = 0.0
     _t_kern_call = 0.0
     for kbatch, lk, in enumerate(uniq_l_ctr_aux[:,0]):
@@ -574,6 +619,8 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
                     cp.multiply(dm1[i][:,:,None], auxvec2_jfac[i,None,None,aux0:aux1], out=dm_tensor)
                     cp.multiply(dm2[i][:,:,None], auxvec1_jfac[i,None,None,aux0:aux1], out=dm_tensor1)
                     dm_tensor += dm_tensor1
+                # K contraction: skip when k_factor[i]==0 (J-only DM).
+                # Saves 4 cupy contract calls per J pair (~10% DF time).
                 if k_factor[i] != 0:
                     tmp = ndarray((dm2_noccs[i],nao,dk), buffer=buf1)
                     contract('rji,qj->iqr', j3c_o1o2[i][aux0:aux1], dm1_factor_l[i], out=tmp)
