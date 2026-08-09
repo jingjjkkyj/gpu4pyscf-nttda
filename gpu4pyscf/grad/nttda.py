@@ -30,8 +30,11 @@ gpu4pyscf); expensive integral and GGA grid work run on GPU:
   GPU implementation.
 
 For GGA functionals, response, Fock-Z, post-Z derivative contractions, and
-the iterative UKS fxc action are evaluated by one geometry-fixed GPU XC
+the iterative reference fxc action are evaluated by one geometry-fixed GPU XC
 backend.  The CPU forge remains the formula and orchestration reference.
+This separation is deliberate: the CPU layer owns the spin-adapted
+Lagrangian, ``H.T Z = M``, Pulay, and NAC formulas, while the GPU layer owns
+only algebraically equivalent integral, grid, and response contractions.
 '''
 
 import importlib
@@ -221,9 +224,11 @@ def _validate_supported_reference(gmf):
 def build_cpu_twin(gpu_td):
     '''CPU forge NTTDA twin of a converged GPU NTTDA calculation.
 
-    Orbitals, occupations, energies, amplitudes, and the (sorted) grid
-    are copied so the twin never runs SCF, Davidson, or grid building of
-    its own.
+    Orbitals, occupations, energies, amplitudes, and the (sorted) grid are
+    copied so the twin never runs SCF, Davidson, or grid building of its own.
+    The concrete EnsembleRKS type is preserved because the CPU formula layer
+    uses that marker to choose the occupation-difference orbital Hessian and
+    the equal-spin response probes.
     '''
     from pyscf import dft
 
@@ -868,7 +873,13 @@ def make_gpu_xc_backend(cpu_td, gmf):
 
 
 def make_gpu_response_cache(cpu_td, gmf, xc_backend=None):
-    '''Forge ResponseCache with GPU-native GGA response and GPU J/K.'''
+    '''Forge ResponseCache with GPU-native reference response and GPU J/K.
+
+    EnsembleRKS uses the restricted response of its common Fock; ROKS uses the
+    spin-resolved response exposed by ``GPUXCFrameBackend``.  The closures are
+    NumPy-in/NumPy-out only at the CPU orchestration seam: every fxc and J/K
+    contraction inside a call is performed on the GPU.
+    '''
     _forge_grad, forge_roks, _forge_solver = _import_forge()
     if xc_backend is None:
         xc_backend = make_gpu_xc_backend(cpu_td, gmf)
@@ -975,7 +986,13 @@ def _make_gradients_class():
     forge_grad, _forge_roks, _forge_solver = _import_forge()
 
     class Gradients(forge_grad.Gradients):
-        '''GPU-accelerated NTTDA gradients (CPU formulas, GPU integrals).'''
+        '''GPU-accelerated NTTDA gradients.
+
+        The inherited CPU class assembles ``M``, solves the adjoint equation,
+        and combines relaxed electronic, Pulay, and nuclear terms.  This
+        subclass replaces the expensive response and derivative-integral
+        backends without duplicating those scientific formulas.
+        '''
 
         def __init__(self, td):
             from gpu4pyscf.df.df_jk import _DFHF
@@ -1049,9 +1066,13 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     '''One dynamics frame: gradient of the active state plus NAC pairs.
 
     All geometry-fixed intermediates -- the spin-flip reference kernel,
-    UKS response closures, spin Fock pair, F0/Fz, and the J/K derivative
+    reference response closures, spin Fock pair, F0/Fz, and the J/K derivative
     engines (VHFOpt / Int3c2eOpt) -- are built once and shared across the
     gradient and every NAC pair.
+
+    Each property has its own right-hand side ``M``, but all use the same
+    reference Hessian in ``H.T Z = M``.  Sharing the response cache therefore
+    changes construction cost and initial guesses, not the derivative model.
 
     ``frame_cache`` may be a forge ``ZVectorFrameCache`` owned by a dynamics
     driver.  It is updated only after every requested property succeeds.

@@ -247,7 +247,14 @@ def _forge_xc():
 
 
 class GPUXCFrameBackend:
-    """Geometry-fixed GPU GGA/MGGA backend shared by derivative tasks."""
+    """Geometry-fixed GPU GGA/MGGA backend shared by derivative tasks.
+
+    The CPU formula layer supplies transition/relaxed densities and scalar
+    coefficients.  This object evaluates fxc/kxc, AO-center derivatives, and
+    the resulting MO/atomic contractions on the device.  For EnsembleRKS all
+    reference kernels are evaluated at the same equal-spin density used by
+    the SCF, so GPU acceleration does not introduce a second reference model.
+    """
 
     def __init__(self, gmf, cpu_td):
         self.gmf = gmf
@@ -304,7 +311,14 @@ class GPUXCFrameBackend:
         self._assert_high_order_xc()
 
     def _reference_spin_densities(self):
+        """Return the spin pair at which reference XC derivatives are taken.
+
+        EnsembleRKS enforces ``D_alpha=D_beta=D/2``.  ROKS instead reconstructs
+        the determinant alpha/beta densities from its 0/1/2 spatial
+        occupations, matching the CPU formula backend.
+        """
         if getattr(self.gmf, "is_ensemble_rks", False):
+            # ``mo_occ`` is the spin-summed 2/1/0 occupation vector.
             density = (self.mo * self.mo_occ[None]) @ self.mo.T
             density *= 0.5
             return density, density.copy()
@@ -421,11 +435,11 @@ class GPUXCFrameBackend:
         return self._response_kernel
 
     def response(self, hermi):
-        """Return a NumPy-in/NumPy-out GPU UKS response closure.
+        """Return a NumPy-in/NumPy-out GPU reference-response closure.
 
-        The closure is the same response operator used by the forge ROKS
-        adjoint: spin-resolved GGA fxc plus Coulomb and hybrid/range-separated
-        exchange.  All grid algebra and J/K builds remain on the GPU.
+        The closure is the same spin-resolved GGA/MGGA fxc plus Coulomb and
+        hybrid/range-separated exchange operator used by the forge adjoint.
+        All grid algebra and J/K builds remain on the GPU.
         """
         hermi = int(hermi)
         if hermi not in self._responses:

@@ -21,6 +21,14 @@ EnsembleRKS references.  This module implements the production
 injected reference kernel; the GGA/MGGA vref1 action is evaluated directly
 in the MO blocks on the grid (batched GEMMs), which avoids the CPU-only
 sparse-AO primitives of the reference implementation.
+
+``F0`` always follows the selected ground-state model: the ROKS common Fock
+for a ROKS reference, or the equal-spin restricted Fock for EnsembleRKS.
+``Fz`` is an auxiliary spin-lowering response used only to assemble the
+NTTDA matrix; it is not the EnsembleRKS SCF Fock.  The corresponding equations
+and block conventions are documented in
+``docs/derivations/ensemble_rks_nttda_gradient_nac.md`` of the companion
+Project_Gpu4pyscf_Nttda repository.
 '''
 
 import numpy as np
@@ -70,6 +78,12 @@ def _orbital_indices(mf):
 
 
 def _sc_vector_slices(nclosed, nopen, nvirtual):
+    '''Map the flattened ``deltaS=0`` vector to its five spin-adapted blocks.
+
+    Keeping this order identical to the CPU forge is essential because the
+    response coefficients couple different blocks before the Davidson matrix
+    action is returned.
+    '''
     co = nclosed * nopen
     cv = nclosed * nvirtual
     oo = 1
@@ -135,11 +149,11 @@ def _select_physical_root_order(
 def spin_flip_reference_fxc(mf):
     '''``1/2 (f_aa - f_ab - f_ba + f_bb)`` on the (sorted) grid.
 
-    Passing the SPATIAL ROKS orbitals with the 0/1/2 occupancy reproduces
-    the CPU reference exactly: ``cache_xc_kernel`` takes its restricted
-    branch and, for ``spin=1``, evaluates the spin-resolved kernel at the
-    spin-averaged density ``(rho/2, rho/2)`` -- this is the NTTDA
-    convention, not the spin-polarized ROKS density.
+    Passing the spatial orbitals with the 0/1/2 occupancy makes
+    ``cache_xc_kernel`` evaluate the equal-spin reference
+    ``(rho_alpha,rho_beta)=(rho/2,rho/2)``.  For EnsembleRKS this is also the
+    SCF density; for ROKS it is the deliberately different NTTDA kernel
+    convention.  The returned combination is the spin-flip kernel ``f^SF``.
     '''
     ni = mf._numint
     mo = cp.asarray(mf.mo_coeff)
@@ -278,8 +292,14 @@ def nr_rks_fxc1_mo(mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref):
 def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True):
     '''Response function for ``Sf = Si - 1`` (GPU).
 
-    Returns ``(vind, fockz)``; with ``use_mo_grid_fxc1`` the GGA/MGGA
-    vref1 action is skipped here and evaluated in MO blocks by the caller.
+    ``vref0`` applies the equal-spin spin-flip kernel (plus hybrid exchange),
+    whereas ``vref1`` carries the directed derivative-index correction (plus
+    its hybrid Coulomb term).  The spin-adapted coefficients below transform
+    those primitive actions into the CO/CV/OO/OV response blocks.
+
+    Returns ``(vind, fockz)``.  With ``use_mo_grid_fxc1`` the GGA/MGGA
+    ``vref1`` action is evaluated directly in MO blocks by the caller so the
+    CPU-only sparse-AO path is avoided without changing the formula.
     '''
     mol = mf.mol
     ni = mf._numint
@@ -379,7 +399,12 @@ def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True):
 
 def gen_rohf_response_sc(mf, fxc_ref=None, hermi=0,
                          use_mo_grid_fxc1=True):
-    '''Response function for the ``Sf = Si`` NTTDA channel on GPU.'''
+    '''Response function for the ``Sf = Si`` NTTDA channel on GPU.
+
+    This is the five-block analogue of :func:`gen_rohf_response_sfd`.
+    ``vref0``/``vref1`` and hybrid J/K primitives are combined with the exact
+    spin-adaptation coefficients expected by the CPU reference action.
+    '''
     mol = mf.mol
     ni = mf._numint
     ni.libxc.test_deriv_order(mf.xc, 2, raise_error=True)
@@ -481,7 +506,13 @@ def gen_rohf_response_sc(mf, fxc_ref=None, hermi=0,
 
 
 def gen_vind_sc(td):
-    '''GPU matrix-vector action for the ``deltaS = 0`` NTTDA channel.'''
+    '''GPU matrix-vector action for the ``deltaS = 0`` NTTDA channel.
+
+    Input/output vectors use ``CO(1), CV(1), OO(1), OV(1), CV(0)`` order.
+    The Fock projections supply the one-electron part and ``vresp`` supplies
+    the spin-adapted kernel part, leaving the Davidson solver unaware of the
+    block decomposition.
+    '''
     mf = td._scf
     mo = cp.asarray(mf.mo_coeff)
     csidx, osidx, vsidx = _orbital_indices(mf)

@@ -18,6 +18,11 @@ Same architecture as :mod:`gpu4pyscf.grad.nttda`: the validated CPU forge
 NAC (bilinear cross numerator + analytic interstate RDM + CSF connection)
 orchestrates, while all response J/K builds, Z-vector iterations, and J/K
 derivative-ledger contractions run on GPU.
+
+The scientific result is preserved as
+``d_IJ = N_IJ^HF / (omega_J-omega_I) + d_IJ^CSF``.  GPU execution changes
+where the contractions are evaluated, not the gap convention, state phase,
+ETF switch, or moving-CSF contribution.
 '''
 
 from gpu4pyscf.grad.nttda import (

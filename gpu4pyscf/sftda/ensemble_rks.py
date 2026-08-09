@@ -1,6 +1,14 @@
 # Copyright 2021-2026 The PySCF Developers. All Rights Reserved.
 
-'''GPU average-occupation restricted ensemble Kohn--Sham references.'''
+'''GPU average-occupation restricted ensemble Kohn--Sham references.
+
+The reference has one spatial-orbital set with fixed ``2/1/0`` occupations.
+Its spin densities obey ``D_alpha = D_beta = D/2`` even when ``mol.spin`` is
+nonzero; ``mol.spin`` labels the target spin manifold and fixes the number of
+singly occupied orbitals.  The orbital residual is therefore the common-Fock
+condition ``g_pq = (n_q - n_p) F0_pq``.  CuPy arrays remain device-resident
+through occupation selection, density construction, and residual evaluation.
+'''
 
 import cupy as cp
 
@@ -10,7 +18,11 @@ from gpu4pyscf.scf import hf
 
 
 class EnsembleRKS(rks.RKS):
-    '''RKS with fixed ``2/1/0`` occupations and ``D_alpha=D_beta=D/2``.'''
+    '''RKS with fixed ``2/1/0`` occupations and ``D_alpha=D_beta=D/2``.
+
+    This is the fixed average-occupation reference required by NTTDA, not a
+    general state-weighted/GOK ensemble optimizer.
+    '''
 
     is_ensemble_rks = True
     _keys = rks.RKS._keys | {'nopen'}
@@ -80,6 +92,13 @@ class EnsembleRKS(rks.RKS):
         return dm_spin, dm_spin.copy()
 
     def get_grad(self, mo_coeff, mo_occ, fock=None):
+        '''Return independent elements of ``(n_q-n_p) F0_pq``.
+
+        The two spin masks retain closed-open, closed-virtual, and
+        open-virtual rotations while excluding rotations inside an
+        equal-occupation subspace.  Constructing the masks with CuPy avoids a
+        host round-trip in the SCF convergence loop.
+        '''
         mo_coeff = cp.asarray(mo_coeff)
         mo_occ = cp.asarray(mo_occ)
         if fock is None:
