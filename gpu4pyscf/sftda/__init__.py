@@ -12,4 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from gpu4pyscf.sftda.ensemble_rks import EnsembleRKS
 from gpu4pyscf.sftda.nttda import NTTDA
+
+__all__ = ['EnsembleRKS', 'NTTDA']

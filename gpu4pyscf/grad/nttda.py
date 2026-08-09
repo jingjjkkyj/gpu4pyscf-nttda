@@ -229,7 +229,12 @@ def build_cpu_twin(gpu_td):
     gmf = gpu_td._scf
     _validate_supported_reference(gmf)
     mol = gmf.mol
-    cpu_mf = dft.ROKS(mol)
+    if getattr(gmf, 'is_ensemble_rks', False):
+        from pyscf.sftda import EnsembleRKS
+
+        cpu_mf = EnsembleRKS(mol, nopen=gmf.nopen)
+    else:
+        cpu_mf = dft.ROKS(mol)
     cpu_mf.xc = gmf.xc
     omega = getattr(gmf, 'omega', None)
     if omega is not None:
@@ -850,7 +855,10 @@ def make_gpu_xc_backend(cpu_td, gmf):
     # The nobeta equal-spin common-Fock correction has a separate XC
     # functional derivative.  Keep MGGA entirely on the reference CPU path
     # until that correction is migrated instead of mixing backends silently.
-    if xctype == 'MGGA' and bool(getattr(cpu_td, 'nobeta', False)):
+    if (
+            xctype == 'MGGA'
+            and bool(getattr(cpu_td, 'nobeta', False))
+            and not getattr(gmf, 'is_ensemble_rks', False)):
         return None
     from gpu4pyscf.grad.nttda_xc import GPUXCFrameBackend
 
@@ -867,7 +875,14 @@ def make_gpu_response_cache(cpu_td, gmf, xc_backend=None):
         def __init__(self, tdobj):
             super().__init__(tdobj)
             self.frame_xc_backend = xc_backend
-            if xc_backend is not None:
+            cached_focks = getattr(
+                tdobj, '_nttda_gpu_fock0_fockz', None,
+            )
+            if cached_focks is not None:
+                self.extra['fock0_fockz'] = tuple(
+                    cp.asnumpy(cp.asarray(value)) for value in cached_focks
+                )
+            elif xc_backend is not None:
                 self.extra['fock0_fockz'] = (
                     xc_backend.spin_lowering_fock0_fockz()
                 )
@@ -879,6 +894,28 @@ def make_gpu_response_cache(cpu_td, gmf, xc_backend=None):
             return reference
 
         def response(self, hermi):
+            if getattr(gmf, 'is_ensemble_rks', False):
+                if hermi not in self._responses:
+                    from gpu4pyscf.scf import _response_functions
+
+                    gpu_response = _response_functions._gen_rhf_response(
+                        gmf, hermi=hermi,
+                    )
+                    self.stats['response_builds'] += 1
+
+                    def counted_ensemble_response(density):
+                        density = np.asarray(density)
+                        width = (
+                            1 if density.ndim == 2
+                            else int(np.prod(density.shape[:-2]))
+                        )
+                        self.stats['response_calls'] += 1
+                        self.stats['response_rhs'] += width
+                        self.stats['response_batch_widths'].append(width)
+                        return cp.asnumpy(gpu_response(cp.asarray(density)))
+
+                    self._responses[hermi] = counted_ensemble_response
+                return self._responses[hermi]
             if xc_backend is None:
                 return super().response(hermi)
             if hermi not in self._responses:
@@ -967,9 +1004,11 @@ def _make_gradients_class():
             if self._gmf.grids.coords is None:
                 self._gmf.grids.build(sort_grids=True)
             if self._with_df:
-                from gpu4pyscf.df.grad.roks import Gradients as DFRoksGrad
-
-                driver = DFRoksGrad(self._gmf)
+                if getattr(self._gmf, 'is_ensemble_rks', False):
+                    from gpu4pyscf.df.grad.rks import Gradients as DFGrad
+                else:
+                    from gpu4pyscf.df.grad.roks import Gradients as DFGrad
+                driver = DFGrad(self._gmf)
             else:
                 driver = self._gmf.nuc_grad_method()
             driver.verbose = 0
