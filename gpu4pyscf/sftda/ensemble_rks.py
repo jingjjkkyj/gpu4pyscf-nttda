@@ -3,7 +3,6 @@
 '''GPU average-occupation restricted ensemble Kohn--Sham references.'''
 
 import cupy as cp
-from pyscf.scf import hf as cpu_hf
 
 from gpu4pyscf.dft import rks
 from gpu4pyscf.lib import logger, utils
@@ -64,7 +63,9 @@ class EnsembleRKS(rks.RKS):
                 'not enough orbitals for %d closed and %d open orbitals'
                 % (self.nclosed, self.nopen)
             )
-        order = cp.argsort(mo_energy)
+        # Match the CPU reference for exactly degenerate orbitals.  A stable
+        # order keeps the selected open subspace deterministic across hosts.
+        order = cp.argsort(mo_energy, kind='stable')
         mo_occ = cp.zeros_like(mo_energy)
         mo_occ[order[:self.nclosed]] = 2
         open_stop = self.nclosed + self.nopen
@@ -85,7 +86,14 @@ class EnsembleRKS(rks.RKS):
             dm = self.make_rdm1(mo_coeff, mo_occ)
             fock = self.get_hcore(self.mol) + self.get_veff(self.mol, dm)
         fock_mo = mo_coeff.conj().T @ cp.asarray(fock) @ mo_coeff
-        unique = cp.asarray(cpu_hf.uniq_var_indices(cp.asnumpy(mo_occ)))
+        occupied_alpha = mo_occ > 0
+        occupied_beta = mo_occ == 2
+        virtual_alpha = ~occupied_alpha
+        virtual_beta = ~occupied_beta
+        unique = (
+            (virtual_alpha[:, None] & occupied_alpha)
+            | (virtual_beta[:, None] & occupied_beta)
+        )
         occupation_difference = mo_occ[None, :] - mo_occ[:, None]
         return (fock_mo * occupation_difference)[unique]
 

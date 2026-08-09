@@ -25,7 +25,7 @@ class EnsembleRKSGPU(unittest.TestCase):
         )
 
     @classmethod
-    def references(cls, xc="PBE"):
+    def references(cls, xc="PBE", density_fit=False):
         mol = cls.molecule()
         cpu = CPUEnsembleRKS(mol).set(
             xc=xc, conv_tol=1e-11, max_cycle=150, verbose=0,
@@ -33,6 +33,9 @@ class EnsembleRKSGPU(unittest.TestCase):
         gpu = EnsembleRKS(mol).set(
             xc=xc, conv_tol=1e-11, max_cycle=150, verbose=0,
         )
+        if density_fit:
+            cpu = cpu.density_fit()
+            gpu = gpu.density_fit()
         cpu.grids.level = 0
         gpu.grids.level = 0
         cpu.kernel()
@@ -81,7 +84,6 @@ class EnsembleRKSGPU(unittest.TestCase):
         np.testing.assert_allclose(
             gpu_gradient, cpu_gradient, atol=3e-6, rtol=0,
         )
-
         cpu_nac = cpu_td.NAC().set(
             verbose=0, cphf_conv_tol=1e-10,
         ).kernel(
@@ -120,6 +122,8 @@ class EnsembleRKSGPU(unittest.TestCase):
         np.testing.assert_allclose(
             gpu_gradient, cpu_gradient, atol=3e-6, rtol=0,
         )
+        with self.assertRaisesRegex(NotImplementedError, 'deltaS=-1'):
+            compute_frame(gpu_td, active_state=1)
 
     def test_frame_batches_gradient_nac_and_reuses_zvector_guess(self):
         _cpu, gpu = self.references("PBE")
@@ -159,6 +163,56 @@ class EnsembleRKSGPU(unittest.TestCase):
         self.assertEqual(second_stats["zvector_cache_hits"], 2)
         self.assertIn(
             2, second_stats["response_cache"]["response_batch_widths"],
+        )
+
+    def test_hybrid_and_mgga_derivatives_match_cpu(self):
+        for xc, nobeta in (("CAM-B3LYP", False), ("M06-2X", True)):
+            with self.subTest(xc=xc, nobeta=nobeta):
+                cpu, gpu = self.references(xc)
+                cpu_td = CPUNTTDA(cpu).set(
+                    deltaS=-1,
+                    nobeta=nobeta,
+                    nstates=2,
+                    conv_tol=1e-9,
+                    verbose=0,
+                ).run()
+                gpu_td = NTTDA(gpu).set(
+                    deltaS=-1,
+                    nobeta=nobeta,
+                    nstates=2,
+                    conv_tol=1e-9,
+                    verbose=0,
+                ).run()
+                np.testing.assert_allclose(
+                    gpu_td.e, cpu_td.e, atol=2e-7, rtol=0,
+                )
+                cpu_gradient = cpu_td.Gradients().set(
+                    verbose=0, cphf_conv_tol=1e-9,
+                ).kernel(state=1, atmlst=[0])
+                gpu_gradient = gpu_td.Gradients().set(
+                    verbose=0, cphf_conv_tol=1e-9,
+                ).kernel(state=1, atmlst=[0])
+                np.testing.assert_allclose(
+                    gpu_gradient, cpu_gradient, atol=8e-6, rtol=0,
+                )
+
+    def test_density_fitted_gradient_matches_cpu(self):
+        cpu, gpu = self.references("PBE", density_fit=True)
+        cpu_td = CPUNTTDA(cpu).set(
+            deltaS=-1, nstates=2, conv_tol=1e-9, verbose=0,
+        ).run()
+        gpu_td = NTTDA(gpu).set(
+            deltaS=-1, nstates=2, conv_tol=1e-9, verbose=0,
+        ).run()
+        np.testing.assert_allclose(gpu_td.e, cpu_td.e, atol=2e-7, rtol=0)
+        cpu_gradient = cpu_td.Gradients().set(
+            verbose=0, cphf_conv_tol=1e-9,
+        ).kernel(state=1, atmlst=[0])
+        gpu_gradient = gpu_td.Gradients().set(
+            verbose=0, cphf_conv_tol=1e-9,
+        ).kernel(state=1, atmlst=[0])
+        np.testing.assert_allclose(
+            gpu_gradient, cpu_gradient, atol=8e-6, rtol=0,
         )
 
 

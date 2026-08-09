@@ -12,20 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-'''GPU driver for NTTDA ``deltaS = -1`` excited-state gradients.
+'''GPU driver for NTTDA excited-state gradients.
 
 Orchestration and scientific formulas reuse the validated CPU forge
 implementation (pyscf-forge NTTDA, importable side by side with
 gpu4pyscf); expensive integral and GGA grid work run on GPU:
 
 - response J/K builds (M matrix, Fock builds, Z-vector iterations) are
-  routed from the CPU twin objects to a GPU ROKS/UKS backend;
+  routed from the CPU twin objects to GPU ROKS/UKS or EnsembleRKS/RKS
+  backends;
 - the J/K derivative ledger is evaluated with the batched per-atom
   ``_jk_energies_per_atom`` kernels through the ledger backend seam
   (empirically calibrated mapping, machine-precision on J/K and
   range-separated variants: ``cpu_J = 2*gpu(L, R)``,
   ``cpu_K = -2*[gpu(L, R^T) + gpu(L^T, R)]``);
-- the ground-state ROKS gradient uses the native GPU implementation.
+- the ground-state ROKS or EnsembleRKS gradient uses the matching native
+  GPU implementation.
 
 For GGA functionals, response, Fock-Z, post-Z derivative contractions, and
 the iterative UKS fxc action are evaluated by one geometry-fixed GPU XC
@@ -1059,6 +1061,12 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     by the state gap); ``use_etfs=False`` includes the moving-CSF term,
     while ``use_etfs=True`` retains the ETF/Hellmann--Feynman term.
     '''
+    if td.deltaS != -1:
+        raise NotImplementedError(
+            'compute_frame batching currently supports only deltaS=-1; '
+            'use td.Gradients().kernel() for a deltaS=0 gradient'
+        )
+
     from gpu4pyscf.nac.nttda import NAC as make_nac
 
     frame_started = time.perf_counter()
