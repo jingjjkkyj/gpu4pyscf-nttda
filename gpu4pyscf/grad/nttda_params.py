@@ -43,6 +43,18 @@ All variables are optional and use the ``NTTDA_`` prefix.
         ``libcublasLt.so.12`` and ``libcutensor.so.2``; if unavailable the
         driver falls back to cupy with a warning.
 
+    NTTDA_XC_DIRECT_BACKEND
+        ``legacy`` (default) or experimental ``ao_reduce``. The latter
+        batches AO-center derivatives and still requires A100 acceptance.
+
+    NTTDA_XC_DIRECT_MAX_MEMORY_MB
+        Additional AO-reduction tile budget in MiB, default 256. Does not
+        include resident inputs, final outputs, or library scratch space.
+
+    NTTDA_XC_DIRECT_PROFILE
+        ``1`` enables synchronized direct-region wall/event timing.
+        Default ``0`` adds no synchronization. Use only diagnostic runs.
+
 All values are read once at import time and cached in :data:`PARAMS`.
 Tests may override via :func:`reload_params`.
 """
@@ -104,6 +116,15 @@ def _load_params():
         'contract_backend': _get_str(
             'NTTDA_CONTRACT_BACKEND', 'cupy', ('cupy', 'cutensor'),
         ),
+        'xc_direct_backend': _get_str(
+            'NTTDA_XC_DIRECT_BACKEND', 'legacy', ('legacy', 'ao_reduce'),
+        ),
+        'xc_direct_max_memory_mb': _get_int(
+            'NTTDA_XC_DIRECT_MAX_MEMORY_MB', 256, 1, 1048576,
+        ),
+        'xc_direct_profile': _get_str(
+            'NTTDA_XC_DIRECT_PROFILE', '0', ('0', '1'),
+        ) == '1',
         'unvalidated_on_A100': UNVALIDATED_ON_A100,
     }
 

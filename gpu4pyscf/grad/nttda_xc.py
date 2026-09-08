@@ -16,12 +16,15 @@ orchestrator.
 
 from dataclasses import dataclass
 import importlib
+import time
 
 import cupy as cp
 import numpy as np
 
 from gpu4pyscf.dft import numint as gpu_numint
 from gpu4pyscf.lib.cupy_helper import add_sparse
+from gpu4pyscf.grad import nttda_params
+from gpu4pyscf.grad.nttda_ao_reduce import contract_centers, fockz_weights, postz_weights
 
 
 _SECOND_DERIVATIVE = {
@@ -289,7 +292,12 @@ class GPUXCFrameBackend:
                 self.mol.offset_nr_by_atom()):
             original_atom[p0:p1] = atom
         self.sorted_atom = cp.asarray(original_atom[self.opt._ao_idx])
+        self.direct_backend = nttda_params.get('xc_direct_backend', 'legacy')
+        self.direct_memory_bytes = nttda_params.get('xc_direct_max_memory_mb', 256) * 1024**2
+        self.direct_profile = nttda_params.get('xc_direct_profile', False)
         self.stats = {
+            "direct_backend": self.direct_backend,
+            "direct_tile_budget_bytes": self.direct_memory_bytes,
             "grid_passes": 0,
             "grid_blocks": 0,
             "cpu_fallbacks": 0,
@@ -631,6 +639,38 @@ class GPUXCFrameBackend:
     def _atom_indices(self, block_indices, atom):
         return cp.flatnonzero(self.sorted_atom[block_indices] == atom)
 
+    def _reduce_centers(self, ao, indices, workspace, weights, atmlst,
+                        grid_weights=None, pair=None, density_indices=None):
+        return contract_centers(
+            ao, workspace.contracted, workspace.contracted_transpose,
+            weights, self.sorted_atom[indices], atmlst, xp=cp,
+            grid_weights=grid_weights, pair=pair,
+            density_indices=density_indices,
+            max_memory_bytes=self.direct_memory_bytes,
+            stats=self.stats.setdefault('direct_reduction', {}),
+        )
+
+    def _start_direct_timer(self):
+        if not self.direct_profile:
+            return None
+        cp.cuda.runtime.deviceSynchronize()
+        event = cp.cuda.Event()
+        event.record()
+        return event, time.perf_counter()
+
+    def _finish_direct_timer(self, stage, started):
+        if started is None:
+            return
+        event, wall_start = started
+        end = cp.cuda.Event()
+        end.record()
+        end.synchronize()
+        stats = self.stats.setdefault('direct_timings', {}).setdefault(
+            stage, {'wall_s': 0.0, 'event_elapsed_s': 0.0, 'calls': 0})
+        stats['wall_s'] += time.perf_counter() - wall_start
+        stats['event_elapsed_s'] += cp.cuda.get_elapsed_time(event, end) / 1000
+        stats['calls'] += 1
+
     def _unsort_numpy(self, matrix):
         matrix = self.opt.unsort_orbitals(
             matrix, axis=[matrix.ndim - 2, matrix.ndim - 1],
@@ -809,6 +849,18 @@ class GPUXCFrameBackend:
 
                 if not with_direct:
                     continue
+                direct_started = self._start_direct_timer()
+                if self.direct_backend == 'ao_reduce':
+                    weights = cp.concatenate((ordinary_stack,
+                                              reference_alpha[None],
+                                              reference_beta[None]))
+                    ctx["direct"] += self._reduce_centers(
+                        ao, indices, workspace, weights, atmlst,
+                        grid_weights=grid_weights,
+                        pair=(pair_products, pair_products_t, special_stack),
+                    )
+                    self._finish_direct_timer('response', direct_started)
+                    continue
                 for atom_index, atom in enumerate(atmlst):
                     local = self._atom_indices(indices, atom)
                     if len(local) == 0:
@@ -841,6 +893,7 @@ class GPUXCFrameBackend:
                             grid_weights,
                         )
                         ctx["direct"][atom_index, xyz] += value
+                self._finish_direct_timer('response', direct_started)
 
         forge_xc = _forge_xc()
         output = []
@@ -960,6 +1013,19 @@ class GPUXCFrameBackend:
             workspace = _density_workspace(
                 ao, masked_stack, hermitian=True, xctype=self.xctype,
             )
+            direct_started = self._start_direct_timer()
+            if self.direct_backend == 'ao_reduce':
+                for task in range(ntask):
+                    weights = fockz_weights(
+                        fref, rho_open, rho_pz, alpha_weights, beta_weights,
+                        grid_weights, task, xp=cp,
+                    )
+                    direct[task] += self._reduce_centers(
+                        ao, indices, workspace, weights, atmlst,
+                        density_indices=(task, ntask, ntask + 1, ntask + 2),
+                    )
+                self._finish_direct_timer('fockz', direct_started)
+                continue
             for atom_index, atom in enumerate(atmlst):
                 local = self._atom_indices(indices, atom)
                 if len(local) == 0:
@@ -987,6 +1053,7 @@ class GPUXCFrameBackend:
                         "nxyg,xyzg,zg,g->n",
                         pair, kref_beta, drho_beta, grid_weights,
                     )
+            self._finish_direct_timer('fockz', direct_started)
 
         forge_xc = _forge_xc()
         mo = np.asarray(tdobj._scf.mo_coeff)
@@ -1082,6 +1149,17 @@ class GPUXCFrameBackend:
                 xctype=self.xctype,
                 spin=1,
             )[:3]
+            direct_started = self._start_direct_timer()
+            if self.direct_backend == 'ao_reduce':
+                for task in range(len(probe_alpha)):
+                    weights = postz_weights(vxc, fxc, probe_rho, task, xp=cp)
+                    output[task] += self._reduce_centers(
+                        ao, indices, workspace, weights, atmlst,
+                        grid_weights=grid_weights,
+                        density_indices=(0, 1, 2 + 2 * task, 3 + 2 * task),
+                    )
+                self._finish_direct_timer('postz', direct_started)
+                continue
             for atom_index, atom in enumerate(atmlst):
                 local = self._atom_indices(indices, atom)
                 if len(local) == 0:
@@ -1105,6 +1183,7 @@ class GPUXCFrameBackend:
                     output[:, atom_index, xyz] += cp.einsum(
                         "nbyg,byg->n", probe_rho, response_weights,
                     )
+            self._finish_direct_timer('postz', direct_started)
         output = cp.asnumpy(output)
         return output[0] if single_probe else output
 
