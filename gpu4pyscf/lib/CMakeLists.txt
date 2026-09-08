@@ -105,9 +105,10 @@ set(CXX_LINK_TEMPLATE "<CMAKE_CXX_COMPILER> <CMAKE_SHARED_LIBRARY_CXX_FLAGS> <LA
 option(BUILD_CUTLASS "Using cutlass" ON)
 if(BUILD_CUTLASS)
   include(ExternalProject)
+  set(CUTLASS_SRC_DIR "/mlx_devbox/users/jingyu.369/playground/Project_gpu4pyscf/cutlass-v3.4.0"
+      CACHE PATH "Local path to CUTLASS v3.4.0 source")
   ExternalProject_Add(cutlass
-    GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-    GIT_TAG        v3.4.0
+    SOURCE_DIR ${CUTLASS_SRC_DIR}
     CONFIGURE_COMMAND ""  # No configure step
     BUILD_COMMAND ""      # No build step
     INSTALL_COMMAND ""    # No install step

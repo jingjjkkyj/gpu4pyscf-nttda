@@ -19,6 +19,9 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(PARAMS['df_batch_factor'], 1.0)
         self.assertAlmostEqual(PARAMS['df_blk_factor'], 1.0)
         self.assertEqual(PARAMS['dm_block'], 7)
+        self.assertEqual(PARAMS['df_compressed_backend'], 'legacy')
+        self.assertFalse(PARAMS['df_compressed_profile'])
+        self.assertEqual(PARAMS['df_output_backend'], 'legacy')
         self.assertIsNone(PARAMS['cphf_max_cycle'])
         self.assertEqual(PARAMS['davidson_max_subspace'], 12)
         self.assertEqual(PARAMS['contract_backend'], 'cupy')
@@ -33,6 +36,9 @@ class KnownValues(unittest.TestCase):
         env = {
             'NTTDA_DF_MEM_FRACTION': '0.7',
             'NTTDA_DM_BLOCK': '12',
+            'NTTDA_DF_COMPRESSED_BACKEND': 'rank_batched',
+            'NTTDA_DF_COMPRESSED_PROFILE': '1',
+            'NTTDA_DF_OUTPUT_BACKEND': 'slot_aware',
             'NTTDA_DAVIDSON_MAX_SUBSPACE': '20',
             'NTTDA_CONTRACT_BACKEND': 'cutensor',
             'NTTDA_CPHF_MAX_CYCLE': '50',
@@ -41,6 +47,9 @@ class KnownValues(unittest.TestCase):
             new_params = reload_params()
         self.assertAlmostEqual(new_params['df_mem_fraction'], 0.7)
         self.assertEqual(new_params['dm_block'], 12)
+        self.assertEqual(new_params['df_compressed_backend'], 'rank_batched')
+        self.assertTrue(new_params['df_compressed_profile'])
+        self.assertEqual(new_params['df_output_backend'], 'slot_aware')
         self.assertEqual(new_params['davidson_max_subspace'], 20)
         self.assertEqual(new_params['contract_backend'], 'cutensor')
         self.assertEqual(new_params['cphf_max_cycle'], 50)
@@ -64,6 +73,18 @@ class KnownValues(unittest.TestCase):
 
     def test_invalid_backend_raises(self):
         with mock.patch.dict(os.environ, {'NTTDA_CONTRACT_BACKEND': 'numpy'}):
+            with self.assertRaises(ValueError):
+                reload_params()
+        with mock.patch.dict(
+                os.environ, {'NTTDA_DF_COMPRESSED_BACKEND': 'padded'}):
+            with self.assertRaises(ValueError):
+                reload_params()
+        with mock.patch.dict(
+                os.environ, {'NTTDA_DF_COMPRESSED_PROFILE': 'yes'}):
+            with self.assertRaises(ValueError):
+                reload_params()
+        with mock.patch.dict(
+                os.environ, {'NTTDA_DF_OUTPUT_BACKEND': 'global'}):
             with self.assertRaises(ValueError):
                 reload_params()
 

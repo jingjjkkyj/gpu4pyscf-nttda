@@ -22,7 +22,11 @@ import gpu4pyscf
 from gpu4pyscf.lib.cupy_helper import contract
 from gpu4pyscf.df import int3c2e_bdiv as int3c2e
 from gpu4pyscf.df.grad import tdrhf as df_tdrhf_grad
-from gpu4pyscf.df.grad.tdrhf import _jk_energy_per_atom, _jk_energies_per_atom
+from gpu4pyscf.df.grad.tdrhf import (
+    _jk_energy_per_atom,
+    _jk_energies_per_atom,
+    _jk_energies_by_dm_factors,
+)
 from gpu4pyscf.df.grad import rhf as rhf_grad
 
 atom = """
@@ -348,6 +352,101 @@ class KnownValues(unittest.TestCase):
         with lib.temporary_env(df_tdrhf_grad, get_avail_mem=(lambda **kw: 16000000)):
             ejk = _jk_energies_per_atom(opt, dm, j_factor=None, k_factor=k_factor)
         assert abs(ejk - ref).max() < 1e-11
+
+    def test_rank_batched_compressed_build(self):
+        cp.random.seed(18)
+        opt = int3c2e.Int3c2eOpt(mol, auxmol).build()
+        nao = opt.mol.nao
+        n_dm = 9
+        dm_factors = []
+        for index in range(n_dm):
+            rank = 3 if index == n_dm - 1 else 2
+            dm_factors.append(tuple(
+                cp.random.rand(nao, rank) - .5 for _ in range(4)
+            ))
+        j_factor = [
+            1.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0,
+        ]
+        k_factor = [
+            0.0, 0.0, 1.0, -1.0, 0.5, -0.25, 0.0, 0.75, -0.5,
+        ]
+
+        old_backend = df_tdrhf_grad._NTTDA_PARAMS[
+            'df_compressed_backend'
+        ]
+        old_profile = df_tdrhf_grad._NTTDA_PARAMS[
+            'df_compressed_profile'
+        ]
+        try:
+            legacy_stats = []
+            df_tdrhf_grad._NTTDA_PARAMS[
+                'df_compressed_backend'
+            ] = 'legacy'
+            df_tdrhf_grad._NTTDA_PARAMS[
+                'df_compressed_profile'
+            ] = True
+            ref = _jk_energies_by_dm_factors(
+                opt, dm_factors, j_factor, k_factor,
+                sum_results=False, verbose=None, stats_sink=legacy_stats,
+            )
+
+            batched_stats = []
+            df_tdrhf_grad._NTTDA_PARAMS[
+                'df_compressed_backend'
+            ] = 'rank_batched'
+            df_tdrhf_grad._NTTDA_PARAMS[
+                'df_compressed_profile'
+            ] = False
+            out = _jk_energies_by_dm_factors(
+                opt, dm_factors, j_factor, k_factor,
+                sum_results=False, verbose=None, stats_sink=batched_stats,
+            )
+
+            group_indices = np.asarray(
+                [0, 0, 1, 1, 1, 2, 0, 2, 2], dtype=np.int32,
+            )
+            slot_stats = []
+            df_tdrhf_grad._NTTDA_PARAMS[
+                'df_compressed_backend'
+            ] = 'legacy'
+            grouped = _jk_energies_by_dm_factors(
+                opt, dm_factors, j_factor, k_factor,
+                sum_results=False, verbose=None, stats_sink=slot_stats,
+                output_group_indices=group_indices,
+                output_group_count=3,
+            )
+        finally:
+            df_tdrhf_grad._NTTDA_PARAMS[
+                'df_compressed_backend'
+            ] = old_backend
+            df_tdrhf_grad._NTTDA_PARAMS[
+                'df_compressed_profile'
+            ] = old_profile
+
+        assert abs(out - ref).max() < 3e-10
+        assert legacy_stats[0]['compressed_profile']
+        assert legacy_stats[0]['compressed_build_gpu_ms'] > 0
+        assert legacy_stats[0]['derivative_kernel_gpu_ms'] > 0
+        assert {
+            (
+                item['operator'],
+                item['rank_left'],
+                item['rank_right'],
+                item['task_count'],
+            )
+            for item in legacy_stats[0]['rank_bucket_gpu']
+        } == {('J', 2, 2, 3), ('K', 2, 2, 5), ('K', 3, 3, 1)}
+        assert batched_stats[0]['compressed_backend'] == 'rank_batched'
+        assert batched_stats[0]['rank_batched_j_only'] == 3
+        assert batched_stats[0]['rank_batched_2x2'] == 5
+        assert batched_stats[0]['legacy_dm'] == 1
+        assert batched_stats[0]['rank_batched_tiles'] > 0
+        grouped_ref = np.zeros((3,) + ref.shape[1:], dtype=ref.dtype)
+        np.add.at(grouped_ref, group_indices, ref)
+        assert abs(grouped - grouped_ref).max() < 3e-10
+        assert slot_stats[0]['output_backend'] == 'slot_aware'
+        assert slot_stats[0]['input_dm'] == 9
+        assert slot_stats[0]['kernel_dm'] == 3
 
     def test_j_energy_per_atom_dm_pairs(self):
         cp.random.seed(8)

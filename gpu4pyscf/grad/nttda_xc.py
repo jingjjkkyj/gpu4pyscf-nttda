@@ -16,6 +16,7 @@ orchestrator.
 
 from dataclasses import dataclass
 import importlib
+import os
 import time
 
 import cupy as cp
@@ -521,6 +522,13 @@ class GPUXCFrameBackend:
         # normally disabled on small GPUs by the conservative worst-case
         # estimate, but an A100 can retain it and avoid reevaluating AO values
         # in the Fock-Z and post-Z grid passes.
+        #
+        # The residency budget is a fraction of free device memory.  The
+        # fractional cap already protects small GPUs (an 8 GB card keeps the
+        # estimate small); the previous absolute 12 GiB ceiling needlessly
+        # capped large-memory GPUs such as the A100 (80 GB), forcing mid/large
+        # systems to re-evaluate AO values on every grid pass.  The fraction
+        # and an optional absolute ceiling are configurable via env.
         free_bytes, _total_bytes = cp.cuda.runtime.memGetInfo()
         components = (deriv + 1) * (deriv + 2) * (deriv + 3) // 6
         feature_count = 4 if self.xctype == "GGA" else 5
@@ -529,7 +537,11 @@ class GPUXCFrameBackend:
             (components * self.nao + kernel_arrays)
             * len(self.grids.weights) * 8
         )
-        cache_budget = min(int(0.35 * free_bytes), 12 * 1024**3)
+        cache_fraction = float(os.environ.get("NTTDA_AO_CACHE_FRACTION", "0.5"))
+        cache_budget = int(cache_fraction * free_bytes)
+        cap_gib = os.environ.get("NTTDA_AO_CACHE_MAX_GIB")
+        if cap_gib is not None:
+            cache_budget = min(cache_budget, int(float(cap_gib) * 1024**3))
         cache_blocks = deriv == 2 and estimated_bytes <= cache_budget
         resident = []
         for ao, indices, weights, coords in self.ni.block_loop(

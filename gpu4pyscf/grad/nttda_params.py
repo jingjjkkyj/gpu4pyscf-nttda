@@ -28,6 +28,23 @@ All variables are optional and use the ``NTTDA_`` prefix.
         Larger values reduce Python launch overhead but increase register
         pressure and shared-memory usage in the CUDA kernel.
 
+    NTTDA_DF_COMPRESSED_BACKEND
+        ``legacy`` (default) or experimental ``rank_batched``. The latter
+        batches J-only tasks and exact rank-(2,2) K tasks while building the
+        compressed DF derivative tensor. Unsupported tasks fall back to the
+        legacy per-pair path.
+
+    NTTDA_DF_COMPRESSED_PROFILE
+        ``1`` records CUDA-event timings grouped by ``(J/K, left rank,
+        right rank)`` for the compressed DF derivative build and the final
+        derivative kernel. Default ``0`` creates no events.
+
+    NTTDA_DF_OUTPUT_BACKEND
+        ``legacy`` (default) returns one derivative row per input task.
+        Experimental ``slot_aware`` pre-sums already weighted compressed
+        tensors within the same ``(omega, operator, output slot)`` group and
+        runs the derivative CUDA kernel over the reduced output width.
+
     NTTDA_CPHF_MAX_CYCLE
         Default maximum CPHF/Z-vector iterations.  ``None`` (use forge
         default).  Range: ``[1, 1000]`` or unset.
@@ -105,6 +122,19 @@ def _load_params():
         'df_batch_factor': _get_float('NTTDA_DF_BATCH_FACTOR', 1.0, 0.0, 10.0),
         'df_blk_factor': _get_float('NTTDA_DF_BLK_FACTOR', 1.0, 0.0, 10.0),
         'dm_block': _get_int('NTTDA_DM_BLOCK', 7, 1, 16),
+        'df_compressed_backend': _get_str(
+            'NTTDA_DF_COMPRESSED_BACKEND',
+            'legacy',
+            ('legacy', 'rank_batched'),
+        ),
+        'df_compressed_profile': _get_str(
+            'NTTDA_DF_COMPRESSED_PROFILE', '0', ('0', '1'),
+        ) == '1',
+        'df_output_backend': _get_str(
+            'NTTDA_DF_OUTPUT_BACKEND',
+            'legacy',
+            ('legacy', 'slot_aware'),
+        ),
         'cphf_max_cycle': (
             _get_int('NTTDA_CPHF_MAX_CYCLE', 0, 1, 1000)
             if os.environ.get('NTTDA_CPHF_MAX_CYCLE')
