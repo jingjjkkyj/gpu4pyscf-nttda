@@ -3,6 +3,9 @@ GPU plugin for PySCF
 ![nightly](https://github.com/pyscf/gpu4pyscf/actions/workflows/nightly_build.yml/badge.svg)
 [![PyPI version](https://badge.fury.io/py/gpu4pyscf-cuda11x.svg)](https://badge.fury.io/py/gpu4pyscf-cuda11x)
 
+The local [GPU NTTDA method interfaces](docs/nttda_methods.md) share their four
+method definitions with the matching CPU forge checkout.
+
 Installation
 --------
 

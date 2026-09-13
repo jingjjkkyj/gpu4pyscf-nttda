@@ -43,6 +43,11 @@ from gpu4pyscf.scf import jk as jk_mod
 from gpu4pyscf.tdscf._lr_eig import eigh as lr_eigh
 
 
+def _methods():
+    from gpu4pyscf.grad.nttda_bridge import import_methods
+    return import_methods()
+
+
 def _get_j_range_separated(mf, dms, hermi, omega):
     '''Long-range (erf-kernel) Coulomb J.
 
@@ -535,16 +540,7 @@ def gen_vind_sc(td):
         mf, fxc_ref=fxc_ref, hermi=0,
         use_mo_grid_fxc1=use_mo_grid_fxc1,
     )
-    if getattr(mf, 'is_ensemble_rks', False):
-        fock0 = cp.asarray(mf.get_fock())
-    elif td.nobeta:
-        density_alpha, density_beta = mf.make_rdm1()
-        density0 = 0.5 * (density_alpha + density_beta)
-        fock = mf.get_fock(dm=cp.stack((density0, density0)))
-        fock0 = 0.5 * (cp.asarray(fock.focka) + cp.asarray(fock.fockb))
-    else:
-        fock = mf.get_fock()
-        fock0 = 0.5 * (cp.asarray(fock.focka) + cp.asarray(fock.fockb))
+    fock0 = _methods().get_method(td).fock0(mf, xp=cp)
     td._nttda_gpu_fxc_ref = fxc_ref
     td._nttda_gpu_fock0_fockz = (fock0, fockz)
 
@@ -721,19 +717,7 @@ def gen_vind_sfd(td):
         mf, fxc_ref=fxc_ref, hermi=0, use_mo_grid_fxc1=use_mo_grid_fxc1,
     )
 
-    if getattr(mf, 'is_ensemble_rks', False):
-        fock0 = cp.asarray(mf.get_fock())
-    elif td.nobeta:
-        dma, dmb = mf.make_rdm1()
-        dm0 = 0.5 * (cp.asarray(dma) + cp.asarray(dmb))
-        fock = mf.get_fock(dm=cp.stack((dm0, dm0)))
-        fock0 = 0.5 * (cp.asarray(fock.focka) + cp.asarray(fock.fockb))
-    else:
-        fock = mf.get_fock()
-        fock0 = 0.5 * (cp.asarray(fock.focka) + cp.asarray(fock.fockb))
-    # The derivative of the same electronic frame needs both objects again.
-    # Keep them device-resident so the gradient/NAC driver does not rebuild a
-    # spin-GGA kernel and an open-shell Fock after the Davidson solve.
+    fock0 = _methods().get_method(td).fock0(mf, xp=cp)
     td._nttda_gpu_fxc_ref = fxc_ref
     td._nttda_gpu_fock0_fockz = (fock0, fockz)
 
@@ -912,6 +896,10 @@ class NTTDA(lib.StreamObject):
     gen_vind_sfd = gen_vind_sfd
     gen_vind_sc = gen_vind_sc
 
+    @property
+    def method_id(self):
+        return _methods().resolve_method(self).id
+
     def get_precond(self, hdiag):
         def precond(x, e, *args):
             x = cp.asarray(x)
@@ -938,6 +926,7 @@ class NTTDA(lib.StreamObject):
         return x0
 
     def kernel(self, x0=None, nstates=None):
+        _methods().begin_solution(self)
         log = logger.new_logger(self)
         t0 = log.init_timer()
         if self.deltaS not in (-1, 0):
@@ -1093,6 +1082,7 @@ class NTTDA(lib.StreamObject):
             'converged': self.converged.tolist(),
         }
         log.timer('GPU NTTDA', *t0)
+        _methods().record_solution(self)
         return self.e, self.xy
 
     def run(self, **kwargs):
@@ -1108,10 +1098,7 @@ class NTTDA(lib.StreamObject):
         ``reference_energy`` selector; every other mean field keeps the
         historical ``mf.e_tot`` zero.
         '''
-        selector = getattr(self._scf, 'reference_energy', None)
-        if selector is None:
-            return float(self._scf.e_tot)
-        return float(selector())
+        return _methods().resolve_method(self).reference_energy(self._scf)
 
     @property
     def e_tot(self):
@@ -1133,3 +1120,23 @@ class NTTDA(lib.StreamObject):
         return NAC(self)
 
     NAC = nac_method
+
+
+def NTTDA_ROKS(mf):
+    """Build the explicit GPU roks NTTDA method."""
+    return _methods().explicit_solver(NTTDA, mf, 'roks')
+
+
+def NTTDA_ROKS_NoBeta(mf):
+    """Build the explicit GPU roks_nobeta NTTDA method."""
+    return _methods().explicit_solver(NTTDA, mf, 'roks_nobeta')
+
+
+def NTTDA_EnsembleRKS(mf):
+    """Build the explicit GPU ensemble_rks NTTDA method."""
+    return _methods().explicit_solver(NTTDA, mf, 'ensemble_rks')
+
+
+def NTTDA_EnsembleROKS(mf):
+    """Build the explicit GPU ensemble_roks NTTDA method."""
+    return _methods().explicit_solver(NTTDA, mf, 'ensemble_roks')

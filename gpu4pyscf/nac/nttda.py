@@ -25,16 +25,10 @@ where the contractions are evaluated, not the gap convention, state phase,
 ETF switch, or moving-CSF contribution.
 '''
 
-from gpu4pyscf.grad.nttda import (
-    DFLedgerBackend,
-    LedgerBackend,
-    _import_forge,
-    _is_gpu_object,
-    _resolve_input,
-    build_cpu_twin,
-    make_gpu_response_cache,
-    rebuild_reference,
+from gpu4pyscf.grad.nttda_bridge import (
+    _import_forge, _is_gpu_object, build_cpu_twin, rebuild_reference,
 )
+from gpu4pyscf.grad.nttda_context import EvaluationContext
 
 
 def _make_nac_class():
@@ -43,22 +37,23 @@ def _make_nac_class():
     class NAC(forge_nac.NonAdiabaticCouplings):
         '''GPU-accelerated NTTDA NACs (CPU formulas, GPU integrals).'''
 
-        def __init__(self, td):
-            from gpu4pyscf.df.df_jk import _DFHF
+        def __init__(self, td, context=None):
+            self._context = EvaluationContext(td) if context is None else context
+            self._context.validate()
+            super().__init__(self._context.cpu_td)
+            self._gmf = self._context.gmf
+            self.nttda_jk_ledger_backend = self._context.ledger
 
-            cpu_td, gmf = _resolve_input(td)
-            super().__init__(cpu_td)
-            self._gmf = gmf
-            if isinstance(gmf, _DFHF):
-                self.nttda_jk_ledger_backend = DFLedgerBackend(gmf)
-            else:
-                self.nttda_jk_ledger_backend = LedgerBackend(gmf)
+        def kernel(self, *args, **kwargs):
+            self._context.validate()
+            return super().kernel(*args, **kwargs)
 
         def _make_response_cache(self):
+            self._context.validate()
             shared = getattr(self, 'shared_response_cache', None)
             if shared is not None:
                 return shared
-            return make_gpu_response_cache(self.base, self._gmf)
+            return self._context.fresh_response_cache()
 
         def _gradient_driver(self, verbose=None):
             driver = super()._gradient_driver(verbose=verbose)
@@ -93,6 +88,8 @@ def _make_nac_class():
                     'max_cycle', 'max_memory'):
                 if hasattr(self.base, name):
                     setattr(displaced, name, getattr(self.base, name))
+            from pyscf.sftda import nttda_methods as methods
+            methods.copy_method(self.base, displaced)
             displaced.verbose = 0
             displaced.kernel()
             return build_cpu_twin(displaced)
@@ -122,3 +119,11 @@ def NAC(td):
 
 
 NonAdiabaticCouplings = NAC
+
+
+def _nac_from_context(td, context):
+    global _NAC_CLASS
+    if _NAC_CLASS is None:
+        _import_forge()
+        _NAC_CLASS = _make_nac_class()
+    return _NAC_CLASS(td, context=context)

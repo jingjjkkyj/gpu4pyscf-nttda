@@ -14,6 +14,10 @@
 
 from gpu4pyscf.sftda.ensemble_rks import EnsembleRKS
 from gpu4pyscf.sftda.ensemble_roks import EnsembleROKS
-from gpu4pyscf.sftda.nttda import NTTDA
+from gpu4pyscf.sftda.nttda import (
+    NTTDA, NTTDA_ROKS, NTTDA_ROKS_NoBeta,
+    NTTDA_EnsembleRKS, NTTDA_EnsembleROKS,
+)
 
-__all__ = ['EnsembleRKS', 'EnsembleROKS', 'NTTDA']
+__all__ = ['EnsembleRKS', 'EnsembleROKS', 'NTTDA', 'NTTDA_ROKS',
+           'NTTDA_ROKS_NoBeta', 'NTTDA_EnsembleRKS', 'NTTDA_EnsembleROKS']

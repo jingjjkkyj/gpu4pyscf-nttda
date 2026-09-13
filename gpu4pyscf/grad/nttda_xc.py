@@ -326,16 +326,8 @@ class GPUXCFrameBackend:
         the determinant alpha/beta densities from its 0/1/2 spatial
         occupations, matching the CPU formula backend.
         """
-        if getattr(self.gmf, "is_ensemble_rks", False):
-            # ``mo_occ`` is the spin-summed 2/1/0 occupation vector.
-            density = (self.mo * self.mo_occ[None]) @ self.mo.T
-            density *= 0.5
-            return density, density.copy()
-        occ_alpha = self.mo_occ > 0
-        occ_beta = self.mo_occ == 2
-        density_alpha = self.mo[:, occ_alpha] @ self.mo[:, occ_alpha].T
-        density_beta = self.mo[:, occ_beta] @ self.mo[:, occ_beta].T
-        return density_alpha, density_beta
+        from pyscf.sftda import nttda_methods as methods
+        return methods.get_method(self.cpu_td).spin_densities(self.gmf, xp=cp)
 
     def spin_lowering_fock0_fockz(self):
         """Return the device-built ``F0/Fz`` pair used by the CPU formulas."""
@@ -355,20 +347,8 @@ class GPUXCFrameBackend:
             hermi=0,
             use_mo_grid_fxc1=True,
         )
-        if getattr(self.gmf, "is_ensemble_rks", False):
-            fock0 = cp.asarray(self.gmf.get_fock())
-        elif bool(getattr(self.cpu_td, "nobeta", False)):
-            density_alpha, density_beta = self.gmf.make_rdm1()
-            density0 = 0.5 * (density_alpha + density_beta)
-            fock = self.gmf.get_fock(dm=cp.stack((density0, density0)))
-            fock0 = 0.5 * (
-                cp.asarray(fock.focka) + cp.asarray(fock.fockb)
-            )
-        else:
-            fock = self.gmf.get_fock()
-            fock0 = 0.5 * (
-                cp.asarray(fock.focka) + cp.asarray(fock.fockb)
-            )
+        from pyscf.sftda import nttda_methods as methods
+        fock0 = methods.get_method(self.cpu_td).fock0(self.gmf, xp=cp)
         self.stats["spin_fock_builds"] += 1
         return cp.asnumpy(fock0), cp.asnumpy(cp.asarray(fockz))
 
