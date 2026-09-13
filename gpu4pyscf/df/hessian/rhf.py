@@ -434,6 +434,10 @@ def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
             verbose=None, with_j=True, with_k=True, omega=None):
     '''
     Derivatives of J, K matrices in MO bases
+
+    The density is ``C diag(mo_occ) C^T``.  Occupation weights belong only
+    to the contracted density index of K; the output ``C_occ`` transform
+    is unweighted, including for fractional occupations.
     '''
     log = logger.new_logger(hessobj, verbose)
     t0 = log.init_timer()
@@ -454,7 +458,8 @@ def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
 
     nao, nmo = mo_coeff.shape
     mocc = mo_coeff[:,mo_occ>0]
-    dm0 = cupy.dot(mocc, mocc.T) * 2
+    occ_weights = mo_occ[mo_occ > 0]
+    dm0 = (mocc * occ_weights) @ mocc.T
 
     if omega and omega > 1e-10:
         with auxmol.with_range_coulomb(omega):
@@ -478,7 +483,7 @@ def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
     nocc = mocc.shape[1]
     mo_coeff = intopt.sort_orbitals(mo_coeff, axis=[0])
     dm0 = intopt.sort_orbitals(dm0, axis=[0,1])
-    dm0_tag = tag_array(dm0, occ_coeff=mocc)
+    dm0_tag = tag_array(dm0, occ_coeff=mocc, occ_weights=occ_weights)
 
     int2c = intopt.sort_orbitals(int2c, aux_axis=[0,1])
     solve_j2c = _gen_metric_solver(int2c, 'ED')
@@ -556,8 +561,8 @@ def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
                 vj1_int3c[:,:,p0:p1] += contract('xpio,pa->axio', vj1_tmp, aux2atom)
                 vj1_tmp = None
             if with_k:
-                vk1_tmp = contract('xpio,pro->xpir', wk0_10_Pl_, rhok0_P__)
-                vk1_tmp += contract('xpro,pir->xpio', wk0_10_P__, rhok_tmp)
+                vk1_tmp = contract('xpio,pro->xpir', wk0_10_Pl_ * occ_weights, rhok0_P__)
+                vk1_tmp += contract('xpro,pir->xpio', wk0_10_P__, rhok_tmp * occ_weights)
                 vk1_int3c[:,:,p0:p1] += contract('xpio,pa->axio', vk1_tmp, aux2atom)
                 vk1_tmp = None
             wk0_10_Pl_ = rhok_tmp = None
@@ -592,9 +597,8 @@ def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
         else:
             vk1_int3c -= vk1_ao
         vk1_ao = None
-        # * 2.0 due to the contraction with mocc
-        vk1_buf *= 2.0
-        vk1_int3c = 2.0 * contract('nxiq,ip->nxpq', vk1_int3c, mo_coeff)
+        # Density occupation weights were applied at the contracted index.
+        vk1_int3c = contract('nxiq,ip->nxpq', vk1_int3c, mo_coeff)
     t0 = log.timer_debug1('Fock matrix due to int3c2e_ip1', *t0)
 
     mocc = intopt.unsort_orbitals(mocc, axis=[0])

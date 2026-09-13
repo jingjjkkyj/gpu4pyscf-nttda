@@ -236,7 +236,13 @@ def build_cpu_twin(gpu_td):
     gmf = gpu_td._scf
     _validate_supported_reference(gmf)
     mol = gmf.mol
-    if getattr(gmf, 'is_ensemble_rks', False):
+    if (
+            getattr(gmf, 'reference_energy_semantics', None)
+            == 'roks_energy_on_ensemble_rks_orbitals'):
+        from pyscf.sftda import EnsembleROKS
+
+        cpu_mf = EnsembleROKS(mol, nopen=gmf.nopen)
+    elif getattr(gmf, 'is_ensemble_rks', False):
         from pyscf.sftda import EnsembleRKS
 
         cpu_mf = EnsembleRKS(mol, nopen=gmf.nopen)
@@ -349,6 +355,62 @@ def route_jk_to_gpu(cpu_mf, gmf):
     cpu_mf._nttda_jk_route_stats = route_stats
     cpu_mf._nttda_gpu_routed = True
     return cpu_mf
+
+
+def rebuild_reference(gmf, mol, fixed_grid=False):
+    '''Rebuild a displaced reference of the source's own concrete type.
+
+    The displaced reference used by finite differences must use the same
+    integral model as the differentiated calculation, so the concrete
+    reference type (ROKS, EnsembleRKS or EnsembleROKS) must be preserved and
+    the model settings carried over.  When ``gmf`` is density fitted the
+    auxiliary basis is carried over so the displaced reference energy is
+    density fitted too; the quadrature is frozen when ``fixed_grid`` is set.
+    '''
+    from pyscf import dft
+
+    from gpu4pyscf.dft import roks as gpu_roks
+    from gpu4pyscf.sftda import EnsembleRKS as GpuEnsembleRKS
+    from gpu4pyscf.sftda import EnsembleROKS as GpuEnsembleROKS
+
+    if isinstance(gmf, GpuEnsembleROKS):
+        reference = GpuEnsembleROKS(
+            mol, xc=gmf.xc, nopen=getattr(gmf, 'nopen', None))
+    elif isinstance(gmf, GpuEnsembleRKS):
+        reference = GpuEnsembleRKS(
+            mol, xc=gmf.xc, nopen=getattr(gmf, 'nopen', None))
+    elif isinstance(gmf, dft.KohnShamDFT):
+        reference = gpu_roks.ROKS(mol, xc=gmf.xc)
+    else:
+        reference = gmf.__class__(mol)
+    with_df = getattr(gmf, 'with_df', None)
+    if with_df is not None:
+        reference = reference.density_fit(
+            auxbasis=getattr(with_df, 'auxbasis', None),
+        )
+    for name in (
+            'conv_tol', 'conv_tol_grad', 'max_cycle', 'max_memory',
+            'level_shift', 'damp', 'direct_scf_tol', 'small_rho_cutoff',
+            'nlc', 'disp', 'disp_with_3body'):
+        if hasattr(gmf, name):
+            setattr(reference, name, getattr(gmf, name))
+    if getattr(gmf, 'omega', None) is not None:
+        reference.omega = gmf.omega
+    reference.grids.level = gmf.grids.level
+    reference.grids.prune = gmf.grids.prune
+    if fixed_grid and gmf.grids.coords is not None:
+        reference.grids.coords = cp.asarray(gmf.grids.coords).copy()
+        reference.grids.weights = cp.asarray(gmf.grids.weights).copy()
+        reference.grids.non0tab = None
+    reference.verbose = 0
+    return reference
+
+
+def _host_normalized_amplitude(xy):
+    '''Normalize a device or host ``(x, y)`` amplitude on the host.'''
+    part = xy[0] if isinstance(xy, (list, tuple)) else xy
+    vector = np.asarray(cp.asnumpy(cp.asarray(part))).ravel()
+    return vector / np.linalg.norm(vector)
 
 
 def _density_view_key(density):
@@ -1055,18 +1117,83 @@ def _make_gradients_class():
             if self._gmf.grids.coords is None:
                 self._gmf.grids.build(sort_grids=True)
             if self._with_df:
-                if getattr(self._gmf, 'is_ensemble_rks', False):
+                # Selected-reference objects (non-stationary reference energy)
+                # must use their own gradient driver.  EnsembleROKS inherits
+                # is_ensemble_rks=True, so that flag alone would silently
+                # select the ordinary DF-RKS gradient and bypass the reference
+                # response.
+                selected_reference = (
+                    getattr(self._gmf, 'reference_energy_stationary', None)
+                    is False
+                )
+                if selected_reference:
+                    driver = self._gmf.nuc_grad_method()
+                elif getattr(self._gmf, 'is_ensemble_rks', False):
                     from gpu4pyscf.df.grad.rks import Gradients as DFGrad
+                    driver = DFGrad(self._gmf)
                 else:
                     from gpu4pyscf.df.grad.roks import Gradients as DFGrad
-                driver = DFGrad(self._gmf)
+                    driver = DFGrad(self._gmf)
             else:
+                # The selected-ROKS reference binds nuc_grad_method() to the
+                # T06 gpu4pyscf.grad.ensemble_roks.ReferenceGradients driver;
+                # legacy ROKS/EnsembleRKS references keep their own gradient.
                 driver = self._gmf.nuc_grad_method()
             driver.verbose = 0
             value = np.asarray(driver.kernel())
+            diagnostics = getattr(driver, 'z_solver_diagnostics', None)
+            self.reference_z_solver_diagnostics = (
+                diagnostics.as_dict() if diagnostics is not None else None
+            )
+            self.reference_gradient_calls = getattr(
+                self, 'reference_gradient_calls', 0,
+            ) + 1
             if atmlst is not None:
                 value = value[list(atmlst)]
             return value
+
+        def _energy_at(self, coords, reference_amplitude):
+            '''Displaced total energy for the public finite-difference path.
+
+            The inherited CPU implementation rebuilds a non-density-fitted
+            CPU reference, so its displaced energy would not be the same
+            integral model as the DF analytic derivative.  For a DF reference
+            rebuild the displaced reference on the GPU with the matching
+            auxiliary basis instead.
+            '''
+            if not self._with_df:
+                return super()._energy_at(coords, reference_amplitude)
+            from gpu4pyscf.sftda import NTTDA as gpu_nttda
+
+            mol = self.mol.copy()
+            mol.set_geom_(coords, unit='Bohr')
+            reference = rebuild_reference(self._gmf, mol, self.fixed_grid)
+            reference.kernel(dm0=self._gmf.make_rdm1())
+            if not reference.converged:
+                raise RuntimeError(
+                    'displaced NTTDA reference did not converge'
+                )
+            tdobj = gpu_nttda(reference)
+            for name in (
+                    'deltaS', 'nobeta', 'nstates', 'conv_tol', 'lindep',
+                    'max_cycle', 'max_memory'):
+                if hasattr(self.base, name):
+                    setattr(tdobj, name, getattr(self.base, name))
+            tdobj.verbose = 0
+            tdobj.kernel()
+            overlaps = np.asarray([
+                abs(np.vdot(
+                    reference_amplitude, _host_normalized_amplitude(xy),
+                ))
+                for xy in tdobj.xy
+            ])
+            root = int(np.argmax(overlaps))
+            if overlaps[root] < self.root_overlap_tol:
+                raise RuntimeError(
+                    'NTTDA state tracking overlap %.6f is below %.6f' %
+                    (overlaps[root], self.root_overlap_tol)
+                )
+            return reference.reference_energy() + tdobj.e[root]
 
     return Gradients
 
@@ -1329,6 +1456,15 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
             'response_jk': dict(getattr(
                 cache.reference(), '_nttda_jk_route_stats', {},
             )),
+            'reference_gradient': {
+                'calls': int(getattr(grad, 'reference_gradient_calls', 0)),
+                'semantics': getattr(
+                    grad._gmf, 'reference_energy_semantics', None,
+                ),
+                'z_solver': dict(
+                    getattr(grad, 'reference_z_solver_diagnostics', None) or {},
+                ),
+            },
         }
         td._nttda_frame_stats = stats
         if frame_cache is not None:

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from gpu4pyscf.sftda.ensemble_rks import EnsembleRKS
+from gpu4pyscf.sftda.ensemble_roks import EnsembleROKS
 from gpu4pyscf.sftda.nttda import NTTDA
 
-__all__ = ['EnsembleRKS', 'NTTDA']
+__all__ = ['EnsembleRKS', 'EnsembleROKS', 'NTTDA']

@@ -878,6 +878,9 @@ def _int3c2e_ip1_vjk_task(intopt, task_k_list, rhoj, rhok, dm0, orbo, device_id=
         log = logger.new_logger(intopt.mol, intopt.mol.verbose)
         t0 = log.init_timer()
         ao2atom = get_ao2atom(intopt, aoslices)
+        # ``orbo`` also transforms the free output index.  Weight only the
+        # internal density contraction; scaling orbo would weight both roles.
+        occ_weights = cupy.asarray(getattr(dm0, 'occ_weights', 1.0))
         dm0 = cupy.asarray(dm0)
         orbo = cupy.asarray(orbo)
         nocc = orbo.shape[1]
@@ -897,7 +900,7 @@ def _int3c2e_ip1_vjk_task(intopt, task_k_list, rhoj, rhok, dm0, orbo, device_id=
             rhok_tmp = copy_array(rhok[k0:k1])
             if with_k:
                 rhok0 = contract('pio,ir->pro', rhok_tmp, orbo)
-                rhok0 = contract('pro,Jo->prJ', rhok0, orbo)
+                rhok0 = contract('pro,Jo->prJ', rhok0, orbo * occ_weights)
                 int3c_ip1_occ = cupy.zeros([3,k1-k0,nao,nocc])
             if with_j:
                 rhoj0 = cupy.zeros([3,k1-k0,nao])
@@ -919,12 +922,12 @@ def _int3c2e_ip1_vjk_task(intopt, task_k_list, rhoj, rhok, dm0, orbo, device_id=
                 rhoj0_atom = rhoj0 = None
             if with_k:
                 rhok0 = None
-                vk1_buf += contract('xpio,plo->xil', int3c_ip1_occ, rhok_tmp)
+                vk1_buf += contract('xpio,plo->xil', int3c_ip1_occ * occ_weights, rhok_tmp)
                 mem_avail = get_avail_mem()
                 blksize = min(int(mem_avail * 0.2 / ((k1-k0) * nao) * 8),
                               int(mem_avail * 0.2 / (nocc * nao * 3 * 8)))
                 for p0, p1, in lib.prange(0, nao, blksize):
-                    rhok0_slice = contract('pJr,ir->pJi', rhok_tmp[:,p0:p1], orbo)
+                    rhok0_slice = contract('pJr,ir->pJi', rhok_tmp[:,p0:p1], orbo * occ_weights)
                     vk1_ao = contract('xpio,pJi->xiJo', int3c_ip1_occ, rhok0_slice)
                     vk1[:,:,p0:p1] += contract('xiJo,ia->axJo', vk1_ao, ao2atom)
                     rhok0_slice = vk1_ao = None
@@ -982,6 +985,7 @@ def _int3c2e_ip2_vjk_task(intopt, task_k_list, rhoj, rhok, dm0, orbo,
         log = logger.new_logger(intopt.mol, intopt.mol.verbose)
         t0 = log.init_timer()
         aux2atom = get_aux2atom(intopt, auxslices)
+        occ_weights = cupy.asarray(getattr(dm0, 'occ_weights', 1.0))
         dm0 = cupy.asarray(dm0)
         orbo = cupy.asarray(orbo)
         nocc = orbo.shape[1]
@@ -1017,10 +1021,10 @@ def _int3c2e_ip2_vjk_task(intopt, task_k_list, rhoj, rhok, dm0, orbo,
                 vj1_tmp = wj2 = None
             if with_k:
                 rhok0_slice = contract('xpjo,jr->xpro', wk2_P__, orbo)
-                vk1_tmp = -contract('xpro,pir->xpio', rhok0_slice, rhok_tmp)
+                vk1_tmp = -contract('xpro,pir->xpio', rhok0_slice, rhok_tmp * occ_weights)
 
                 rhok0_oo = contract('pio,ir->pro', rhok_tmp, orbo)
-                vk1_tmp -= contract('xpio,pro->xpir', wk2_P__, rhok0_oo)
+                vk1_tmp -= contract('xpio,pro->xpir', wk2_P__ * occ_weights, rhok0_oo)
 
                 vk1 += contract('xpir,pa->axir', vk1_tmp, aux2atom[k0:k1])
                 vk1_tmp = rhok0_oo = rhok0_slice = None

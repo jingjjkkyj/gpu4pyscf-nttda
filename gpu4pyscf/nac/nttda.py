@@ -31,7 +31,9 @@ from gpu4pyscf.grad.nttda import (
     _import_forge,
     _is_gpu_object,
     _resolve_input,
+    build_cpu_twin,
     make_gpu_response_cache,
+    rebuild_reference,
 )
 
 
@@ -62,6 +64,38 @@ def _make_nac_class():
             driver = super()._gradient_driver(verbose=verbose)
             driver.nttda_jk_ledger_backend = self.nttda_jk_ledger_backend
             return driver
+
+        def _displaced_td(self, coordinates):
+            '''Rebuild the displaced NTTDA with the source's integral model.
+
+            The inherited CPU helper rebuilds a non-density-fitted CPU
+            reference, so its finite-difference NAC would not be the same
+            integral model as the analytic DF derivative.  For a DF reference
+            rebuild on the GPU with the matching auxiliary basis, then hand
+            the CPU twin to the wavefunction-overlap post-processing.
+            '''
+            from gpu4pyscf.df.df_jk import _DFHF
+            from gpu4pyscf.sftda import NTTDA as gpu_nttda
+
+            if not isinstance(self._gmf, _DFHF):
+                return super()._displaced_td(coordinates)
+            mol = self.mol.copy()
+            mol.set_geom_(coordinates, unit='Bohr')
+            reference = rebuild_reference(self._gmf, mol, self.fixed_grid)
+            reference.kernel(dm0=self._gmf.make_rdm1())
+            if not reference.converged:
+                raise RuntimeError(
+                    'displaced NTTDA reference did not converge'
+                )
+            displaced = gpu_nttda(reference)
+            for name in (
+                    'deltaS', 'nobeta', 'nstates', 'conv_tol', 'lindep',
+                    'max_cycle', 'max_memory'):
+                if hasattr(self.base, name):
+                    setattr(displaced, name, getattr(self.base, name))
+            displaced.verbose = 0
+            displaced.kernel()
+            return build_cpu_twin(displaced)
 
     return NAC
 

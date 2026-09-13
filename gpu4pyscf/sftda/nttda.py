@@ -1101,6 +1101,27 @@ class NTTDA(lib.StreamObject):
         self.kernel()
         return self
 
+    def reference_energy(self):
+        '''Return the reference zero selected by the mean-field object.
+
+        :class:`~gpu4pyscf.sftda.ensemble_roks.EnsembleROKS` exposes a
+        ``reference_energy`` selector; every other mean field keeps the
+        historical ``mf.e_tot`` zero.
+        '''
+        selector = getattr(self._scf, 'reference_energy', None)
+        if selector is None:
+            return float(self._scf.e_tot)
+        return float(selector())
+
+    @property
+    def e_tot(self):
+        '''Total energies ``reference_energy() + omega`` for the NTTDA roots.'''
+        if self.e is None:
+            raise RuntimeError(
+                'run NTTDA.kernel() before requesting total energies'
+            )
+        return self.reference_energy() + np.asarray(self.e)
+
     def nuc_grad_method(self):
         from gpu4pyscf.grad.nttda import Gradients
         return Gradients(self)
