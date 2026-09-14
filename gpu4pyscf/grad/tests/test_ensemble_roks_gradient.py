@@ -81,22 +81,41 @@ class EnsembleROKSGradientGPU(unittest.TestCase):
 
     def test_gradient_components_match_cpu_oracle(self):
         self.cpu_driver.kernel()
-        self.gpu_driver.kernel()
+        gpu_driver = ReferenceGradients(self.mf)
+        gpu_driver.conv_tol = 1e-10
+        gpu_driver.max_cycle = 100
+        gpu_driver.restart = 40
+        gpu_driver.zb_backend = 'legacy'
+        gpu_driver.kernel()
 
         np.testing.assert_allclose(
-            cp.asnumpy(self.gpu_driver.e_hs_unrelaxed),
+            cp.asnumpy(gpu_driver.e_hs_unrelaxed),
             np.asarray(self.cpu_driver.e_hs_unrelaxed),
             atol=1e-8, rtol=0,
         )
         np.testing.assert_allclose(
-            cp.asnumpy(self.gpu_driver.b),
+            cp.asnumpy(gpu_driver.b),
             np.asarray(self.cpu_driver.b),
             atol=1e-8, rtol=0,
         )
         np.testing.assert_allclose(
-            cp.asnumpy(self.gpu_driver.z),
+            cp.asnumpy(gpu_driver.z),
             np.asarray(self.cpu_driver.z),
             atol=1e-8, rtol=0,
+        )
+
+    def test_direct_zb_matches_materialized_b(self):
+        driver = ReferenceGradients(self.mf)
+        driver._build_intermediates()
+        z = cp.asarray(
+            np.random.default_rng(20260914).normal(size=driver._space.size),
+        )
+        expected = cp.einsum(
+            'i,iax->ax', z, driver._build_b(), optimize=True,
+        )
+        result = driver._contract_z_b(z)
+        np.testing.assert_allclose(
+            cp.asnumpy(result), cp.asnumpy(expected), atol=2e-8, rtol=0,
         )
 
     def test_reference_energy_finite_difference_converges(self):

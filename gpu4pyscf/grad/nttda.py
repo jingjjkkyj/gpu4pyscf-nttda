@@ -117,6 +117,7 @@ def _make_gradients_class():
             self.reference_z_solver_diagnostics = (
                 diagnostics.as_dict() if diagnostics is not None else None
             )
+            self.reference_zb_backend = getattr(driver, 'zb_backend', None)
             self.reference_gradient_calls = getattr(
                 self, 'reference_gradient_calls', 0,
             ) + 1
@@ -434,6 +435,9 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
                 'calls': int(getattr(grad, 'reference_gradient_calls', 0)),
                 'semantics': getattr(
                     grad._gmf, 'reference_energy_semantics', None,
+                ),
+                'z_b_backend': getattr(
+                    grad, 'reference_zb_backend', None,
                 ),
                 'z_solver': dict(
                     getattr(grad, 'reference_z_solver_diagnostics', None) or {},

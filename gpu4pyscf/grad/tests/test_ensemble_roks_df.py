@@ -189,6 +189,19 @@ class EnsembleROKSDFGPU(unittest.TestCase):
         result = self.gpu_driver._charge_response(density)
         self.assertIsInstance(result, cp.ndarray)
 
+    def test_df_direct_zb_matches_materialized_b(self):
+        driver = self.gpu_driver
+        z = cp.asarray(
+            np.random.default_rng(20260914).normal(size=driver._space.size),
+        )
+        expected = cp.einsum(
+            'i,iax->ax', z, driver._build_b(), optimize=True,
+        )
+        result = driver._contract_z_b(z)
+        np.testing.assert_allclose(
+            cp.asnumpy(result), cp.asnumpy(expected), atol=2e-8, rtol=0,
+        )
+
 
 class EnsembleROKSDFDefaultAuxbasisGPU(unittest.TestCase):
     '''R2: ``density_fit()`` without an explicit auxbasis must stay DF.

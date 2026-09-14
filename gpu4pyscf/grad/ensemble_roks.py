@@ -19,6 +19,7 @@ contraction, the Hessian action and the GMRES vectors stay on the device.
 
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass
 
@@ -32,6 +33,7 @@ from pyscf.lib import logger
 
 from gpu4pyscf.dft import rks as gpu_rks
 from gpu4pyscf.dft import roks as gpu_roks
+from gpu4pyscf.grad import rhf as gpu_rhf_grad
 from gpu4pyscf.hessian import rhf as gpu_rhf_hess
 from gpu4pyscf.hessian import rks as gpu_rks_hess
 from gpu4pyscf.lib.cupy_helper import tag_array
@@ -39,6 +41,7 @@ from gpu4pyscf.scf import _response_functions
 
 
 _OCC_TOL = 1e-8
+_ZB_BACKENDS = ('contracted', 'legacy')
 
 
 @dataclass(frozen=True)
@@ -352,6 +355,8 @@ class ReferenceGradients(lib.StreamObject):
         'b',
         'e_hs_unrelaxed',
         'z_solver_diagnostics',
+        'zb_backend',
+        'z_b_correction',
     }
 
     def __init__(self, mf):
@@ -374,6 +379,10 @@ class ReferenceGradients(lib.StreamObject):
         self.b = None
         self.e_hs_unrelaxed = None
         self.z_solver_diagnostics = None
+        self.zb_backend = os.environ.get(
+            'NTTDA_REFERENCE_ZB_BACKEND', 'contracted',
+        ).strip().lower()
+        self.z_b_correction = None
 
         self._space = None
         self._charge_mf = None
@@ -396,6 +405,7 @@ class ReferenceGradients(lib.StreamObject):
         log.info('Z-vector max cycles = %d', self.max_cycle)
         log.info('GMRES restart = %d', self.restart)
         log.info('grid response = %s', self.grid_response)
+        log.info('Z.B contraction backend = %s', self.zb_backend)
         return self
 
     def _validate(self) -> None:
@@ -449,6 +459,11 @@ class ReferenceGradients(lib.StreamObject):
             raise NotImplementedError(
                 'Only molecular (three-dimensional) calculations are '
                 'supported.'
+            )
+        if self.zb_backend not in _ZB_BACKENDS:
+            raise ValueError(
+                'Unknown EnsembleROKS Z.B backend %r; expected one of %s.'
+                % (self.zb_backend, _ZB_BACKENDS)
             )
 
     def _build_intermediates(self) -> None:
@@ -714,6 +729,79 @@ class ReferenceGradients(lib.StreamObject):
             b[:, atom, :] = (2.0 * gap * packed.T)
         return b
 
+    def _contract_z_b(self, z):
+        '''Contract ``z_i B_i^(0,A)`` without materializing the full B tensor.
+
+        The charge response is self-adjoint on real Hermitian densities.  Move
+        it from every nuclear overlap density onto the single Z-derived probe,
+        then reduce the remaining overlap derivatives by AO centre.  Explicit
+        DF/XC/core skeleton terms are contracted before they are discarded.
+        '''
+        mol = self.mol
+        c0 = self._c0
+        space = self._space
+        z = cp.asarray(z, dtype=float)
+        if z.shape != (space.size,):
+            raise ValueError(
+                'Expected a Z vector of shape (%d,), got %s.'
+                % (space.size, z.shape)
+            )
+
+        f_occ = cp.asarray(space.f)
+        occ = np.where(space.f > 0.0)[0]
+        q_pos = _occupied_positions(space)
+        cocc = c0[:, occ]
+        weighted_z = 2.0 * cp.asarray(space.occupation_gap) * z
+
+        # W[p,q_occ] is the only part of B selected by the packed Z vector.
+        weight_occ = cp.zeros((space.f.size, occ.size), dtype=c0.dtype)
+        weight_occ[space.p, q_pos] = weighted_z
+
+        if getattr(self._charge_mf, 'with_df', None) is not None:
+            from gpu4pyscf.df.grad.ensemble_roks import (
+                fractional_rks_fock_skeleton,
+            )
+
+            skeleton = fractional_rks_fock_skeleton(
+                self._charge_mf, c0, f_occ,
+            )
+        else:
+            skeleton = _fractional_rks_fock_skeleton(
+                self._charge_mf, c0, f_occ,
+            )
+        correction = cp.einsum(
+            'pq,axpq->ax', weight_occ, skeleton, optimize=True,
+        )
+        del skeleton
+
+        # Contract W with the common-Fock response by adjointness:
+        # <Pz, R[dD(S^A)]> = <R[Pz], dD(S^A)>.
+        probe_ao = c0 @ weight_occ @ cocc.T
+        probe_ao = 0.5 * (probe_ao + probe_ao.T)
+        response_probe_mo = _transform_ao_to_mo(
+            c0, self._charge_response(probe_ao),
+        )
+        response_weight_mo = -0.5 * response_probe_mo * (
+            f_occ[:, None] + f_occ[None, :]
+        )
+
+        # The explicit overlap term is also linear in S^A.  Fold both MO
+        # contractions into one AO weight and use the vectorized AO-centre
+        # reduction instead of one full MO transform per atom.
+        weight_mo = cp.zeros_like(self._f0mo)
+        weight_mo[:, occ] = weight_occ
+        overlap_weight_mo = -0.5 * (
+            weight_mo @ self._f0mo.T + self._f0mo.T @ weight_mo
+        )
+        overlap_weight_ao = c0 @ (
+            response_weight_mo + overlap_weight_mo
+        ) @ c0.T
+        one_sided_s1 = cp.asarray(rhf_grad.get_ovlp(mol))
+        correction += cp.asarray(gpu_rhf_grad.contract_h1e_dm(
+            mol, one_sided_s1, overlap_weight_ao.T, hermi=0,
+        ))
+        return correction
+
     def get_ovlp(self, mol=None):
         '''Overlap-derivative helper used by the NTTDA gradient and NAC.'''
         return rhf_grad.get_ovlp(self.mol if mol is None else mol)
@@ -752,10 +840,15 @@ class ReferenceGradients(lib.StreamObject):
 
         self.z = self._solve_z()
         self.e_hs_unrelaxed = self._high_spin_unrelaxed_gradient()
-        self.b = self._build_b()
-        z_correction = cp.einsum(
-            'i,iax->ax', self.z, self.b, optimize=True,
-        )
+        if self.zb_backend == 'legacy':
+            self.b = self._build_b()
+            z_correction = cp.einsum(
+                'i,iax->ax', self.z, self.b, optimize=True,
+            )
+        else:
+            self.b = None
+            z_correction = self._contract_z_b(self.z)
+        self.z_b_correction = z_correction
         de = self.e_hs_unrelaxed - z_correction
 
         self.atmlst = atmlst
