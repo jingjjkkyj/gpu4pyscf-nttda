@@ -3,8 +3,13 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 
 import types
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 
+import cupy as cp
+import h5py
 import numpy as np
 from pyscf import gto
 
@@ -183,10 +188,186 @@ class KnownValues(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, 'only_dfj'):
             FSSH_NTTDA(td, states=[1, 2])
 
-    def test_restart_is_disabled_until_electronic_gauge_is_checkpointed(self):
-        driver = FSSH_NTTDA(FakeNTTDA(self.mol), states=[1, 2])
-        with self.assertRaisesRegex(NotImplementedError, 'electronic'):
-            driver.restore('unused.h5')
+    def test_checkpoint_restores_electronic_gauge_cache_and_rng(self):
+        from gpu4pyscf.dft import roks
+        from gpu4pyscf.sftda import NTTDA
+
+        mf = roks.ROKS(self.mol, xc='B3LYP')
+        mf.conv_tol = 1e-10
+        mf.mo_coeff = cp.eye(2)
+        mf.mo_occ = cp.asarray([2.0, 0.0])
+        mf.mo_energy = cp.asarray([-0.5, 0.2])
+        mf.e_tot = -1.0
+        mf.converged = True
+        mf.cycles = 4
+        td = NTTDA(mf)
+        td.nstates = 3
+        td.conv_tol = 1e-8
+        td.e = np.asarray([0.1, 0.2, 0.3])
+        td.xy = [(cp.ones((1, 1)) * value, 0) for value in (1, 2, 3)]
+        td.converged = np.ones(3, dtype=bool)
+        td._nttda_solver_stats = {'warm_start': True}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trajectory = Path(tmpdir) / 'trajectory.h5'
+            driver = FSSH_NTTDA(td, states=[1, 2])
+            driver.cur_state = 2
+            driver.filename = str(trajectory)
+            driver.save_force = True
+            driver._frame_cache._mol = self.mol.copy()
+            driver._frame_cache._signature = ('test-signature',)
+            driver._frame_cache._entries = {
+                ('grad', 2): (np.eye(2), np.eye(2) * 2),
+            }
+            position = self.mol.atom_coords()
+            velocity = np.arange(6, dtype=float).reshape(2, 3) * 1e-4
+            pes = PES(
+                energy=np.asarray([-0.9, -0.8]),
+                force=np.ones((2, 3)) * 0.01,
+                nacv=np.zeros((2, 2, 2, 3)),
+            )
+            coefficient = np.asarray([0.0, 1.0j])
+            np.random.seed(19)
+            driver.write_trajectory(
+                0, position, velocity, pes, coefficient, 2,
+            )
+            expected_random = np.random.random()
+            driver._finalize()
+
+            with h5py.File(trajectory, 'a') as handle:
+                handle.create_group('1')
+                handle['velocity'][:] = 0.0
+
+            mismatch = FSSH_NTTDA(
+                td, states=[1, 2], state_ordering='overlap',
+            )
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                mismatch.restore(trajectory)
+
+            restored = FSSH_NTTDA(td, states=[1, 2])
+            restored.restore(trajectory)
+            self.assertEqual(restored.cur_step, 0)
+            self.assertEqual(restored.cur_state, 2)
+            self.assertTrue(np.array_equal(restored.position, position))
+            self.assertTrue(np.array_equal(restored.velocity, velocity))
+            self.assertTrue(np.array_equal(
+                restored.coefficient, coefficient,
+            ))
+            self.assertEqual(np.random.random(), expected_random)
+            self.assertEqual(
+                set(restored._frame_cache._entries), {('grad', 2)}
+            )
+            self.assertTrue(np.array_equal(
+                restored._prev[1], cp.asnumpy(mf.mo_coeff),
+            ))
+            restored_pes = restored.evaluate_pes(
+                position, 2, with_nacv=False,
+            )
+            self.assertTrue(np.array_equal(restored_pes.energy, pes.energy))
+            self.assertIsNone(restored._restored_pes)
+            with h5py.File(trajectory) as handle:
+                self.assertEqual(
+                    sorted(int(key) for key in handle if key.isdigit()),
+                    [0],
+                )
+                self.assertTrue(np.array_equal(
+                    handle['0/velocity'], velocity,
+                ))
+                self.assertTrue(np.array_equal(
+                    handle['velocity'], velocity,
+                ))
+
+    def test_resumed_next_step_matches_continuous_trajectory(self):
+        from gpu4pyscf.dft import roks
+        from gpu4pyscf.sftda import NTTDA
+
+        mol = gto.M(
+            atom='N 0 0 0; O 0 0 1.20; H 0 0.90 -0.20',
+            basis='sto-3g',
+            spin=2,
+            unit='Bohr',
+            verbose=0,
+        )
+        mf = roks.ROKS(mol, xc='B3LYP').density_fit()
+        mf.conv_tol = 1e-11
+        mf.grids.level = 1
+        mf.verbose = 0
+        mf.kernel()
+        self.assertTrue(mf.converged)
+        td = NTTDA(mf)
+        td.nstates = 3
+        td.conv_tol = 1e-9
+        td.verbose = 0
+        td.kernel()
+        self.assertTrue(np.all(
+            cp.asnumpy(cp.asarray(td.converged)).astype(bool)
+        ))
+
+        velocity = np.asarray([
+            [0.0, 0.0, 5e-5],
+            [0.0, 0.0, -5e-5],
+            [0.0, 5e-5, 0.0],
+        ])
+
+        def new_driver(path, nsteps):
+            driver = FSSH_NTTDA(
+                td, states=[1, 2], cphf_conv_tol=1e-9,
+            )
+            driver.filename = str(path)
+            driver.nsteps = nsteps
+            driver.timestep_fs = 0.02
+            driver.seed = 23
+            driver.save_force = True
+            driver.verbose = 0
+            return driver
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            continuous_path = Path(tmpdir) / 'continuous.h5'
+            resumed_path = Path(tmpdir) / 'resumed.h5'
+            continuous = new_driver(continuous_path, 2)
+
+            def capture_first_step(env):
+                if env['step'] == 1:
+                    shutil.copyfile(continuous_path, resumed_path)
+                    shutil.copyfile(
+                        continuous._checkpoint_path(),
+                        Path(str(resumed_path) + '.checkpoint.pkl'),
+                    )
+
+            continuous.callback = capture_first_step
+            continuous.kernel(velocity=velocity.copy())
+            continuous_rng = np.random.random()
+
+            restored = new_driver(resumed_path, 2)
+            restored.restore(resumed_path)
+            restored.kernel()
+            resumed_rng = np.random.random()
+
+            with h5py.File(continuous_path) as left, \
+                    h5py.File(resumed_path) as right:
+                self.assertEqual(
+                    sorted(int(key) for key in right if key.isdigit()),
+                    [0, 1, 2],
+                )
+                for key, atol in (
+                        ('position', 1e-12), ('velocity', 1e-12),
+                        ('energy', 1e-11), ('coeffs', 1e-12),
+                        ('force', 5e-9), ('nacv', 5e-9)):
+                    np.testing.assert_allclose(
+                        left[f'2/{key}'], right[f'2/{key}'],
+                        atol=atol, rtol=0,
+                    )
+                self.assertEqual(
+                    int(left['2/cur_state'][()]),
+                    int(right['2/cur_state'][()]),
+                )
+            self.assertEqual(continuous_rng, resumed_rng)
+            self.assertEqual(
+                restored._last_td._nttda_frame_stats[
+                    'zvector_cache_hits'
+                ],
+                2,
+            )
 
     def test_loose_initial_solutions_are_not_reused(self):
         td = FakeNTTDA(self.mol)
