@@ -27,6 +27,42 @@ class FakeMF:
 
 
 class KnownValues(unittest.TestCase):
+    def test_synchronized_operator_profiler_summarizes_regions(self):
+        profiler = nttda._SynchronizedOperatorProfiler(True)
+        timestamps = iter((0.0, 1.0, 3.0, 4.0, 7.0, 8.0, 12.0, 15.0))
+        with mock.patch.object(profiler, '_synchronize'):
+            with mock.patch.object(
+                    nttda.time, 'perf_counter',
+                    side_effect=lambda: next(timestamps)):
+                profiler.begin(6)
+                self.assertEqual(
+                    profiler.measure('xc_response_seconds', lambda: 'xc'),
+                    'xc',
+                )
+                profiler.measure('df_exchange_seconds', lambda: None)
+                profiler.measure('df_coulomb_seconds', lambda: None)
+                profiler.end()
+
+        summary = profiler.summary()
+        self.assertTrue(summary['synchronized'])
+        self.assertEqual(summary['calls'][0]['width'], 6)
+        self.assertEqual(summary['totals']['xc_response_seconds'], 2.0)
+        self.assertEqual(summary['totals']['df_exchange_seconds'], 3.0)
+        self.assertEqual(summary['totals']['df_coulomb_seconds'], 4.0)
+        self.assertEqual(summary['totals']['other_seconds'], 6.0)
+        self.assertAlmostEqual(summary['fractions']['df_exchange'], 0.2)
+
+    def test_disabled_operator_profiler_has_no_sync_or_stats(self):
+        profiler = nttda._SynchronizedOperatorProfiler(False)
+        with mock.patch.object(profiler, '_synchronize') as synchronize:
+            profiler.begin(4)
+            self.assertEqual(
+                profiler.measure('xc_response_seconds', lambda: 7), 7,
+            )
+            profiler.end()
+        synchronize.assert_not_called()
+        self.assertIsNone(profiler.summary())
+
     def test_spin_lowered_reference_is_open_open_identity(self):
         reference = nttda._spin_lowered_reference_vector(
             nocc=3, nvir=3, nopen=2,
@@ -139,6 +175,7 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(stats['initial_subspace_width'], 6)
         self.assertEqual(stats['nroots'], 4)
         self.assertEqual(stats['final_residuals'], [1e-10] * 4)
+        self.assertIsNone(stats['operator_profile'])
 
     def test_kernel_warm_start_flag_and_width(self):
         """Warm-start records the flag and concatenates diagonal guesses."""

@@ -34,6 +34,7 @@ Project_Gpu4pyscf_Nttda repository.
 import numpy as np
 import cupy as cp
 import os
+import time
 
 from pyscf import lib
 from gpu4pyscf.lib import logger
@@ -46,6 +47,105 @@ from gpu4pyscf.tdscf._lr_eig import eigh as lr_eigh
 def _methods():
     from gpu4pyscf.grad.nttda_bridge import import_methods
     return import_methods()
+
+
+class _SynchronizedOperatorProfiler:
+    """Diagnostic wall timings for one Davidson operator application.
+
+    Synchronizing before and after each region captures work submitted on any
+    CUDA stream.  This deliberately perturbs execution and is enabled only by
+    ``NTTDA_OPERATOR_PROFILE=1``.
+    """
+
+    def __init__(self, enabled):
+        self.enabled = bool(enabled)
+        self.calls = []
+        self._current = None
+        self._started = None
+
+    @staticmethod
+    def _synchronize():
+        cp.cuda.Device().synchronize()
+
+    def begin(self, width):
+        if not self.enabled:
+            return
+        if self._current is not None:
+            raise RuntimeError('nested NTTDA operator profiling is unsupported')
+        self._synchronize()
+        self._started = time.perf_counter()
+        self._current = {
+            'width': int(width),
+            'xc_response_seconds': 0.0,
+            'df_exchange_seconds': 0.0,
+            'df_coulomb_seconds': 0.0,
+        }
+
+    def measure(self, name, operation):
+        if not self.enabled:
+            return operation()
+        if self._current is None or name not in self._current:
+            raise RuntimeError(f'invalid NTTDA operator profile region {name!r}')
+        self._synchronize()
+        started = time.perf_counter()
+        result = operation()
+        self._synchronize()
+        self._current[name] += time.perf_counter() - started
+        return result
+
+    def end(self):
+        if not self.enabled:
+            return
+        self._synchronize()
+        current = self._current
+        current['total_seconds'] = time.perf_counter() - self._started
+        measured = sum(
+            current[name] for name in (
+                'xc_response_seconds',
+                'df_exchange_seconds',
+                'df_coulomb_seconds',
+            )
+        )
+        current['other_seconds'] = max(0.0, current['total_seconds'] - measured)
+        self.calls.append(current)
+        self._current = None
+        self._started = None
+
+    def abort(self):
+        self._current = None
+        self._started = None
+
+    def summary(self):
+        if not self.enabled:
+            return None
+        totals = {
+            name: float(sum(call[name] for call in self.calls))
+            for name in (
+                'total_seconds',
+                'xc_response_seconds',
+                'df_exchange_seconds',
+                'df_coulomb_seconds',
+                'other_seconds',
+            )
+        }
+        total = totals['total_seconds']
+        return {
+            'enabled': True,
+            'synchronized': True,
+            'calls': [dict(call) for call in self.calls],
+            'totals': totals,
+            'fractions': {
+                name.removesuffix('_seconds'): (
+                    totals[name] / total if total else 0.0
+                )
+                for name in (
+                    'xc_response_seconds',
+                    'df_exchange_seconds',
+                    'df_coulomb_seconds',
+                    'other_seconds',
+                )
+            },
+        }
 
 
 def _get_j_range_separated(mf, dms, hermi, omega):
@@ -310,7 +410,8 @@ def nr_rks_fxc1_mo(mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref):
     return out
 
 
-def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True):
+def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True,
+                          operator_profiler=None):
     '''Response function for ``Sf = Si - 1`` (GPU).
 
     ``vref0`` applies the equal-spin spin-flip kernel (plus hybrid exchange),
@@ -329,6 +430,8 @@ def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True):
     hybrid = ni.libxc.is_hybrid_xc(mf.xc)
     xctype = ni._xc_type(mf.xc)
     spin = (mol.nelec[0] - mol.nelec[1]) * 0.5
+    if operator_profiler is None:
+        operator_profiler = _SynchronizedOperatorProfiler(False)
 
     if xctype != 'HF' and fxc_ref is None:
         fxc_ref = spin_flip_reference_fxc(mf)
@@ -344,17 +447,23 @@ def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True):
         dms1 = cp.concatenate((dms_co, dms_ov), axis=0)
 
         if xctype != 'HF':
-            vref0 = gpu_numint.nr_rks_fxc(
-                ni, mol, mf.grids, mf.xc, None, dms0, 0, hermi,
-                None, None, fxc_ref,
+            vref0 = operator_profiler.measure(
+                'xc_response_seconds',
+                lambda: gpu_numint.nr_rks_fxc(
+                    ni, mol, mf.grids, mf.xc, None, dms0, 0, hermi,
+                    None, None, fxc_ref,
+                ),
             )
             vref0 = cp.asarray(vref0)
             if skip_vref1:
                 vref1 = cp.zeros_like(dms1)
             elif xctype == 'LDA':
-                vref1 = cp.asarray(gpu_numint.nr_rks_fxc(
-                    ni, mol, mf.grids, mf.xc, None, dms1, 0, hermi,
-                    None, None, fxc_ref,
+                vref1 = cp.asarray(operator_profiler.measure(
+                    'xc_response_seconds',
+                    lambda: gpu_numint.nr_rks_fxc(
+                        ni, mol, mf.grids, mf.xc, None, dms1, 0, hermi,
+                        None, None, fxc_ref,
+                    ),
                 ))
             else:
                 raise NotImplementedError(
@@ -375,12 +484,22 @@ def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True):
                     ])
                 return mf.get_k(mol, dms0, hermi, omega=omega)
 
-            vk = exchange() * hyb
-            vj = mf.get_j(mol, dms1, hermi) * hyb
+            vk = operator_profiler.measure(
+                'df_exchange_seconds', exchange,
+            ) * hyb
+            vj = operator_profiler.measure(
+                'df_coulomb_seconds',
+                lambda: mf.get_j(mol, dms1, hermi),
+            ) * hyb
             if omega != 0:
-                vk += exchange(omega) * (alpha - hyb)
-                vj += _get_j_range_separated(
-                    mf, dms1, hermi, omega,
+                vk += operator_profiler.measure(
+                    'df_exchange_seconds', lambda: exchange(omega),
+                ) * (alpha - hyb)
+                vj += operator_profiler.measure(
+                    'df_coulomb_seconds',
+                    lambda: _get_j_range_separated(
+                        mf, dms1, hermi, omega,
+                    ),
                 ) * (alpha - hyb)
             vref0 -= cp.asarray(vk)
             vref1 -= cp.asarray(vj)
@@ -755,8 +874,13 @@ def gen_vind_sfd(td):
     fxc_ref = None
     if xctype != 'HF':
         fxc_ref = spin_flip_reference_fxc(mf)
+    operator_profiler = _SynchronizedOperatorProfiler(
+        os.environ.get('NTTDA_OPERATOR_PROFILE', '0') == '1',
+    )
+    td._nttda_operator_profiler = operator_profiler
     vresp, fockz = gen_rohf_response_sfd(
         mf, fxc_ref=fxc_ref, hermi=0, use_mo_grid_fxc1=use_mo_grid_fxc1,
+        operator_profiler=operator_profiler,
     )
 
     fock0 = _methods().get_method(td).fock0(mf, xp=cp)
@@ -799,6 +923,16 @@ def gen_vind_sfd(td):
 
     def vind(zs):
         zs = cp.asarray(zs).reshape(-1, nocc, nvir)
+        operator_profiler.begin(len(zs))
+        try:
+            result = _vind_profiled(zs)
+        except BaseException:
+            operator_profiler.abort()
+            raise
+        operator_profiler.end()
+        return result
+
+    def _vind_profiled(zs):
         zs_co = zs[:, core_rows, open_cols]
         zs_cv = zs[:, core_rows, virt_cols]
         zs_oo = zs[:, open_rows, open_cols]
@@ -836,8 +970,11 @@ def gen_vind_sfd(td):
                 ('co', 'ov', -1.0 / denom),
                 ('ov', 'ov', 1.0 / denom),
             )
-            vref1_mo = nr_rks_fxc1_mo(
-                mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref,
+            vref1_mo = operator_profiler.measure(
+                'xc_response_seconds',
+                lambda: nr_rks_fxc1_mo(
+                    mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref,
+                ),
             )
             v1mo_co += vref1_mo['co']
             v1mo_ov += vref1_mo['ov']
@@ -978,6 +1115,7 @@ class NTTDA(lib.StreamObject):
             self.nstates = nstates
         nroots = nstates + (self.deltaS == -1)
 
+        self._nttda_operator_profiler = None
         if self.deltaS == -1:
             vind_orig, hdiag = self.gen_vind_sfd()
         else:
@@ -1120,6 +1258,11 @@ class NTTDA(lib.StreamObject):
                 if davidson_iterations else None
             ),
             'converged': self.converged.tolist(),
+            'operator_profile': (
+                getattr(self, '_nttda_operator_profiler', None).summary()
+                if getattr(self, '_nttda_operator_profiler', None) is not None
+                else None
+            ),
         }
         log.timer('GPU NTTDA', *t0)
         _methods().record_solution(self)
