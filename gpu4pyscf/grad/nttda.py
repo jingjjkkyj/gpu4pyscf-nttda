@@ -100,6 +100,7 @@ def _make_gradients_class():
                 )
                 if selected_reference:
                     driver = self._gmf.nuc_grad_method()
+                    driver.nttda_xc_backend = self._context.xc_backend
                 elif self._context.method.reference_kind == 'ensemble_rks':
                     from gpu4pyscf.df.grad.rks import Gradients as DFGrad
                     driver = DFGrad(self._gmf)
@@ -118,6 +119,9 @@ def _make_gradients_class():
                 diagnostics.as_dict() if diagnostics is not None else None
             )
             self.reference_zb_backend = getattr(driver, 'zb_backend', None)
+            self.reference_zb_skeleton_stats = getattr(
+                driver, 'z_b_skeleton_stats', None,
+            )
             self.reference_gradient_calls = getattr(
                 self, 'reference_gradient_calls', 0,
             ) + 1
@@ -441,6 +445,9 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
                 ),
                 'z_solver': dict(
                     getattr(grad, 'reference_z_solver_diagnostics', None) or {},
+                ),
+                'z_b_skeleton': dict(
+                    getattr(grad, 'reference_zb_skeleton_stats', None) or {},
                 ),
             },
         }

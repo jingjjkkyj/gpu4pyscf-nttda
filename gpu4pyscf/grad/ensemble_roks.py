@@ -20,6 +20,7 @@ contraction, the Hessian action and the GMRES vectors stay on the device.
 from __future__ import annotations
 
 import os
+import time
 import warnings
 from dataclasses import dataclass
 
@@ -357,6 +358,7 @@ class ReferenceGradients(lib.StreamObject):
         'z_solver_diagnostics',
         'zb_backend',
         'z_b_correction',
+        'z_b_skeleton_stats',
     }
 
     def __init__(self, mf):
@@ -383,6 +385,7 @@ class ReferenceGradients(lib.StreamObject):
             'NTTDA_REFERENCE_ZB_BACKEND', 'contracted',
         ).strip().lower()
         self.z_b_correction = None
+        self.z_b_skeleton_stats = None
 
         self._space = None
         self._charge_mf = None
@@ -397,6 +400,10 @@ class ReferenceGradients(lib.StreamObject):
         self._w_hs_mo = None
         self._hcore = None
         self._veff_hs = None
+
+        # The frame driver supplies these shared backends.  Standalone
+        # reference-gradient calls construct equivalent local instances.
+        self.nttda_xc_backend = None
 
     def dump_flags(self, verbose=None):
         log = logger.new_logger(self, verbose)
@@ -757,22 +764,21 @@ class ReferenceGradients(lib.StreamObject):
         weight_occ = cp.zeros((space.f.size, occ.size), dtype=c0.dtype)
         weight_occ[space.p, q_pos] = weighted_z
 
-        if getattr(self._charge_mf, 'with_df', None) is not None:
-            from gpu4pyscf.df.grad.ensemble_roks import (
-                fractional_rks_fock_skeleton,
-            )
-
-            skeleton = fractional_rks_fock_skeleton(
-                self._charge_mf, c0, f_occ,
+        xctype = self._charge_mf._numint._xc_type(self._charge_mf.xc)
+        if (
+                getattr(self._charge_mf, 'with_df', None) is not None
+                and xctype in ('GGA', 'MGGA', 'HF')):
+            correction = self._contract_df_fock_skeleton(
+                weight_occ, cocc, f_occ,
             )
         else:
             skeleton = _fractional_rks_fock_skeleton(
                 self._charge_mf, c0, f_occ,
             )
-        correction = cp.einsum(
-            'pq,axpq->ax', weight_occ, skeleton, optimize=True,
-        )
-        del skeleton
+            correction = cp.einsum(
+                'pq,axpq->ax', weight_occ, skeleton, optimize=True,
+            )
+            del skeleton
 
         # Contract W with the common-Fock response by adjointness:
         # <Pz, R[dD(S^A)]> = <R[Pz], dD(S^A)>.
@@ -801,6 +807,91 @@ class ReferenceGradients(lib.StreamObject):
             mol, one_sided_s1, overlap_weight_ao.T, hermi=0,
         ))
         return correction
+
+    def _contract_df_fock_skeleton(self, weight_occ, cocc, f_occ):
+        """Contract the explicit DF/core/XC skeleton with one MO weight."""
+        from gpu4pyscf.grad.nttda_xc import GPUXCFrameBackend
+        from gpu4pyscf.df.hessian import rhf as gpu_df_rhf_hess
+        from gpu4pyscf.df.hessian import rks as gpu_df_rks_hess
+
+        mol = self.mol
+        c0 = self._c0
+        probe = c0 @ weight_occ @ cocc.T
+        probe = 0.5 * (probe + probe.T)
+        density = _ao_density(c0, f_occ)
+        probe_host = cp.asnumpy(probe)
+        density_host = cp.asnumpy(density)
+        spin_density = 0.5 * density_host
+        spin_probe = 0.5 * probe_host
+        atoms = tuple(range(mol.natm))
+        result = np.zeros((mol.natm, 3))
+        stats = {}
+        components = {}
+
+        cp.cuda.get_current_stream().synchronize()
+        started = time.perf_counter()
+        hcore = _hcore_derivative_generator(mol)
+        for atom in atoms:
+            result[atom] += np.einsum(
+                'pq,xpq->x', probe_host, hcore(atom), optimize=True,
+            )
+        components['core'] = result.copy()
+        stats['core_s'] = time.perf_counter() - started
+
+        ni = self._charge_mf._numint
+        omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(
+            self._charge_mf.xc, spin=mol.spin,
+        )
+        hessobj = gpu_df_rks_hess.Hessian(self._charge_mf)
+        started = time.perf_counter()
+        vj, vk = gpu_df_rhf_hess._get_jk_ip(
+            hessobj, c0, f_occ, with_j=True,
+            with_k=ni.libxc.is_hybrid_xc(self._charge_mf.xc),
+            contract_weight=weight_occ,
+        )
+        jk = vj
+        if ni.libxc.is_hybrid_xc(self._charge_mf.xc):
+            jk = jk - 0.5 * hybrid * vk
+        if abs(omega) > 1e-10 and abs(alpha - hybrid) > 1e-10:
+            _vj_lr, vk_lr = gpu_df_rhf_hess._get_jk_ip(
+                hessobj, c0, f_occ, with_j=False, with_k=True,
+                omega=omega, contract_weight=weight_occ,
+            )
+            jk = jk - 0.5 * (alpha - hybrid) * vk_lr
+        jk = cp.asnumpy(jk)
+        result += jk
+        components['df_jk'] = jk
+        cp.cuda.get_current_stream().synchronize()
+        stats['df_jk_s'] = time.perf_counter() - started
+
+        xctype = ni._xc_type(self._charge_mf.xc)
+        if xctype != 'HF':
+            if xctype not in ('GGA', 'MGGA'):
+                raise NotImplementedError(
+                    'Direct selected-reference XC skeleton does not support '
+                    f'{xctype}'
+                )
+            xc_backend = self.nttda_xc_backend
+            if xc_backend is None:
+                xc_backend = GPUXCFrameBackend(self._charge_mf, None)
+            started = time.perf_counter()
+            xc = xc_backend._contract_vxc_derivative(
+                spin_density, spin_density, spin_probe, spin_probe,
+                atmlst=atoms,
+            )
+            result += xc
+            components['xc'] = xc
+            cp.cuda.get_current_stream().synchronize()
+            stats['xc_s'] = time.perf_counter() - started
+        else:
+            stats['xc_s'] = 0.0
+        stats['backend'] = 'direct_df'
+        stats['total_s'] = (
+            stats['core_s'] + stats['df_jk_s'] + stats['xc_s']
+        )
+        self.z_b_skeleton_stats = stats
+        self._z_b_skeleton_components = components
+        return cp.asarray(result)
 
     def get_ovlp(self, mol=None):
         '''Overlap-derivative helper used by the NTTDA gradient and NAC.'''

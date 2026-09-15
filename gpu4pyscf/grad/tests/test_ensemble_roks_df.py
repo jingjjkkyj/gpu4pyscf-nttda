@@ -202,6 +202,59 @@ class EnsembleROKSDFGPU(unittest.TestCase):
             cp.asnumpy(result), cp.asnumpy(expected), atol=2e-8, rtol=0,
         )
 
+    def test_df_direct_skeleton_components(self):
+        from gpu4pyscf.df.hessian import rhf as df_rhf_hess
+        from gpu4pyscf.df.hessian import rks as df_rks_hess
+        from gpu4pyscf.grad import rhf as gpu_rhf_grad
+        from gpu4pyscf.hessian import rks as gpu_rks_hess
+
+        driver = self.gpu_driver
+        space = driver._space
+        z = cp.asarray(
+            np.random.default_rng(20260914).normal(size=space.size),
+        )
+        occupied = np.where(space.f > 0.0)[0]
+        positions = np.searchsorted(occupied, space.q)
+        weight = cp.zeros((space.f.size, len(occupied)))
+        weight[space.p, positions] = (
+            2.0 * cp.asarray(space.occupation_gap) * z
+        )
+        driver._contract_df_fock_skeleton(
+            weight, driver._c0[:, occupied], cp.asarray(space.f),
+        )
+        components = driver._z_b_skeleton_components
+
+        charge = driver._charge_mf
+        hessobj = df_rks_hess.Hessian(charge)
+        vj, vk = df_rhf_hess._get_jk_ip(
+            hessobj, driver._c0, cp.asarray(space.f),
+        )
+        _omega, _alpha, hybrid = charge._numint.rsh_and_hybrid_coeff(
+            charge.xc, spin=charge.mol.spin,
+        )
+        expected_jk = cp.einsum(
+            'pq,axpq->ax', weight, vj - 0.5 * hybrid * vk,
+        )
+        expected_core = cp.einsum(
+            'pq,axpq->ax', weight,
+            gpu_rhf_grad.get_grad_hcore(
+                charge.nuc_grad_method(), driver._c0, cp.asarray(space.f),
+            ),
+        )
+        expected_xc = cp.einsum(
+            'pq,axpq->ax', weight,
+            gpu_rks_hess._get_vxc_deriv1(
+                hessobj, driver._c0, cp.asarray(space.f), 2000,
+            ),
+        )
+        for name, expected in (
+                ('core', expected_core), ('df_jk', expected_jk),
+                ('xc', expected_xc)):
+            error = np.max(np.abs(
+                components[name] - cp.asnumpy(expected)
+            ))
+            self.assertLess(error, 1e-9)
+
 
 class EnsembleROKSDFDefaultAuxbasisGPU(unittest.TestCase):
     '''R2: ``density_fit()`` without an explicit auxbasis must stay DF.

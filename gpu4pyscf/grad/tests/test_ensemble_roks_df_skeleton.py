@@ -83,6 +83,33 @@ class EnsembleROKSDFSkeletonGPU(unittest.TestCase):
     def test_fractional_long_range_jk_nuclear_derivative(self):
         self.compare_jk(omega=0.3)
 
+    def compare_contracted_jk(self, omega=None):
+        mf = self.reference()
+        full = df_rhf_hess._get_jk_ip(
+            df_rhf_hess.Hessian(mf), mf.mo_coeff, mf.mo_occ,
+            omega=omega,
+        )
+        nocc = int(cp.count_nonzero(mf.mo_occ > 0))
+        weight = cp.asarray(np.random.default_rng(20260915).normal(
+            size=(mf.mo_coeff.shape[1], nocc),
+        ))
+        contracted = df_rhf_hess._get_jk_ip(
+            df_rhf_hess.Hessian(mf), mf.mo_coeff, mf.mo_occ,
+            omega=omega, contract_weight=weight,
+        )
+        for actual, matrix in zip(contracted, full):
+            expected = cp.einsum('pq,axpq->ax', weight, matrix)
+            np.testing.assert_allclose(
+                cp.asnumpy(actual), cp.asnumpy(expected),
+                atol=1e-10, rtol=0,
+            )
+
+    def test_fractional_jk_direct_contraction(self):
+        self.compare_contracted_jk()
+
+    def test_fractional_long_range_jk_direct_contraction(self):
+        self.compare_contracted_jk(omega=0.3)
+
     def test_fractional_fock_skeleton(self):
         mf = self.reference()
         coeff, occupied = mf.mo_coeff, mf.mo_coeff[:, mf.mo_occ > 0]
