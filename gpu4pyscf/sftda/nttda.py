@@ -37,7 +37,7 @@ import os
 
 from pyscf import lib
 from gpu4pyscf.lib import logger
-from gpu4pyscf.lib.cupy_helper import contract
+from gpu4pyscf.lib.cupy_helper import contract, tag_array
 from gpu4pyscf.dft import numint as gpu_numint
 from gpu4pyscf.scf import jk as jk_mod
 from gpu4pyscf.tdscf._lr_eig import eigh as lr_eigh
@@ -80,6 +80,22 @@ def _orbital_indices(mf):
     osidx = np.flatnonzero(mo_occ == 1)
     vsidx = np.flatnonzero(mo_occ == 0)
     return csidx, osidx, vsidx
+
+
+def _transition_density(amplitude, left, right, factorized=False):
+    """Directed R X.T L.T density with exact, shortest orbital factors."""
+    transformed = contract('xov,pv->xpo', amplitude, right)
+    density = contract('xpo,qo->xpq', transformed, left)
+    if not factorized or min(left.shape[1], right.shape[1]) == 0:
+        return density
+    if left.shape[1] <= right.shape[1]:
+        factor_l, factor_r = transformed, left
+    else:
+        factor_l = right
+        factor_r = contract('qo,xov->xqv', left, amplitude)
+    return tag_array(
+        density, factor_l=factor_l, factor_r=factor_r, symmetrize=0,
+    )
 
 
 def _sc_vector_slices(nclosed, nopen, nvirtual):
@@ -349,10 +365,20 @@ def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True):
             vref1 = cp.zeros_like(dms1)
 
         if hybrid:
-            vk = mf.get_k(mol, dms0, hermi) * hyb
+            blocks = (dms_co, dms_cv, dms_oo, dms_ov)
+
+            def exchange(omega=None):
+                # Concatenating the AO densities drops their factor metadata.
+                if hermi == 0 and all(hasattr(dm, 'factor_l') for dm in blocks):
+                    return cp.concatenate([
+                        mf.get_k(mol, dm, hermi, omega=omega) for dm in blocks
+                    ])
+                return mf.get_k(mol, dms0, hermi, omega=omega)
+
+            vk = exchange() * hyb
             vj = mf.get_j(mol, dms1, hermi) * hyb
             if omega != 0:
-                vk += mf.get_k(mol, dms0, hermi, omega=omega) * (alpha - hyb)
+                vk += exchange(omega) * (alpha - hyb)
                 vj += _get_j_range_separated(
                     mf, dms1, hermi, omega,
                 ) * (alpha - hyb)
@@ -518,6 +544,7 @@ def gen_vind_sc(td):
     the spin-adapted kernel part, leaving the Davidson solver unaware of the
     block decomposition.
     '''
+    td._nttda_df_exchange_backend = 'dense'
     mf = td._scf
     mo = cp.asarray(mf.mo_coeff)
     csidx, osidx, vsidx = _orbital_indices(mf)
@@ -688,8 +715,23 @@ def gen_vind_sc(td):
 
 
 def gen_vind_sfd(td):
+    from gpu4pyscf.df.df_jk import _DFHF
+
     mf = td._scf
     mo_coeff = cp.asarray(mf.mo_coeff)
+    exchange_backend = os.environ.get(
+        'NTTDA_DF_EXCHANGE_BACKEND', 'factorized',
+    ).strip().lower()
+    if exchange_backend not in ('dense', 'factorized'):
+        raise ValueError('NTTDA_DF_EXCHANGE_BACKEND must be dense or factorized')
+    factorized_exchange = (
+        exchange_backend == 'factorized'
+        and isinstance(mf, _DFHF) and bool(mf.with_df)
+        and not getattr(mf, 'only_dfj', False)
+        and mo_coeff.dtype.kind != 'c'
+        and mf._numint.libxc.is_hybrid_xc(mf.xc)
+    )
+    td._nttda_df_exchange_backend = 'factorized' if factorized_exchange else 'dense'
 
     csidx, osidx, vsidx = _orbital_indices(mf)
     orbcs = mo_coeff[:, csidx]
@@ -761,14 +803,11 @@ def gen_vind_sfd(td):
         zs_cv = zs[:, core_rows, virt_cols]
         zs_oo = zs[:, open_rows, open_cols]
         zs_ov = zs[:, open_rows, virt_cols]
-        dms_co = contract('xov,pv->xpo', zs_co, orbos)
-        dms_co = contract('xpo,qo->xpq', dms_co, orbcs)
-        dms_cv = contract('xov,pv->xpo', zs_cv, orbvs)
-        dms_cv = contract('xpo,qo->xpq', dms_cv, orbcs)
-        dms_oo = contract('xov,pv->xpo', zs_oo, orbos)
-        dms_oo = contract('xpo,qo->xpq', dms_oo, orbos)
-        dms_ov = contract('xov,pv->xpo', zs_ov, orbvs)
-        dms_ov = contract('xpo,qo->xpq', dms_ov, orbos)
+        use_factors = factorized_exchange and zs.dtype.kind != 'c'
+        dms_co = _transition_density(zs_co, orbcs, orbos, use_factors)
+        dms_cv = _transition_density(zs_cv, orbcs, orbvs, use_factors)
+        dms_oo = _transition_density(zs_oo, orbos, orbos, use_factors)
+        dms_ov = _transition_density(zs_ov, orbos, orbvs, use_factors)
         v1ao_co, v1ao_cv, v1ao_oo, v1ao_ov = vresp(
             dms_co, dms_cv, dms_oo, dms_ov,
         )
@@ -1068,6 +1107,7 @@ class NTTDA(lib.StreamObject):
         #   warm_start              — whether x0 was provided (cross-frame)
         #   final_residuals        — last-iteration residual norms (profile only)
         self._nttda_solver_stats = {
+            'df_exchange_backend': getattr(self, '_nttda_df_exchange_backend', 'dense'),
             'vind_calls': len(vind_widths),
             'vind_widths': vind_widths,
             'total_vector_applications': sum(vind_widths),

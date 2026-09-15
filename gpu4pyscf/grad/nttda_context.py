@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Per-evaluation GPU response ownership and cross-frame guess factory."""
+import os
 import numpy as np
 import cupy as cp
 from .nttda_bridge import _import_forge, _resolve_input, route_jk_to_gpu
@@ -59,6 +60,15 @@ def make_gpu_response_cache(cpu_td, gmf, xc_backend=_UNSET):
                 self.extra['fock0_fockz'] = (
                     xc_backend.spin_lowering_fock0_fockz()
                 )
+            if (self.method.reference_kind in ('ensemble_rks', 'ensemble_roks')
+                    and 'fock0_fockz' in self.extra
+                    and os.environ.get('NTTDA_ENSEMBLE_FOCK_CACHE', '1') != '0'):
+                # F0 is the ensemble common Fock, not the selected HS reference.
+                orbitals = np.asarray(tdobj._scf.mo_coeff)
+                self.extra['ensemble_fock_mo'] = (
+                    orbitals.conj().T @ self.extra['fock0_fockz'][0] @ orbitals
+                )
+                self.stats['ensemble_fock_cache_hits'] = 1
 
         def reference(self):
             reference = super().reference()

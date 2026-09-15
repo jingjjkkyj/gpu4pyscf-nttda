@@ -47,3 +47,28 @@ ROKS NoBeta MGGA still uses the CPU XC path. The GPU numerical tests require an
 accessible CUDA device, including the four-method matrix in
 `gpu4pyscf/grad/tests/test_nttda_methods.py`. A sandbox without device access is
 not evidence that the host CUDA installation is unavailable.
+
+## Exact operator optimizations
+
+`NTTDA_DF_EXCHANGE_BACKEND=factorized` (default) preserves exact orbital
+factors of the directed CO/CV/OO/OV transition densities for real,
+hybrid, density-fitted `deltaS=-1` calculations. It uses the existing DF
+factorized exchange implementation without SVD or rank truncation. Coulomb
+and XC responses keep the dense densities. Range-separated exchange retains
+its per-omega DF integrals. Non-DF, `only_dfj`, complex inputs and `deltaS=0`
+retain the dense exchange path. Set the variable to `dense` for an oracle A/B;
+unknown values are rejected by the `deltaS=-1` builder.
+
+`NTTDA_ENSEMBLE_FOCK_CACHE=1` (default) initializes the per-evaluation
+`ensemble_fock_mo` cache from the existing GPU common Fock for EnsembleRKS
+and EnsembleROKS. It does not substitute the selected high-spin reference
+Fock, change the Hessian action or combine independent Z-vector solves.
+Set it to `0` to retain the CPU Fock rebuild. If no GPU Fock is available,
+the original fallback remains. ROKS cache semantics are unchanged.
+
+The solver reports `df_exchange_backend`; response-cache statistics include
+`ensemble_fock_cache_hits` when the MO Fock is seeded. Use a new derivative
+evaluation after changing the electronic solution as required above.
+Tests in `grad/tests/test_nttda_operator_optimizations.py` cover random
+batch actions, hybrid/range-separated/non-DF paths, directed factors, Fock
+and Hessian parity, fallback and evaluation ownership.
