@@ -26,6 +26,11 @@ from gpu4pyscf.dft import numint as gpu_numint
 from gpu4pyscf.lib.cupy_helper import add_sparse
 from gpu4pyscf.grad import nttda_params
 from gpu4pyscf.grad.nttda_ao_reduce import contract_centers, fockz_weights, postz_weights
+from gpu4pyscf.grad.nttda_xc_fused import (
+    add_response_matrices,
+    assemble_response_weights,
+    contract_response_centers,
+)
 
 
 _SECOND_DERIVATIVE = {
@@ -703,6 +708,10 @@ class GPUXCFrameBackend:
             pair_stack = cp.stack([
                 density_map[label] for label in pair_labels
             ]) if pair_labels else cp.empty((0, self.nao, self.nao))
+            label_indices = {label: i for i, label in enumerate(labels)}
+            pair_indices = {
+                label: i for i, label in enumerate(pair_labels)
+            }
             contexts.append({
                 "labels": labels,
                 "blocks": blocks,
@@ -713,6 +722,24 @@ class GPUXCFrameBackend:
                 )),
                 "pair_labels": pair_labels,
                 "pair_stack": pair_stack,
+                "pair_output_indices": tuple(
+                    label_indices[label] for label in pair_labels
+                ),
+                "term_targets": cp.asarray([
+                    label_indices[term.target] for term in terms
+                ], dtype=np.int32),
+                "term_sources": cp.asarray([
+                    label_indices[term.source] for term in terms
+                ], dtype=np.int32),
+                "term_vref0": cp.asarray([
+                    term.vref0 for term in terms
+                ], dtype=np.float64),
+                "term_vref1": cp.asarray([
+                    term.vref1 for term in terms
+                ], dtype=np.float64),
+                "pair_lookup": cp.asarray([
+                    pair_indices.get(label, -1) for label in labels
+                ], dtype=np.int32),
                 "potentials": {
                     label: cp.zeros((self.nao, self.nao)) for label in labels
                 },
@@ -750,141 +777,51 @@ class GPUXCFrameBackend:
                 pair_values, pair_products, pair_products_t = (
                     _pair_feature_batches(ao, pair_densities)
                 )
-                pairs = dict(zip(ctx["pair_labels"], pair_values))
-                pair_potential = (
-                    _gga_pair_potential
-                    if self.xctype == "GGA" else _mgga_pair_potential
+                (
+                    ordinary_stack, special_stack,
+                    reference_alpha, reference_beta,
+                ) = assemble_response_weights(
+                    fref, kref_alpha, kref_beta,
+                    cp.stack([rho[label] for label in ctx["labels"]]),
+                    pair_values, grid_weights,
+                    ctx["term_targets"], ctx["term_sources"],
+                    ctx["pair_lookup"], ctx["term_vref0"],
+                    ctx["term_vref1"],
                 )
-                pair_kernel_cross = (
-                    _gga_pair_kernel_cross
-                    if self.xctype == "GGA" else _mgga_pair_kernel_cross
+                add_response_matrices(
+                    tuple(
+                        ctx["potentials"][label] for label in ctx["labels"]
+                    ),
+                    ctx["reference_alpha"], ctx["reference_beta"], ao,
+                    ordinary_stack, special_stack,
+                    reference_alpha, reference_beta,
+                    ctx["pair_output_indices"], indices,
                 )
-                feature_count = 4 if self.xctype == "GGA" else 5
-                pair_potentials = {
-                    label: pair_potential(fref, pairs[label])
-                    for label in ctx["pair_labels"]
-                }
-                ordinary = {
-                    label: cp.zeros((feature_count, len(grid_weights)))
-                    for label in ctx["labels"]
-                }
-                special = {
-                    label: cp.zeros((4, 4, len(grid_weights)))
-                    for label in ctx["pair_labels"]
-                }
-                reference_alpha = cp.zeros(
-                    (feature_count, len(grid_weights)),
+                fused_stats = self.stats.setdefault("response_fused", {})
+                fused_stats["weight_launches"] = (
+                    fused_stats.get("weight_launches", 0) + 1
                 )
-                reference_beta = cp.zeros_like(reference_alpha)
-
-                for term in ctx["terms"]:
-                    if term.vref0:
-                        ordinary[term.target] += term.vref0 * cp.einsum(
-                            "xyg,yg->xg", fref, rho[term.source],
-                        )
-                        ordinary[term.source] += term.vref0 * cp.einsum(
-                            "xyg,xg->yg", fref, rho[term.target],
-                        )
-                        pair = term.vref0 * cp.einsum(
-                            "xg,yg->xyg",
-                            rho[term.target], rho[term.source],
-                        )
-                        reference_alpha += cp.einsum(
-                            "xyg,xyzg->zg", pair, kref_alpha,
-                        )
-                        reference_beta += cp.einsum(
-                            "xyg,xyzg->zg", pair, kref_beta,
-                        )
-                    if term.vref1:
-                        special[term.target] += (
-                            term.vref1 * pair_potentials[term.source]
-                        )
-                        special[term.source] += (
-                            term.vref1 * pair_potentials[term.target]
-                        )
-                        pair = term.vref1 * pair_kernel_cross(
-                            pairs[term.target], pairs[term.source],
-                        )
-                        reference_alpha += cp.einsum(
-                            "xyg,xyzg->zg", pair, kref_alpha,
-                        )
-                        reference_beta += cp.einsum(
-                            "xyg,xyzg->zg", pair, kref_beta,
-                        )
-
-                ordinary_stack = cp.stack([
-                    ordinary[label] for label in ctx["labels"]
-                ])
-                special_stack = cp.stack([
-                    special[label] for label in ctx["pair_labels"]
-                ]) if ctx["pair_labels"] else cp.empty(
-                    (0, 4, 4, len(grid_weights)),
-                )
-                for label in ctx["labels"]:
-                    self._add_xc_matrix(
-                        ctx["potentials"][label], ao,
-                        ordinary[label] * grid_weights, indices,
-                    )
-                for label in ctx["pair_labels"]:
-                    self._add_pair_matrix(
-                        ctx["potentials"][label], ao,
-                        special[label] * grid_weights, indices,
-                    )
-                self._add_xc_matrix(
-                    ctx["reference_alpha"], ao,
-                    reference_alpha * grid_weights, indices,
-                )
-                self._add_xc_matrix(
-                    ctx["reference_beta"], ao,
-                    reference_beta * grid_weights, indices,
+                fused_stats["matrix_batches"] = (
+                    fused_stats.get("matrix_batches", 0) + 1
                 )
 
                 if not with_direct:
                     continue
                 direct_started = self._start_direct_timer()
-                if self.direct_backend == 'ao_reduce':
-                    weights = cp.concatenate((ordinary_stack,
-                                              reference_alpha[None],
-                                              reference_beta[None]))
-                    ctx["direct"] += self._reduce_centers(
-                        ao, indices, workspace, weights, atmlst,
-                        grid_weights=grid_weights,
-                        pair=(pair_products, pair_products_t, special_stack),
-                    )
-                    self._finish_direct_timer('response', direct_started)
-                    continue
-                for atom_index, atom in enumerate(atmlst):
-                    local = self._atom_indices(indices, atom)
-                    if len(local) == 0:
-                        continue
-                    for xyz in range(3):
-                        delta = _ao_center_derivative(ao, local, xyz)
-                        derivatives = workspace.derivatives(delta, local)
-                        channel_count = len(ctx["labels"])
-                        drho = derivatives[:channel_count]
-                        drho_alpha = derivatives[channel_count]
-                        drho_beta = derivatives[channel_count + 1]
-                        value = cp.einsum(
-                            "nfg,nfg,g->",
-                            ordinary_stack, drho, grid_weights,
-                        )
-                        value += cp.einsum(
-                            "fg,fg,g->",
-                            reference_alpha, drho_alpha, grid_weights,
-                        )
-                        value += cp.einsum(
-                            "fg,fg,g->",
-                            reference_beta, drho_beta, grid_weights,
-                        )
-                        value += _contract_pair_feature_derivatives(
-                            delta,
-                            pair_products,
-                            pair_products_t,
-                            local,
-                            special_stack,
-                            grid_weights,
-                        )
-                        ctx["direct"][atom_index, xyz] += value
+                weights = cp.concatenate((
+                    ordinary_stack,
+                    reference_alpha[None],
+                    reference_beta[None],
+                ))
+                ctx["direct"] += contract_response_centers(
+                    ao, workspace.contracted,
+                    workspace.contracted_transpose, weights,
+                    pair_products, pair_products_t, special_stack,
+                    self.sorted_atom[indices], atmlst,
+                )
+                fused_stats["direct_launches"] = (
+                    fused_stats.get("direct_launches", 0) + 1
+                )
                 self._finish_direct_timer('response', direct_started)
 
         forge_xc = _forge_xc()
