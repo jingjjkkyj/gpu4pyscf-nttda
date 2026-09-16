@@ -370,8 +370,13 @@ def _jk_energies_per_atom(int3c2e_opt, dm_pairs, j_factor=None, k_factor=None,
         return grouped
 
     mol = int3c2e_opt.mol
-    dm_factors = [_factorize_multiple_dm(mol, dm1_dm2, hermi=0)
-                  for dm1_dm2 in dm_pairs]
+    factor_cache = {}
+    dm_factors = [
+        _factorize_multiple_dm(
+            mol, dm1_dm2, hermi=0, factor_cache=factor_cache,
+        )
+        for dm1_dm2 in dm_pairs
+    ]
 
     splits = [0, n_dm]
     if n_dm > 2:
@@ -461,6 +466,20 @@ def _rank_batched_compressed_plan(dm_factors, k_factor):
         'legacy': (start_2x2 + len(rank_2x2), len(permutation)),
     }
     return permutation, ranges
+
+
+def _factor_contraction_groups(factors):
+    """Group exact CuPy factor views for shared three-center contractions."""
+    groups = {}
+    for index, factor in enumerate(factors):
+        key = (
+            int(factor.data.ptr),
+            factor.shape,
+            factor.strides,
+            factor.dtype.str,
+        )
+        groups.setdefault(key, []).append(index)
+    return tuple(tuple(indices) for indices in groups.values())
 
 
 def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
@@ -573,12 +592,21 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     dm1_factor_l, dm1_factor_r, dm2_factor_l, dm2_factor_r = zip(*dm_factors)
     dm1_noccs = [x.shape[1] for x in dm1_factor_l]
     dm2_noccs = [x.shape[1] for x in dm2_factor_l]
+    dm2_right_groups = _factor_contraction_groups(dm2_factor_r)
+    dm1_right_groups = _factor_contraction_groups(dm1_factor_r)
     nao = mol.nao
     nocc_max = max(max(dm1_noccs), max(dm2_noccs))
     _layer_t['dm1_noccs'] = list(dm1_noccs)
     _layer_t['dm2_noccs'] = list(dm2_noccs)
     _layer_t['dm1_ranks'] = [x.shape[-1] for x in dm1_factor_l]
     _layer_t['dm2_ranks'] = [x.shape[-1] for x in dm2_factor_l]
+    _layer_t['contract_first_raw'] = 2 * n_dm
+    _layer_t['contract_first_unique'] = (
+        len(dm2_right_groups) + len(dm1_right_groups)
+    )
+    _layer_t['contract_first_reused'] = (
+        2 * n_dm - _layer_t['contract_first_unique']
+    )
     log.debug1('nao=%d dm1_noccs=%s dm2_noccs=%s', nao, dm1_noccs, dm2_noccs)
 
     pair_addresses = int3c2e_opt.pair_and_diag_indices(
@@ -634,14 +662,22 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             aux0, aux1 = aux1, aux1 + dk
             j3c = j3c_full[:,:,:dk]
             j3c[j_addr,i_addr] = j3c[i_addr,j_addr] = compressed[:,k0:k1]
-            for i, nocc in enumerate(dm2_noccs):
+            for group in dm2_right_groups:
+                first = group[0]
+                nocc = dm2_noccs[first]
                 tmp = ndarray((nocc, nao, dk), buffer=buf1)
-                contract('pqr,pi->iqr', j3c, dm2_factor_r[i], out=tmp)
-                contract('iqr,qj->rij', tmp, dm1_factor_l[i], out=j3c_o2o1[i][aux0:aux1])
-            for i, nocc in enumerate(dm1_noccs):
+                contract('pqr,pi->iqr', j3c, dm2_factor_r[first], out=tmp)
+                for i in group:
+                    contract('iqr,qj->rij', tmp, dm1_factor_l[i],
+                             out=j3c_o2o1[i][aux0:aux1])
+            for group in dm1_right_groups:
+                first = group[0]
+                nocc = dm1_noccs[first]
                 tmp = ndarray((nocc, nao, dk), buffer=buf1)
-                contract('pqr,pi->iqr', j3c, dm1_factor_r[i], out=tmp)
-                contract('iqr,qj->rij', tmp, dm2_factor_l[i], out=j3c_o1o2[i][aux0:aux1])
+                contract('pqr,pi->iqr', j3c, dm1_factor_r[first], out=tmp)
+                for i in group:
+                    contract('iqr,qj->rij', tmp, dm2_factor_l[i],
+                             out=j3c_o1o2[i][aux0:aux1])
             if j_factor is not None:
                 auxvec1[:,aux0:aux1] = cp.einsum('pqr,nqp->nr', j3c, dm1)
                 auxvec2[:,aux0:aux1] = cp.einsum('pqr,nqp->nr', j3c, dm2)
@@ -1148,18 +1184,30 @@ def _j_energies_per_atom(int3c2e_opt, dm_pairs, j_factor,
     t0 = log.timer_debug1('contract int2c2e_ip1', *t0)
     return ej
 
-def _factorize_multiple_dm(mol, dm_pair, hermi):
+def _factorize_multiple_dm(mol, dm_pair, hermi, factor_cache=None):
+    def factorize(dm):
+        if factor_cache is None:
+            return _factorize_dm(mol, dm, hermi)
+        key = id(dm)
+        cached = factor_cache.get(key)
+        if cached is not None and cached[0] is dm:
+            return cached[1]
+        result = _factorize_dm(mol, dm, hermi)
+        factor_cache[key] = (dm, result)
+        return result
+
     dm1_factor_r = dm2_factor_r = None
     if isinstance(dm_pair, cp.ndarray):
-        res = _factorize_dm(mol, dm_pair, hermi)
         if dm_pair.ndim == 2: # dm pair employs two identical density matrices
+            res = factorize(dm_pair)
             dm1_factor_l, dm1_factor_r = dm2_factor_l, dm2_factor_r = res
         else:
+            res = _factorize_dm(mol, dm_pair, hermi)
             dm1_factor_l, dm2_factor_l = res[0]
             dm1_factor_r, dm2_factor_r = res[1]
     else:
-        dm1_factor_l, dm1_factor_r = _factorize_dm(mol, dm_pair[0], hermi)
-        dm2_factor_l, dm2_factor_r = _factorize_dm(mol, dm_pair[1], hermi)
+        dm1_factor_l, dm1_factor_r = factorize(dm_pair[0])
+        dm2_factor_l, dm2_factor_r = factorize(dm_pair[1])
     return dm1_factor_l, dm1_factor_r, dm2_factor_l, dm2_factor_r
 
 class Gradients(tdrhf_grad.Gradients):

@@ -23,10 +23,13 @@ from gpu4pyscf.lib.cupy_helper import contract
 from gpu4pyscf.df import int3c2e_bdiv as int3c2e
 from gpu4pyscf.df.grad import tdrhf as df_tdrhf_grad
 from gpu4pyscf.df.grad.tdrhf import (
+    _factor_contraction_groups,
+    _factorize_multiple_dm,
     _jk_energy_per_atom,
     _jk_energies_per_atom,
     _jk_energies_by_dm_factors,
 )
+from gpu4pyscf.df.df_jk import _make_factorized_dm
 from gpu4pyscf.df.grad import rhf as rhf_grad
 
 atom = """
@@ -447,6 +450,73 @@ class KnownValues(unittest.TestCase):
         assert slot_stats[0]['output_backend'] == 'slot_aware'
         assert slot_stats[0]['input_dm'] == 9
         assert slot_stats[0]['kernel_dm'] == 3
+
+    def test_shared_factor_contractions(self):
+        cp.random.seed(19)
+        opt = int3c2e.Int3c2eOpt(mol, auxmol).build()
+        nao = opt.mol.nao
+        shared_dm1_right = cp.random.rand(nao, 2) - .5
+        shared_dm2_right = cp.random.rand(nao, 2) - .5
+        dm_factors = [
+            (
+                cp.random.rand(nao, 2) - .5,
+                shared_dm1_right,
+                cp.random.rand(nao, 2) - .5,
+                shared_dm2_right,
+            )
+            for _ in range(3)
+        ]
+        copied_factors = [
+            tuple(factor.copy() for factor in factors)
+            for factors in dm_factors
+        ]
+        stats = []
+        result = _jk_energies_by_dm_factors(
+            opt, dm_factors, [0.5, -0.25, 0.75], [1.0, -0.5, 0.25],
+            sum_results=False, verbose=None, stats_sink=stats,
+        )
+        reference = _jk_energies_by_dm_factors(
+            opt, copied_factors, [0.5, -0.25, 0.75], [1.0, -0.5, 0.25],
+            sum_results=False, verbose=None,
+        )
+
+        assert _factor_contraction_groups(
+            [shared_dm1_right, shared_dm1_right, shared_dm2_right]
+        ) == ((0, 1), (2,))
+        assert stats[0]['contract_first_raw'] == 6
+        assert stats[0]['contract_first_unique'] == 2
+        assert stats[0]['contract_first_reused'] == 4
+        assert abs(result - reference).max() < 3e-10
+
+    def test_multiple_dm_factorization_cache(self):
+        cp.random.seed(20)
+        class Transform:
+            calls = 0
+
+            def apply_C_dot(self, factor, axis):
+                del axis
+                self.calls += 1
+                return factor.copy()
+
+        transform = Transform()
+        nao = mol.nao
+        first = _make_factorized_dm(
+            cp.random.rand(nao, 2), cp.random.rand(nao, 2), symmetrize=0,
+        )
+        second = _make_factorized_dm(
+            cp.random.rand(nao, 3), cp.random.rand(nao, 3), symmetrize=0,
+        )
+        cache = {}
+        factors_a = _factorize_multiple_dm(
+            transform, (first, second), hermi=0, factor_cache=cache,
+        )
+        factors_b = _factorize_multiple_dm(
+            transform, (first, second), hermi=0, factor_cache=cache,
+        )
+
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(transform.calls, 4)
+        self.assertTrue(all(a is b for a, b in zip(factors_a, factors_b)))
 
     def test_j_energy_per_atom_dm_pairs(self):
         cp.random.seed(8)
