@@ -87,7 +87,6 @@ def make_gpu_response_cache(cpu_td, gmf, xc_backend=_UNSET):
                     self.stats['response_builds'] += 1
 
                     def counted_ensemble_response(density):
-                        density = np.asarray(density)
                         width = (
                             1 if density.ndim == 2
                             else int(np.prod(density.shape[:-2]))
@@ -95,7 +94,10 @@ def make_gpu_response_cache(cpu_td, gmf, xc_backend=_UNSET):
                         self.stats['response_calls'] += 1
                         self.stats['response_rhs'] += width
                         self.stats['response_batch_widths'].append(width)
-                        return cp.asnumpy(gpu_response(cp.asarray(density)))
+                        # cp.asarray strips CPArrayWithTag factor metadata.
+                        if not isinstance(density, cp.ndarray):
+                            density = cp.asarray(density)
+                        return cp.asnumpy(gpu_response(density))
 
                     self._responses[hermi] = counted_ensemble_response
                 return self._responses[hermi]
@@ -120,6 +122,24 @@ def make_gpu_response_cache(cpu_td, gmf, xc_backend=_UNSET):
 
                 self._responses[hermi] = counted_response
             return self._responses[hermi]
+
+        def orbital_response(self, orbitals, occupation):
+            """Make a solve-local exact density builder for the ensemble Z."""
+            from ._response_density import OrbitalRotationDensity
+            density = OrbitalRotationDensity(orbitals, occupation)
+            response = self.response(1)
+
+            def apply(rotation):
+                return response(density(rotation))
+
+            def clear():
+                self.stats['z_df_cache_hits'] = density.cache.hits
+                self.stats['z_df_cache_misses'] = density.cache.misses
+                self.stats['z_df_cache_peak_bytes'] = density.cache.peak_bytes
+                density.clear()
+
+            apply.clear = clear
+            return apply
 
         def fxc_ref(self):
             if xc_backend is not None:

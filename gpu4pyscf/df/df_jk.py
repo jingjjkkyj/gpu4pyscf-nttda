@@ -435,6 +435,11 @@ def _jk_via_decomposed_dm(dfobj, dms, hermi=0, with_j=True, with_k=True, device_
         symmetrize = getattr(dms, 'symmetrize', 0)
         dm_factor_l = dms.factor_l
         dm_factor_r = dms.factor_r
+        fixed_cache = getattr(dms, '_df_factor_cache', None)
+        if (fixed_cache is not None
+                and (dm_factor_r is not fixed_cache.factor
+                     or dm_factor_r.ndim != 2 or dm_factor_l.ndim != 3)):
+            fixed_cache = None
         dm_factor_l = cp.asarray(dm_factor_l, order='A')
         dm_factor_l = intopt.sort_orbitals(dm_factor_l, axis=[dm_factor_l.ndim-2])
         if dm_factor_r is None:
@@ -470,6 +475,7 @@ def _jk_via_decomposed_dm(dfobj, dms, hermi=0, with_j=True, with_k=True, device_
         buf1 = cp.empty((nao, nao))
         buf2 = cp.empty((blksize, nocc, nao))
         buf3 = cp.empty((blksize, nocc, nao))
+        aux_start = 0
         for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
             if with_j:
                 rhoj = dm_sparse.dot(cderi_sparse)
@@ -493,12 +499,20 @@ def _jk_via_decomposed_dm(dfobj, dms, hermi=0, with_j=True, with_k=True, device_
                         vk[i] += cupy.dot(rhok.reshape([-1,nao]).T,
                                           rhok1.reshape([-1,nao]), out=buf1)
                 else:
-                    contract('Lij,jk->Lki', cderi, dm_factor_r, out=rhok1)
+                    cached = None if fixed_cache is None else fixed_cache.get(
+                        dfobj, device_id, aux_start, nL)
+                    if cached is None:
+                        contract('Lij,jk->Lki', cderi, dm_factor_r, out=rhok1)
+                        if fixed_cache is not None:
+                            fixed_cache.put(dfobj, device_id, aux_start, rhok1)
+                    else:
+                        rhok1 = cached
                     for i in range(n_dm):
                         contract('Lij,jk->Lki', cderi, dm_factor_l[i], out=rhok)
                         vk[i] += cupy.dot(rhok.reshape([-1,nao]).T,
                                           rhok1.reshape([-1,nao]), out=buf1)
                 rhok1 = rhok = None
+                aux_start += nL
             cderi = None
 
         if with_j:
@@ -628,6 +642,8 @@ def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-
                 futures.append(future)
 
     elif hasattr(dms_tag, 'factor_l'):
+        # Factor metadata may have just been produced on a non-default stream.
+        cupy.cuda.get_current_stream().synchronize()
         futures = []
         with ThreadPoolExecutor(max_workers=num_devices) as executor:
             for device_id in range(num_devices):

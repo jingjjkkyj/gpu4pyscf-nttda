@@ -118,6 +118,7 @@ def _make_gradients_class():
             self.reference_z_solver_diagnostics = (
                 diagnostics.as_dict() if diagnostics is not None else None
             )
+            self.reference_z_df_cache_stats = getattr(driver, 'z_df_cache_stats', None)
             self.reference_zb_backend = getattr(driver, 'zb_backend', None)
             self.reference_zb_skeleton_stats = getattr(
                 driver, 'z_b_skeleton_stats', None,
@@ -445,6 +446,9 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
                 ),
                 'z_solver': dict(
                     getattr(grad, 'reference_z_solver_diagnostics', None) or {},
+                ),
+                'z_df_cache': dict(
+                    getattr(grad, 'reference_z_df_cache_stats', None) or {},
                 ),
                 'z_b_skeleton': dict(
                     getattr(grad, 'reference_zb_skeleton_stats', None) or {},

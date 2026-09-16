@@ -535,6 +535,8 @@ class ReferenceGradients(lib.StreamObject):
         self._charge_mf = charge_mf
         self._hs_mf = hs_mf
         self._charge_response = charge_response
+        from ._response_density import OrbitalRotationDensity
+        self._rotation_density = OrbitalRotationDensity(c0, f_occ)
         self._c0 = c0
         self._f0ao = f0ao
         self._f0mo = f0mo
@@ -562,9 +564,7 @@ class ReferenceGradients(lib.StreamObject):
 
         space = self._space
         kappa = space.unpack(cp.asarray(vector, dtype=float))
-        f_occ = cp.asarray(space.f)
-        delta_dm_mo = kappa * f_occ[None, :] - f_occ[:, None] * kappa
-        delta_dm_ao = self._c0 @ delta_dm_mo @ self._c0.T
+        delta_dm_ao = self._rotation_density(kappa)
         delta_f_ao = self._charge_response(delta_dm_ao)
         delta_f_mo = _transform_ao_to_mo(self._c0, delta_f_ao)
         moving_mo = self._f0mo @ kappa - kappa @ self._f0mo
@@ -574,6 +574,16 @@ class ReferenceGradients(lib.StreamObject):
         return cp.asarray(result).real
 
     def _solve_z(self):
+        try:
+            return self._solve_z_impl()
+        finally:
+            cache = self._rotation_density.cache
+            self.z_df_cache_stats = dict(
+                hits=cache.hits, misses=cache.misses, peak_bytes=cache.peak_bytes,
+            )
+            self._rotation_density.clear()
+
+    def _solve_z_impl(self):
         space = self._space
         if space.size == 0:
             self.z_solver_diagnostics = GMRESDiagnostics(
