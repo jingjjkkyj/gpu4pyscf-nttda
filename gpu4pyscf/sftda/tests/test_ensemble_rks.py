@@ -1,6 +1,7 @@
 # Copyright 2021-2026 The PySCF Developers. All Rights Reserved.
 
 import unittest
+from unittest import mock
 
 import cupy as cp
 import numpy as np
@@ -10,6 +11,7 @@ from pyscf.sftda import EnsembleRKS as CPUEnsembleRKS
 from pyscf.sftda.nttda import NTTDA as CPUNTTDA
 
 from gpu4pyscf.sftda import EnsembleRKS, NTTDA
+from gpu4pyscf.grad import nttda as nttda_driver
 from gpu4pyscf.grad.nttda import compute_frame, make_frame_cache
 
 
@@ -132,23 +134,27 @@ class EnsembleRKSGPU(unittest.TestCase):
         ).run()
         cache = make_frame_cache()
 
-        first = compute_frame(
-            tdobj,
-            active_state=1,
-            nac_pairs=((1, 2),),
-            cphf_conv_tol=1e-10,
-            use_etfs=False,
-            frame_cache=cache,
-        )
+        with mock.patch.dict(
+                nttda_driver._NTTDA_PARAMS, {"finish_profile": True}):
+            first = compute_frame(
+                tdobj,
+                active_state=1,
+                nac_pairs=((1, 2),),
+                cphf_conv_tol=1e-10,
+                use_etfs=False,
+                frame_cache=cache,
+            )
         first_stats = dict(tdobj._nttda_frame_stats)
-        second = compute_frame(
-            tdobj,
-            active_state=1,
-            nac_pairs=((1, 2),),
-            cphf_conv_tol=1e-10,
-            use_etfs=False,
-            frame_cache=cache,
-        )
+        with mock.patch.dict(
+                nttda_driver._NTTDA_PARAMS, {"finish_profile": True}):
+            second = compute_frame(
+                tdobj,
+                active_state=1,
+                nac_pairs=((1, 2),),
+                cphf_conv_tol=1e-10,
+                use_etfs=False,
+                frame_cache=cache,
+            )
         second_stats = dict(tdobj._nttda_frame_stats)
 
         np.testing.assert_allclose(
@@ -163,6 +169,22 @@ class EnsembleRKSGPU(unittest.TestCase):
         self.assertEqual(second_stats["zvector_cache_hits"], 2)
         self.assertIn(
             2, second_stats["response_cache"]["response_batch_widths"],
+        )
+        finish_timings = second_stats["finish_prepared_timings"]
+        self.assertGreater(finish_timings["total"], 0.0)
+        self.assertAlmostEqual(
+            finish_timings["accounted"],
+            sum(finish_timings[name] for name in (
+                "setup",
+                "zvector_solve",
+                "zvector_data",
+                "post_z_prepare",
+                "df_derivative_ledger",
+                "post_z_hcore",
+                "post_z_xc",
+                "post_z_accumulate",
+                "final_assembly",
+            )),
         )
 
     def test_hybrid_and_mgga_derivatives_match_cpu(self):

@@ -155,6 +155,9 @@ def _load_params():
         'xc_direct_profile': _get_str(
             'NTTDA_XC_DIRECT_PROFILE', '0', ('0', '1'),
         ) == '1',
+        'finish_profile': _get_str(
+            'NTTDA_FINISH_PROFILE', '0', ('0', '1'),
+        ) == '1',
         'unvalidated_on_A100': UNVALIDATED_ON_A100,
     }
 

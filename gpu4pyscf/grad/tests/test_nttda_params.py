@@ -25,6 +25,7 @@ class KnownValues(unittest.TestCase):
         self.assertIsNone(PARAMS['cphf_max_cycle'])
         self.assertEqual(PARAMS['davidson_max_subspace'], 12)
         self.assertEqual(PARAMS['contract_backend'], 'cupy')
+        self.assertFalse(PARAMS['finish_profile'])
 
     def test_a100_unvalidated_flag(self):
         """A100 paths must be marked unvalidated until a sweep is done."""
@@ -42,6 +43,7 @@ class KnownValues(unittest.TestCase):
             'NTTDA_DAVIDSON_MAX_SUBSPACE': '20',
             'NTTDA_CONTRACT_BACKEND': 'cutensor',
             'NTTDA_CPHF_MAX_CYCLE': '50',
+            'NTTDA_FINISH_PROFILE': '1',
         }
         with mock.patch.dict(os.environ, env, clear=False):
             new_params = reload_params()
@@ -53,6 +55,7 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(new_params['davidson_max_subspace'], 20)
         self.assertEqual(new_params['contract_backend'], 'cutensor')
         self.assertEqual(new_params['cphf_max_cycle'], 50)
+        self.assertTrue(new_params['finish_profile'])
         # Restore defaults for subsequent tests
         reload_params()
 

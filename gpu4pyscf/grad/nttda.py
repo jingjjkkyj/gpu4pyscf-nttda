@@ -363,9 +363,17 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
         initial, cache_hits = frame_cache.project(
             grad.base, pairs, task_keys,
         )
+    finish_profile = _NTTDA_PARAMS['finish_profile']
+    finish_profile_timings = {} if finish_profile else None
     finish_started = time.perf_counter()
     components = forge_response.finish_prepared_gradients(
-        prepared, initial=initial,
+        prepared,
+        initial=initial,
+        timings=finish_profile_timings,
+        synchronize=(
+            cp.cuda.get_current_stream().synchronize
+            if finish_profile else None
+        ),
     )
     finish_seconds = time.perf_counter() - finish_started
     grad.nttda_details = components[0]
@@ -436,6 +444,9 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
             'response_jk': dict(getattr(
                 cache.reference(), '_nttda_jk_route_stats', {},
             )),
+            'finish_prepared_timings': dict(
+                finish_profile_timings or {},
+            ),
             'reference_gradient': {
                 'calls': int(getattr(grad, 'reference_gradient_calls', 0)),
                 'semantics': getattr(
