@@ -64,7 +64,8 @@ class EnsembleROKSDFSkeletonGPU(unittest.TestCase):
 
     def compare_jk(self, closed_shell=False, omega=None):
         mf = self.reference(closed_shell)
-        numerical = self.numerical_jk(mf, omega)
+        step = 2e-4 if omega is not None else 1e-4
+        numerical = self.numerical_jk(mf, omega, step=step)
         analytic = df_rhf_hess._get_jk_ip(
             df_rhf_hess.Hessian(mf), mf.mo_coeff, mf.mo_occ, omega=omega,
         )
@@ -83,32 +84,53 @@ class EnsembleROKSDFSkeletonGPU(unittest.TestCase):
     def test_fractional_long_range_jk_nuclear_derivative(self):
         self.compare_jk(omega=0.3)
 
-    def compare_contracted_jk(self, omega=None):
+    def compare_ledger_jk(self, omega=None):
+        from pyscf.grad.nttda.derivative_jk import _JKDerivativeLedger
+        from gpu4pyscf.grad.nttda_ledger import DFLedgerBackend
+
         mf = self.reference()
-        full = df_rhf_hess._get_jk_ip(
-            df_rhf_hess.Hessian(mf), mf.mo_coeff, mf.mo_occ,
-            omega=omega,
-        )
-        nocc = int(cp.count_nonzero(mf.mo_occ > 0))
+        coeff, occ = mf.mo_coeff, mf.mo_occ
+        cocc = coeff[:, occ > 0]
+        nocc = cocc.shape[1]
         weight = cp.asarray(np.random.default_rng(20260915).normal(
-            size=(mf.mo_coeff.shape[1], nocc),
+            size=(coeff.shape[1], nocc),
         ))
-        contracted = df_rhf_hess._get_jk_ip(
-            df_rhf_hess.Hessian(mf), mf.mo_coeff, mf.mo_occ,
-            omega=omega, contract_weight=weight,
+        probe = coeff @ weight @ cocc.T
+        probe = 0.5 * (probe + probe.T)
+        probe_host = cp.asnumpy(probe)
+        spin_density = 0.5 * cp.asnumpy((coeff * occ) @ coeff.T)
+        atoms = tuple(range(mf.mol.natm))
+
+        vj, vk = df_rhf_hess._get_jk_ip(
+            df_rhf_hess.Hessian(mf), coeff, occ, omega=omega,
         )
-        for actual, matrix in zip(contracted, full):
-            expected = cp.einsum('pq,axpq->ax', weight, matrix)
-            np.testing.assert_allclose(
-                cp.asnumpy(actual), cp.asnumpy(expected),
-                atol=1e-10, rtol=0,
-            )
+        ledger = _JKDerivativeLedger()
+        if omega is None:
+            ledger.add('j', 'jk', (
+                (probe_host, spin_density, 1.0, None),
+                (probe_host, spin_density, 1.0, None),
+            ))
+        ledger.add('k', 'jk', (
+            (0.5 * probe_host, spin_density, -1.0, omega),
+            (0.5 * probe_host, spin_density, -1.0, omega),
+        ))
+        contracted = DFLedgerBackend(mf)(
+            ledger._terms, mf.mol, atoms, slots=('jk',),
+        )['jk']
+        if omega is None:
+            expected = cp.einsum('pq,axpq->ax', weight, vj)
+            expected -= 0.5 * cp.einsum('pq,axpq->ax', weight, vk)
+        else:
+            expected = -0.5 * cp.einsum('pq,axpq->ax', weight, vk)
+        np.testing.assert_allclose(
+            contracted, cp.asnumpy(expected), atol=1e-8, rtol=0,
+        )
 
-    def test_fractional_jk_direct_contraction(self):
-        self.compare_contracted_jk()
+    def test_fractional_jk_ledger_contraction(self):
+        self.compare_ledger_jk()
 
-    def test_fractional_long_range_jk_direct_contraction(self):
-        self.compare_contracted_jk(omega=0.3)
+    def test_fractional_long_range_jk_ledger_contraction(self):
+        self.compare_ledger_jk(omega=0.3)
 
     def test_fractional_fock_skeleton(self):
         mf = self.reference()

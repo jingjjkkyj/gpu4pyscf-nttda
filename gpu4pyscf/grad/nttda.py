@@ -39,6 +39,7 @@ only algebraically equivalent integral, grid, and response contractions.
 
 import importlib
 import time
+from dataclasses import replace
 
 import numpy as np
 import cupy as cp
@@ -357,6 +358,25 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     prepare_seconds = time.perf_counter() - prepare_started
 
     pairs = context.method.orbital_backend().canonical_pairs(grad.base, compact=True)
+    reference_prepared = None
+    reference_started = time.perf_counter()
+    if context.method.reference_kind == 'ensemble_roks':
+        reference_driver = grad._gmf.nuc_grad_method()
+        reference_driver.verbose = 0
+        reference_prepared = reference_driver.prepare_nttda_fusion(
+            pairs, atmlst=atmlst, response_cache=cache,
+        )
+        if reference_prepared.pairs != pairs:
+            raise RuntimeError(
+                'selected-reference preparation changed canonical pair order'
+            )
+        prepared[0] = replace(
+            prepared[0],
+            orbital_rhs_shift=reference_prepared.orbital_rhs_shift,
+            tolerance=min(float(cphf_conv_tol), 1e-12),
+        )
+    reference_prepare_seconds = time.perf_counter() - reference_started
+
     initial = None
     cache_hits = 0
     if frame_cache is not None:
@@ -378,11 +398,29 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     finish_seconds = time.perf_counter() - finish_started
     grad.nttda_details = components[0]
     nuclear_started = time.perf_counter()
+    if reference_prepared is None:
+        reference_gradient = np.asarray(grad.grad_nuc())
+    else:
+        reference_gradient = reference_prepared.unrelaxed_gradient
+        grad.reference_gradient_calls = 1
+        grad.reference_z_solver_diagnostics = {
+            'converged': True,
+            'fused': True,
+            'residual_max_abs': float(components[0].residual),
+            'solve_tolerance': min(float(cphf_conv_tol), 1e-12),
+        }
+        grad.reference_zb_backend = 'fused_nttda'
+        grad.reference_z_df_cache_stats = dict(
+            getattr(reference_driver, 'z_df_cache_stats', {}),
+        )
+        grad.reference_zb_skeleton_stats = {}
     result = {
-        'grad': np.asarray(grad.grad_nuc()) + components[0].total,
+        'grad': reference_gradient + components[0].total,
         'nac': {},
     }
-    nuclear_seconds = time.perf_counter() - nuclear_started
+    nuclear_seconds = (
+        reference_prepare_seconds + time.perf_counter() - nuclear_started
+    )
 
     def record_stats(nac_postprocess_seconds=0.0):
         '''Collect per-frame stats from all backends into ``td._nttda_frame_stats``.
@@ -449,6 +487,7 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
             ),
             'reference_gradient': {
                 'calls': int(getattr(grad, 'reference_gradient_calls', 0)),
+                'fused': reference_prepared is not None,
                 'semantics': getattr(
                     grad._gmf, 'reference_energy_semantics', None,
                 ),

@@ -83,6 +83,15 @@ class RotationSpace:
 
 
 @dataclass(frozen=True)
+class PreparedReferenceResponse:
+    '''Selected-reference terms ready for the shared NTTDA adjoint solve.'''
+
+    pairs: tuple
+    orbital_rhs_shift: np.ndarray
+    unrelaxed_gradient: np.ndarray
+
+
+@dataclass(frozen=True)
 class GMRESDiagnostics:
     '''Auditable convergence evidence for the Dz0 Z-vector solve.'''
 
@@ -214,6 +223,28 @@ def _rotation_space(mo_occ) -> RotationSpace:
     nalpha = (f > 0.0).astype(float)
     nbeta = np.isclose(f, 2.0, atol=_OCC_TOL, rtol=0.0).astype(float)
     return RotationSpace(p=p, q=q, f=f, nalpha=nalpha, nbeta=nbeta)
+
+
+def _rotation_space_from_pairs(mo_occ, pairs) -> RotationSpace:
+    '''Build the selected-reference space in an existing backend pair order.'''
+    native = _rotation_space(mo_occ)
+    pair_indices = tuple((int(pair[0]), int(pair[1])) for pair in pairs)
+    native_indices = tuple(zip(native.p.tolist(), native.q.tolist()))
+    if (
+            len(pair_indices) != len(native_indices)
+            or set(pair_indices) != set(native_indices)):
+        raise ValueError(
+            'NTTDA and selected-reference orbital pair spaces do not match'
+        )
+    p = np.asarray([pair[0] for pair in pair_indices], dtype=int)
+    q = np.asarray([pair[1] for pair in pair_indices], dtype=int)
+    return RotationSpace(
+        p=p,
+        q=q,
+        f=native.f,
+        nalpha=native.nalpha,
+        nbeta=native.nbeta,
+    )
 
 
 def _copy_ks_settings(source, target) -> None:
@@ -473,11 +504,60 @@ class ReferenceGradients(lib.StreamObject):
                 % (self.zb_backend, _ZB_BACKENDS)
             )
 
-    def _build_intermediates(self) -> None:
+    def _build_selected_intermediates(
+            self, space, c0=None, hcore=None) -> None:
+        mf = self.base
+        mol = self.mol
+        if c0 is None:
+            c0 = cp.asarray(mf.mo_coeff).real
+        f_occ = cp.asarray(space.f)
+        with_df = getattr(mf, 'with_df', None)
+        auxbasis = None if with_df is None else getattr(
+            with_df, 'auxbasis', None,
+        )
+        hs_mf = gpu_roks.ROKS(mol)
+        _copy_ks_settings(mf, hs_mf)
+        if with_df is not None:
+            hs_mf = hs_mf.density_fit(auxbasis=auxbasis)
+            _copy_ks_settings(mf, hs_mf)
+        hs_mf.mo_coeff = c0
+        hs_mf.mo_occ = f_occ
+        if hcore is None:
+            hcore = hs_mf.get_hcore(mol)
+        dm_hs = hs_mf.make_rdm1(c0, f_occ)
+        veff_hs = hs_mf.get_veff(mol, dm_hs)
+        f_hs_ao = cp.stack((hcore + veff_hs[0], hcore + veff_hs[1]))
+        f_hs_mo = _transform_ao_to_mo(c0, f_hs_ao)
+
+        occ_spin = cp.asarray((space.nalpha, space.nbeta))
+        w_hs_mo = 0.5 * cp.sum(
+            occ_spin[:, :, None] * f_hs_mo + f_hs_mo * occ_spin[:, None, :],
+            axis=0,
+        )
+
+        self._space = space
+        self._hs_mf = hs_mf
+        self._c0 = c0
+        self._f_hs_ao = f_hs_ao
+        self._f_hs_mo = f_hs_mo
+        self._dm_hs = dm_hs
+        self._w_hs_mo = w_hs_mo
+        self._hcore = hcore
+        self._veff_hs = veff_hs
+
+        nalpha = cp.asarray(space.nalpha)
+        nbeta = cp.asarray(space.nbeta)
+        self.g_hs = 2.0 * (
+            (nalpha[space.q] - nalpha[space.p]) * space.pack(f_hs_mo[0])
+            + (nbeta[space.q] - nbeta[space.p]) * space.pack(f_hs_mo[1])
+        )
+
+    def _build_intermediates(self, space=None) -> None:
         mf = self.base
         mol = self.mol
         c0 = cp.asarray(mf.mo_coeff).real
-        space = _rotation_space(cp.asnumpy(cp.asarray(mf.mo_occ)))
+        if space is None:
+            space = _rotation_space(cp.asnumpy(cp.asarray(mf.mo_occ)))
         f_occ = cp.asarray(space.f)
 
         # Do not call the gpu4pyscf.dft.RKS factory here: for mol.spin != 0 it
@@ -502,7 +582,6 @@ class ReferenceGradients(lib.StreamObject):
         hcore = charge_mf.get_hcore(mol)
         f0ao = hcore + charge_mf.get_veff(mol, dm0)
         f0mo = _transform_ao_to_mo(c0, f0ao)
-
         charge_response = _response_functions._gen_rhf_response(
             charge_mf,
             mo_coeff=c0,
@@ -513,47 +592,45 @@ class ReferenceGradients(lib.StreamObject):
             with_nlc=False,
         )
 
-        hs_mf = gpu_roks.ROKS(mol)
-        _copy_ks_settings(mf, hs_mf)
-        if with_df is not None:
-            hs_mf = hs_mf.density_fit(auxbasis=auxbasis)
-            _copy_ks_settings(mf, hs_mf)
-        hs_mf.mo_coeff = c0
-        hs_mf.mo_occ = f_occ
-        dm_hs = hs_mf.make_rdm1(c0, f_occ)
-        veff_hs = hs_mf.get_veff(mol, dm_hs)
-        f_hs_ao = cp.stack((hcore + veff_hs[0], hcore + veff_hs[1]))
-        f_hs_mo = _transform_ao_to_mo(c0, f_hs_ao)
-
-        occ_spin = cp.asarray((space.nalpha, space.nbeta))
-        w_hs_mo = 0.5 * cp.sum(
-            occ_spin[:, :, None] * f_hs_mo + f_hs_mo * occ_spin[:, None, :],
-            axis=0,
-        )
-
-        self._space = space
+        self._build_selected_intermediates(space, c0=c0, hcore=hcore)
         self._charge_mf = charge_mf
-        self._hs_mf = hs_mf
         self._charge_response = charge_response
         from ._response_density import OrbitalRotationDensity
         self._rotation_density = OrbitalRotationDensity(c0, f_occ)
-        self._c0 = c0
         self._f0ao = f0ao
         self._f0mo = f0mo
-        self._f_hs_ao = f_hs_ao
-        self._f_hs_mo = f_hs_mo
-        self._dm_hs = dm_hs
-        self._w_hs_mo = w_hs_mo
-        self._hcore = hcore
-        self._veff_hs = veff_hs
+        self.g_dz0 = (
+            2.0 * cp.asarray(space.occupation_gap) * space.pack(f0mo)
+        )
 
-        gap = cp.asarray(space.occupation_gap)
-        self.g_dz0 = 2.0 * gap * space.pack(f0mo)
-        nalpha = cp.asarray(space.nalpha)
-        nbeta = cp.asarray(space.nbeta)
-        self.g_hs = 2.0 * (
-            (nalpha[space.q] - nalpha[space.p]) * space.pack(f_hs_mo[0])
-            + (nbeta[space.q] - nbeta[space.p]) * space.pack(f_hs_mo[1])
+    def prepare_nttda_fusion(
+            self, pairs, atmlst=None, response_cache=None):
+        '''Prepare reference terms in the NTTDA backend's pair convention.
+
+        The full ``g_hs`` is the required RHS shift because the NTTDA final
+        contraction differentiates a stationarity residual that is half the
+        standalone selected-reference convention.
+        '''
+        self._validate()
+        space = _rotation_space_from_pairs(
+            cp.asnumpy(cp.asarray(self.base.mo_occ)), pairs,
+        )
+        self._build_intermediates(space=space)
+        if response_cache is not None:
+            response_cache.use_selected_reference_hessian(
+                cp.asnumpy(self._f0mo),
+                self._charge_response,
+            )
+        self.e_hs_unrelaxed = self._high_spin_unrelaxed_gradient()
+        self.atmlst = atmlst
+        direct = cp.asnumpy(self.e_hs_unrelaxed)
+        if atmlst is not None:
+            direct = direct[np.asarray(atmlst, dtype=int)]
+
+        return PreparedReferenceResponse(
+            pairs=tuple(pairs),
+            orbital_rhs_shift=cp.asnumpy(self.g_hs),
+            unrelaxed_gradient=direct,
         )
 
     def hessian_vector_product(self, vector):
@@ -821,8 +898,6 @@ class ReferenceGradients(lib.StreamObject):
     def _contract_df_fock_skeleton(self, weight_occ, cocc, f_occ):
         """Contract the explicit DF/core/XC skeleton with one MO weight."""
         from gpu4pyscf.grad.nttda_xc import GPUXCFrameBackend
-        from gpu4pyscf.df.hessian import rhf as gpu_df_rhf_hess
-        from gpu4pyscf.df.hessian import rks as gpu_df_rks_hess
 
         mol = self.mol
         c0 = self._c0
@@ -852,23 +927,29 @@ class ReferenceGradients(lib.StreamObject):
         omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(
             self._charge_mf.xc, spin=mol.spin,
         )
-        hessobj = gpu_df_rks_hess.Hessian(self._charge_mf)
         started = time.perf_counter()
-        vj, vk = gpu_df_rhf_hess._get_jk_ip(
-            hessobj, c0, f_occ, with_j=True,
-            with_k=ni.libxc.is_hybrid_xc(self._charge_mf.xc),
-            contract_weight=weight_occ,
-        )
-        jk = vj
+        from pyscf.grad.nttda.derivative_jk import _JKDerivativeLedger
+        from gpu4pyscf.grad.nttda_ledger import DFLedgerBackend
+
+        jk_ledger = _JKDerivativeLedger()
+        half_probe = 0.5 * probe_host
+        jk_ledger.add('j', 'jk', (
+            (probe_host, spin_density, 1.0, None),
+            (probe_host, spin_density, 1.0, None),
+        ))
         if ni.libxc.is_hybrid_xc(self._charge_mf.xc):
-            jk = jk - 0.5 * hybrid * vk
+            jk_ledger.add('k', 'jk', (
+                (half_probe, spin_density, -hybrid, None),
+                (half_probe, spin_density, -hybrid, None),
+            ))
         if abs(omega) > 1e-10 and abs(alpha - hybrid) > 1e-10:
-            _vj_lr, vk_lr = gpu_df_rhf_hess._get_jk_ip(
-                hessobj, c0, f_occ, with_j=False, with_k=True,
-                omega=omega, contract_weight=weight_occ,
-            )
-            jk = jk - 0.5 * (alpha - hybrid) * vk_lr
-        jk = cp.asnumpy(jk)
+            jk_ledger.add('k', 'jk', (
+                (half_probe, spin_density, -(alpha - hybrid), omega),
+                (half_probe, spin_density, -(alpha - hybrid), omega),
+            ))
+        jk = DFLedgerBackend(self._charge_mf)(
+            jk_ledger._terms, mol, atoms, slots=('jk',),
+        )['jk']
         result += jk
         components['df_jk'] = jk
         cp.cuda.get_current_stream().synchronize()
@@ -978,6 +1059,7 @@ Grad = ReferenceGradients
 
 __all__ = [
     'GMRESDiagnostics',
+    'PreparedReferenceResponse',
     'ReferenceGradients',
     'Gradients',
     'Grad',

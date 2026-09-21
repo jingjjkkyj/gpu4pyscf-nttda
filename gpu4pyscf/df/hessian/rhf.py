@@ -431,18 +431,13 @@ def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
     return h1mo
 
 def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
-            verbose=None, with_j=True, with_k=True, omega=None,
-            contract_weight=None):
+            verbose=None, with_j=True, with_k=True, omega=None):
     '''
-    Derivatives of J, K matrices in MO bases.
+    Derivatives of J, K matrices in MO bases
 
     The density is ``C diag(mo_occ) C^T``.  Occupation weights belong only
     to the contracted density index of K; the output ``C_occ`` transform
     is unweighted, including for fractional occupations.
-
-    If ``contract_weight`` has shape ``(nmo, nocc)``, contract the free MO
-    and occupied indices before returning.  This preserves the integral path
-    while avoiding the full ``(natm, 3, nmo, nocc)`` output tensors.
     '''
     log = logger.new_logger(hessobj, verbose)
     t0 = log.init_timer()
@@ -464,13 +459,6 @@ def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
     nao, nmo = mo_coeff.shape
     mocc = mo_coeff[:,mo_occ>0]
     occ_weights = mo_occ[mo_occ > 0]
-    if contract_weight is not None:
-        contract_weight = cupy.asarray(contract_weight, order='C')
-        if contract_weight.shape != (nmo, mocc.shape[1]):
-            raise ValueError(
-                'contract_weight must have shape (%d, %d), got %s' %
-                (nmo, mocc.shape[1], contract_weight.shape)
-            )
     dm0 = (mocc * occ_weights) @ mocc.T
 
     if omega and omega > 1e-10:
@@ -600,13 +588,7 @@ def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
         # NOTE: vj1_int3c and vk1_int3c are in [natm,3,nao,nocc]
         #       axis=2 in AO, axis=3 in MO
         #       convert axis=2 into MO now
-        if contract_weight is None:
-            vj1_int3c = contract(
-                'nxiq,ip->nxpq', vj1_int3c, mo_coeff,
-            )
-        else:
-            left_occ = contract('ip,po->io', mo_coeff, contract_weight)
-            vj1_int3c = contract('nxio,io->nx', vj1_int3c, left_occ)
+        vj1_int3c = contract('nxiq,ip->nxpq', vj1_int3c, mo_coeff)
 
     if with_k:
         vk1_buf = intopt.unsort_orbitals(vk1_buf, axis=[1,2])
@@ -616,23 +598,11 @@ def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
             vk1_int3c -= vk1_ao
         vk1_ao = None
         # Density occupation weights were applied at the contracted index.
-        if contract_weight is None:
-            vk1_int3c = contract(
-                'nxiq,ip->nxpq', vk1_int3c, mo_coeff,
-            )
-        else:
-            if not with_j:
-                left_occ = contract(
-                    'ip,po->io', mo_coeff, contract_weight,
-                )
-            vk1_int3c = contract('nxio,io->nx', vk1_int3c, left_occ)
+        vk1_int3c = contract('nxiq,ip->nxpq', vk1_int3c, mo_coeff)
     t0 = log.timer_debug1('Fock matrix due to int3c2e_ip1', *t0)
 
     mocc = intopt.unsort_orbitals(mocc, axis=[0])
     mo_coeff = intopt.unsort_orbitals(mo_coeff, axis=[0])
-    if contract_weight is not None:
-        probe_ao = contract('ip,po->io', mo_coeff, contract_weight)
-        probe_ao = contract('io,jo->ij', probe_ao, mocc)
     release_gpu_stack()
 
     # ========================== sorted AO end ================================
@@ -647,22 +617,12 @@ def _get_jk_ip(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None,
             vj1_ao = cupy.zeros([3,nao,nao])
             vj1_ao[:,p0:p1,:] -= vj1_buf[:,p0:p1,:]
             vj1_ao[:,:,p0:p1] -= vj1_buf[:,p0:p1,:].transpose(0,2,1)
-            if contract_weight is None:
-                vj1_int3c[ia] += _ao2mo(vj1_ao)
-            else:
-                vj1_int3c[ia] += contract(
-                    'xij,ij->x', vj1_ao, probe_ao,
-                )
+            vj1_int3c[ia] += _ao2mo(vj1_ao)
         if with_k:
             vk1_ao = cupy.zeros([3,nao,nao])
             vk1_ao[:,p0:p1,:] -= vk1_buf[:,p0:p1,:]
             vk1_ao[:,:,p0:p1] -= vk1_buf[:,p0:p1,:].transpose(0,2,1)
-            if contract_weight is None:
-                vk1_int3c[ia] += _ao2mo(vk1_ao)
-            else:
-                vk1_int3c[ia] += contract(
-                    'xij,ij->x', vk1_ao, probe_ao,
-                )
+            vk1_int3c[ia] += _ao2mo(vk1_ao)
     return vj1_int3c, vk1_int3c
 
 def _get_jk_mo(hessobj, mol, dms, mo_coeff, mocc,

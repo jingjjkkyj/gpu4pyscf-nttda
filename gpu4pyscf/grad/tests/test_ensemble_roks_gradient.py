@@ -11,6 +11,7 @@ the reference energy must be reproduced by a fixed-grid finite difference to
 
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 import cupy as cp
 import numpy as np
@@ -116,6 +117,55 @@ class EnsembleROKSGradientGPU(unittest.TestCase):
         result = driver._contract_z_b(z)
         np.testing.assert_allclose(
             cp.asnumpy(result), cp.asnumpy(expected), atol=2e-8, rtol=0,
+        )
+
+    def test_nttda_fusion_uses_canonical_pairs_and_shared_hessian(self):
+        from pyscf.grad.nttda import ensemble
+
+        pairs = ensemble.canonical_pairs(SimpleNamespace(
+            _scf=SimpleNamespace(mo_occ=cp.asnumpy(self.mf.mo_occ)),
+        ))
+        legacy = ReferenceGradients(self.mf)
+        legacy._build_intermediates()
+        native_pairs = tuple(zip(
+            legacy._space.p.tolist(),
+            legacy._space.q.tolist(),
+        ))
+        native_lookup = {
+            pair: index for index, pair in enumerate(native_pairs)
+        }
+        expected_rhs = cp.asnumpy(legacy.g_hs)[
+            [native_lookup[(p, q)] for p, q, _name in pairs]
+        ]
+
+        shared_hessian = {}
+
+        driver = ReferenceGradients(self.mf)
+        cache = SimpleNamespace(
+            use_selected_reference_hessian=lambda fock, response: (
+                shared_hessian.update(fock=fock, response=response)
+            ),
+        )
+        prepared = driver.prepare_nttda_fusion(
+            pairs, response_cache=cache,
+        )
+
+        self.assertEqual(prepared.pairs, pairs)
+        self.assertIs(shared_hessian['response'], driver._charge_response)
+        np.testing.assert_allclose(
+            shared_hessian['fock'],
+            cp.asnumpy(legacy._f0mo),
+            atol=1e-10,
+            rtol=0,
+        )
+        np.testing.assert_allclose(
+            prepared.orbital_rhs_shift, expected_rhs, atol=1e-12, rtol=0,
+        )
+        np.testing.assert_allclose(
+            prepared.unrelaxed_gradient,
+            cp.asnumpy(legacy._high_spin_unrelaxed_gradient()),
+            atol=1e-10,
+            rtol=0,
         )
 
     def test_reference_energy_finite_difference_converges(self):

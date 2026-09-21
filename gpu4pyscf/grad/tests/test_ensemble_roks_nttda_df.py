@@ -7,6 +7,7 @@ For NACs, exact spin-adapted wavefunction overlaps fix the root order and phase.
 import cupy as cp
 import numpy as np
 import pytest
+from unittest import mock
 
 from pyscf import gto
 from gpu4pyscf.grad.nttda import _import_forge, build_cpu_twin, compute_frame
@@ -73,6 +74,32 @@ def test_df_reference_gradient_before_public_dispatch():
     assert np.max(np.abs(cp.asnumpy(correction))) > 1e-4
 
 
+def test_compute_frame_fuses_selected_reference_zvector():
+    _import_forge()
+    td = make_td(make_reference())
+    separate = td.Gradients().set(
+        cphf_conv_tol=1e-11, verbose=0,
+    ).kernel(state=1)
+
+    with mock.patch.object(
+        ReferenceGradients,
+        '_solve_z',
+        side_effect=AssertionError(
+            'compute_frame must use the fused NTTDA adjoint solve'
+        ),
+    ):
+        frame = compute_frame(
+            td, active_state=1, cphf_conv_tol=1e-11,
+        )
+
+    np.testing.assert_allclose(frame['grad'], separate, atol=5e-9, rtol=0)
+    stats = td._nttda_frame_stats['reference_gradient']
+    assert stats['calls'] == 1
+    assert stats['fused']
+    assert stats['z_b_backend'] == 'fused_nttda'
+    assert stats['z_solver']['converged']
+
+
 @pytest.mark.parametrize('delta_s', [-1, 0])
 @pytest.mark.parametrize('xc', ['PBE', 'B3LYP', 'M06-2X', 'CAM-B3LYP'])
 def test_df_total_gradient_matches_selected_energy(xc, delta_s):
@@ -125,14 +152,23 @@ def test_df_nac_wavefunction_difference_and_joint_frame():
     ).kernel(state=1)
     for use_etfs in (False, True):
         separate_nac = nac_driver.kernel(state_I=1, state_J=2, use_etfs=use_etfs)
-        frame = compute_frame(
-            td, active_state=1, nac_pairs=((1, 2),),
-            cphf_conv_tol=1e-11, use_etfs=use_etfs,
-        )
+        with mock.patch.object(
+            ReferenceGradients,
+            '_solve_z',
+            side_effect=AssertionError(
+                'compute_frame must use the fused NTTDA adjoint solve'
+            ),
+        ):
+            frame = compute_frame(
+                td, active_state=1, nac_pairs=((1, 2),),
+                cphf_conv_tol=1e-11, use_etfs=use_etfs,
+            )
         np.testing.assert_allclose(frame['grad'], separate_gradient, atol=5e-9, rtol=0)
         np.testing.assert_allclose(frame['nac'][(1, 2)], separate_nac, atol=5e-9, rtol=0)
         stats = td._nttda_frame_stats['reference_gradient']
         assert stats['calls'] == 1
+        assert stats['fused']
+        assert stats['z_b_backend'] == 'fused_nttda'
         assert stats['z_solver']['converged']
 
 

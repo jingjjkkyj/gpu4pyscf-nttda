@@ -76,6 +76,23 @@ def make_gpu_response_cache(cpu_td, gmf, xc_backend=_UNSET):
                 route_jk_to_gpu(reference, gmf)
             return reference
 
+        def spin_focks_mo(self):
+            """Build spin Focks on the GPU, returning the solver's host pair."""
+            if self._focks_mo is None:
+                mo = cp.asarray(self._orbitals)
+                fock = gmf.get_fock()
+                if self.method.reference_kind in ('ensemble_rks', 'ensemble_roks'):
+                    # Both spins use the ensemble common Fock, not the
+                    # selected high-spin reference or the channel Fz.
+                    common = cp.asnumpy(mo.conj().T @ cp.asarray(fock) @ mo)
+                    self._focks_mo = (common, common)
+                else:
+                    self._focks_mo = tuple(
+                        cp.asnumpy(mo.conj().T @ spin_fock @ mo)
+                        for spin_fock in (fock.focka, fock.fockb)
+                    )
+            return self._focks_mo
+
         def response(self, hermi):
             if self.method.reference_kind in ('ensemble_rks', 'ensemble_roks'):
                 if hermi not in self._responses:
@@ -140,6 +157,25 @@ def make_gpu_response_cache(cpu_td, gmf, xc_backend=_UNSET):
 
             apply.clear = clear
             return apply
+
+        def use_selected_reference_hessian(self, fock_mo, response):
+            """Use one reference-built Fock/response in the shared Hessian."""
+            self.extra['ensemble_fock_mo'] = np.asarray(fock_mo)
+
+            def counted_response(density):
+                width = (
+                    1 if density.ndim == 2
+                    else int(np.prod(density.shape[:-2]))
+                )
+                self.stats['response_calls'] += 1
+                self.stats['response_rhs'] += width
+                self.stats['response_batch_widths'].append(width)
+                if not isinstance(density, cp.ndarray):
+                    density = cp.asarray(density)
+                return cp.asnumpy(response(density))
+
+            self._responses[1] = counted_response
+            self.stats['response_builds'] += 1
 
         def fxc_ref(self):
             if xc_backend is not None:

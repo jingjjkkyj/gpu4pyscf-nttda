@@ -123,6 +123,33 @@ def test_contexts_do_not_share_mutable_response_state():
         first.validate()
 
 
+@pytest.mark.parametrize('case', CASES, ids=[case[2] for case in CASES])
+@pytest.mark.parametrize('df', [False, True])
+def test_spin_fock_cache_uses_gpu_and_preserves_method(case, df):
+    from unittest import mock
+    from pyscf.dft.numint import NumInt
+
+    kind, factory, _, _ = case
+    td = solve(factory(reference(kind, df=df)))
+    context = EvaluationContext(td)
+    cpu_mf = context.cpu_td._scf
+    expected = context.method.spin_focks_mo(cpu_mf)
+    with (
+        mock.patch.object(cpu_mf, 'get_fock', side_effect=AssertionError('CPU Fock')),
+        mock.patch.object(NumInt, 'nr_uks', side_effect=AssertionError('CPU UKS XC')),
+        mock.patch.object(NumInt, 'nr_rks', side_effect=AssertionError('CPU RKS XC')),
+    ):
+        cache = context.response_cache
+        assert cache._focks_mo is None
+        with mock.patch.object(td._scf, 'get_fock', wraps=td._scf.get_fock) as build:
+            actual = cache.spin_focks_mo()
+            assert cache.spin_focks_mo() is actual
+            build.assert_called_once()
+    for spin, reference_fock in zip(actual, expected):
+        assert isinstance(spin, np.ndarray)
+        np.testing.assert_allclose(spin, reference_fock, atol=1e-9, rtol=0)
+
+
 def test_existing_drivers_reject_replaced_solution_for_all_paths():
     td = solve(NTTDA_ROKS(reference(ROKS)))
     grad, nac = td.Gradients(), td.NAC()
