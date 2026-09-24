@@ -17,10 +17,11 @@
 GPU port of pyscf.sftda.nttda for high-spin ROKS and average-occupation
 EnsembleRKS references.  This module implements the production
 ``deltaS = -1`` and ``deltaS = 0`` channels.  The vref0
-(spin-flip kernel) action reuses the stock gpu4pyscf ``nr_rks_fxc`` with an
-injected reference kernel; the GGA/MGGA vref1 action is evaluated directly
-in the MO blocks on the grid (batched GEMMs), which avoids the CPU-only
-sparse-AO primitives of the reference implementation.
+(spin-flip kernel) and GGA/MGGA vref1 actions are evaluated directly in the
+MO blocks on the grid for the real-orbital ``deltaS = -1`` path.  This avoids
+materializing full AO response matrices and the CPU-only sparse-AO primitives
+of the reference implementation.  Other channels retain the generic
+gpu4pyscf ``nr_rks_fxc`` fallback with an injected reference kernel.
 
 ``F0`` always follows the selected ground-state model: the ROKS common Fock
 for a ROKS reference, or the equal-spin restricted Fock for EnsembleRKS.
@@ -290,12 +291,17 @@ def _fxc1_gga_mo_wv(fxc, t, i):
     wv = cp.empty((nvec, 4, ngrids))
     t00 = t[:, 0, 0]
     if i == 0:
-        wv[:, 0] = cp.einsum('ijg,xijg->xg', fxc[:4, :4], t)
+        wv[:, 0] = (fxc[:4, :4][None] * t).sum(axis=(1, 2))
         wv[:, 1:4] = fxc[0, 1:4][None] * t00[:, None]
-        wv[:, 1:4] += cp.einsum('ijg,xig->xjg', fxc[1:4, 1:4], t[:, 1:4, 0])
+        wv[:, 1:4] += (
+            fxc[1:4, 1:4][None]
+            * t[:, 1:4, 0][:, :, None]
+        ).sum(axis=1)
     else:
         wv[:, 0] = fxc[i, 0][None] * t00
-        wv[:, 0] += cp.einsum('jg,xjg->xg', fxc[i, 1:4], t[:, 0, 1:4])
+        wv[:, 0] += (
+            fxc[i, 1:4][None] * t[:, 0, 1:4]
+        ).sum(axis=1)
         wv[:, 1:4] = fxc[i, 1:4][None] * t00[:, None]
     return wv
 
@@ -305,17 +311,26 @@ def _fxc1_mgga_mo_wv(fxc, t, i):
     wv = cp.empty((nvec, 4, ngrids))
     t00 = t[:, 0, 0]
     if i == 0:
-        wv[:, 0] = cp.einsum('ijg,xijg->xg', fxc[:4, :4], t)
+        wv[:, 0] = (fxc[:4, :4][None] * t).sum(axis=(1, 2))
         wv[:, 1:4] = fxc[0, 1:4][None] * t00[:, None]
-        wv[:, 1:4] += cp.einsum('ijg,xig->xjg', fxc[1:4, 1:4], t[:, 1:4, 0])
+        wv[:, 1:4] += (
+            fxc[1:4, 1:4][None]
+            * t[:, 1:4, 0][:, :, None]
+        ).sum(axis=1)
         wv[:, 1:4] += 0.5 * fxc[0, 4][None, None] * t[:, 0, 1:4]
-        wv[:, 1:4] += 0.5 * cp.einsum('ig,xijg->xjg', fxc[1:4, 4],
-                                      t[:, 1:4, 1:4])
+        wv[:, 1:4] += 0.5 * (
+            fxc[1:4, 4][None, :, None]
+            * t[:, 1:4, 1:4]
+        ).sum(axis=1)
     else:
         wv[:, 0] = fxc[i, 0][None] * t00
-        wv[:, 0] += cp.einsum('jg,xjg->xg', fxc[i, 1:4], t[:, 0, 1:4])
+        wv[:, 0] += (
+            fxc[i, 1:4][None] * t[:, 0, 1:4]
+        ).sum(axis=1)
         wv[:, 0] += 0.5 * fxc[4, 0][None] * t[:, i, 0]
-        wv[:, 0] += 0.5 * cp.einsum('jg,xjg->xg', fxc[4, 1:4], t[:, i, 1:4])
+        wv[:, 0] += 0.5 * (
+            fxc[4, 1:4][None] * t[:, i, 1:4]
+        ).sum(axis=1)
         wv[:, 1:4] = fxc[i, 1:4][None] * t00[:, None]
         wv[:, 1:4] += 0.5 * fxc[i, 4][None, None] * t[:, 0, 1:4]
         wv[:, 1:4] += 0.5 * fxc[4, 1:4][None] * t[:, i, 0][:, None]
@@ -323,14 +338,82 @@ def _fxc1_mgga_mo_wv(fxc, t, i):
     return wv
 
 
-def nr_rks_fxc1_mo(mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref):
-    '''Contract the fxc1 kernel directly in selected MO spaces (GPU).
+def _fxc0_mo_rho(x, left_mo, right_mo, xctype, t=None):
+    """Density components of ``right @ x.T @ left.T`` on one grid block."""
+    nvec = x.shape[0]
+    ngrids = left_mo.shape[-1]
+    if xctype == 'LDA':
+        right_x = contract('nlr,rg->nlg', x, right_mo[0])
+        return contract('nlg,lg->ng', right_x, left_mo[0])[:, None]
 
-    ``in_blocks``: name -> (X (nvec, nleft, nright) cupy, left_key,
-    right_key); ``out_blocks``: name -> (left_key, right_key); ``terms``:
-    (input_name, output_name, coefficient).  Mirrors the CPU
-    ``_nr_rks_fxc1_mo`` with the gpu4pyscf sorted-AO block loop; only
-    GGA/MGGA reach this path.
+    if t is None:
+        right_x = contract('nlr,irg->nilg', x, right_mo)
+        rho0 = contract('nlg,lg->ng', right_x[:, 0], left_mo[0])
+        rho_grad = contract(
+            'nilg,lg->nig', right_x[:, 1:4], left_mo[0],
+        )
+        rho_grad += contract(
+            'nlg,ilg->nig', right_x[:, 0], left_mo[1:4],
+        )
+        if xctype == 'MGGA':
+            tau = 0.5 * contract(
+                'nilg,ilg->ng', right_x[:, 1:4], left_mo[1:4],
+            )
+    else:
+        rho0 = t[:, 0, 0]
+        rho_grad = t[:, 1:4, 0] + t[:, 0, 1:4]
+        if xctype == 'MGGA':
+            tau = 0.5 * cp.einsum('niig->ng', t[:, 1:4, 1:4])
+
+    ncomp = 5 if xctype == 'MGGA' else 4
+    rho = cp.empty((nvec, ncomp, ngrids), dtype=x.dtype)
+    rho[:, 0] = rho0
+    rho[:, 1:4] = rho_grad
+    if xctype == 'MGGA':
+        rho[:, 4] = tau
+    return rho
+
+
+def _fxc0_mo_accumulate(out, left_mo, right_mo, wv, xctype):
+    """Project one ordinary XC-kernel response directly into an MO block."""
+    if xctype == 'LDA':
+        weighted_left = left_mo[0][None] * wv[:, 0, None]
+        out += contract('nlg,rg->nlr', weighted_left, right_mo[0])
+        return
+
+    # The AO implementation forms ao[0] @ scale_ao(ao, wv).T and then
+    # symmetrizes it.  Keep the two directed halves explicit in MO space.
+    weighted_left = contract('nig,ilg->nlg', wv[:, :4], left_mo)
+    out += contract('nlg,rg->nlr', weighted_left, right_mo[0])
+    weighted_right = contract(
+        'nig,irg->nrg', wv[:, 1:4], right_mo[1:4],
+    )
+    out += contract('lg,nrg->nlr', left_mo[0], weighted_right)
+    if xctype == 'MGGA':
+        weighted_tau = (
+            left_mo[1:4][None] * (0.5 * wv[:, 4])[:, None, None]
+        )
+        out += contract(
+            'nilg,irg->nlr', weighted_tau, right_mo[1:4],
+        )
+
+
+def _linear_grid_combination(values, terms):
+    combined = None
+    for name, coefficient in terms:
+        value = coefficient * values[name]
+        combined = value if combined is None else combined + value
+    return combined
+
+
+def nr_rks_fxc_mo(mf, mo_blocks, in_blocks, out_blocks, fxc_ref,
+                  fxc0_terms=(), fxc1_terms=()):
+    '''Contract ordinary and derivative-index XC kernels in selected MO spaces.
+
+    Both kernels are linear in their input transition densities.  Terms aimed
+    at the same output block are therefore combined on the grid before the
+    expensive MO projection.  A single AO block loop supplies both ``vref0``
+    and ``vref1``.
     '''
     ni = mf._numint
     mol = mf.mol
@@ -340,8 +423,12 @@ def nr_rks_fxc1_mo(mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref):
         fill_wv = _fxc1_gga_mo_wv
     elif xctype == 'MGGA':
         fill_wv = _fxc1_mgga_mo_wv
+    elif xctype == 'LDA' and not fxc1_terms:
+        fill_wv = None
     else:
-        raise ValueError(f'MO-grid fxc1 only supports GGA/MGGA, got {xctype}')
+        raise ValueError(
+            f'MO-grid fxc1 only supports GGA/MGGA, got {xctype}'
+        )
 
     opt = getattr(ni, 'gdftopt', None)
     if opt is None:
@@ -363,55 +450,102 @@ def nr_rks_fxc1_mo(mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref):
         needed.add(right_key)
 
     nvec = next(iter(in_blocks.values()))[0].shape[0]
+    dtype = cp.result_type(
+        fxc_ref.dtype, next(iter(in_blocks.values()))[0].dtype,
+    )
     out = {
         name: cp.zeros((
             nvec,
             mo_blocks[left_key].shape[1],
             mo_blocks[right_key].shape[1],
-        ))
+        ), dtype=dtype)
         for name, (left_key, right_key) in out_blocks.items()
     }
-    terms_by_input = {}
-    for in_name, out_name, coef in terms:
-        terms_by_input.setdefault(in_name, []).append((out_name, coef))
+    fxc0_by_output = {}
+    for in_name, out_name, coefficient in fxc0_terms:
+        fxc0_by_output.setdefault(out_name, []).append(
+            (in_name, coefficient),
+        )
+    fxc1_by_output = {}
+    for in_name, out_name, coefficient in fxc1_terms:
+        fxc1_by_output.setdefault(out_name, []).append(
+            (in_name, coefficient),
+        )
+    fxc0_inputs = {name for name, _out, _coef in fxc0_terms}
+    fxc1_inputs = {name for name, _out, _coef in fxc1_terms}
+    active_inputs = fxc0_inputs | fxc1_inputs
 
     p1 = 0
     for ao_mask, idx, weight, _coords in ni.block_loop(
-            _sorted_mol, grids, nao, 1):
+            _sorted_mol, grids, nao, 0 if xctype == 'LDA' else 1):
         p0, p1 = p1, p1 + weight.size
         wfxc = fxc_ref[:, :, p0:p1] * weight
+        ao_components = (
+            ao_mask[None] if xctype == 'LDA' else ao_mask[:4]
+        )
 
         mo_cache = {}
         for key in needed:
             coeff_mask = sorted_blocks[key][idx]
-            mo_cache[key] = contract('cig,ip->cpg', ao_mask[:4], coeff_mask)
+            mo_cache[key] = contract(
+                'cig,ip->cpg', ao_components, coeff_mask,
+            )
 
+        rho_inputs = {}
+        t_inputs = {}
         for in_name, (x, left_key, right_key) in in_blocks.items():
-            input_terms = terms_by_input.get(in_name)
-            if not input_terms:
+            if in_name not in active_inputs:
                 continue
             left_mo = mo_cache[left_key]
             right_mo = mo_cache[right_key]
-            # t[n, i, j, g] = sum_lr L[j][l, g] X[n, l, r] R[i][r, g]
-            xr = contract('nlr,irg->nilg', x, right_mo)
-            t = contract('nilg,jlg->nijg', xr, left_mo)
-            wv = cp.empty((nvec, 4, 4, weight.size))
-            for i in range(4):
-                wv[:, i] = fill_wv(wfxc, t, i)
-            for out_name, coef in input_terms:
-                out_left, out_right = out_blocks[out_name]
-                lmo = mo_cache[out_left]
-                rmo = mo_cache[out_right]
-                # out[n] += coef * sum_ij L[j] diag(wv[n,i,j]) R[i]^T
-                weighted = contract('nijg,jlg->nilg', wv, lmo)
-                out[out_name] += coef * contract(
-                    'nilg,irg->nlr', weighted, rmo,
+            t = None
+            if in_name in fxc1_inputs:
+                # t[n,i,j,g] = sum_lr R[i,r,g] X[n,l,r] L[j,l,g]
+                xr = contract('nlr,irg->nilg', x, right_mo)
+                t = contract('nilg,jlg->nijg', xr, left_mo)
+                t_inputs[in_name] = t
+            if in_name in fxc0_inputs:
+                rho_inputs[in_name] = _fxc0_mo_rho(
+                    x, left_mo, right_mo, xctype, t=t,
+                )
+
+        for out_name, (left_key, right_key) in out_blocks.items():
+            left_mo = mo_cache[left_key]
+            right_mo = mo_cache[right_key]
+            ordinary_terms = fxc0_by_output.get(out_name)
+            if ordinary_terms:
+                rho = _linear_grid_combination(
+                    rho_inputs, ordinary_terms,
+                )
+                wv = (rho[:, None] * wfxc[None]).sum(axis=2)
+                _fxc0_mo_accumulate(
+                    out[out_name], left_mo, right_mo, wv, xctype,
+                )
+
+            derivative_terms = fxc1_by_output.get(out_name)
+            if derivative_terms:
+                t = _linear_grid_combination(t_inputs, derivative_terms)
+                wv = cp.empty((nvec, 4, 4, weight.size))
+                for i in range(4):
+                    wv[:, i] = fill_wv(wfxc, t, i)
+                # out[n] += sum_ij L[j] diag(wv[n,i,j]) R[i]^T
+                weighted = contract('nijg,jlg->nilg', wv, left_mo)
+                out[out_name] += contract(
+                    'nilg,irg->nlr', weighted, right_mo,
                 )
     return out
 
 
+def nr_rks_fxc1_mo(mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref):
+    """Compatibility wrapper for a derivative-index-only MO contraction."""
+    return nr_rks_fxc_mo(
+        mf, mo_blocks, in_blocks, out_blocks, fxc_ref,
+        fxc1_terms=terms,
+    )
+
+
 def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True,
-                          operator_profiler=None):
+                          operator_profiler=None, use_mo_grid_fxc0=False):
     '''Response function for ``Sf = Si - 1`` (GPU).
 
     ``vref0`` applies the equal-spin spin-flip kernel (plus hybrid exchange),
@@ -419,9 +553,8 @@ def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True,
     its hybrid Coulomb term).  The spin-adapted coefficients below transform
     those primitive actions into the CO/CV/OO/OV response blocks.
 
-    Returns ``(vind, fockz)``.  With ``use_mo_grid_fxc1`` the GGA/MGGA
-    ``vref1`` action is evaluated directly in MO blocks by the caller so the
-    CPU-only sparse-AO path is avoided without changing the formula.
+    Returns ``(vind, fockz)``.  With the MO-grid flags, the corresponding
+    GGA/MGGA actions are evaluated directly in MO blocks by the caller.
     '''
     mol = mf.mol
     ni = mf._numint
@@ -435,6 +568,7 @@ def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True,
 
     if xctype != 'HF' and fxc_ref is None:
         fxc_ref = spin_flip_reference_fxc(mf)
+    skip_vref0 = use_mo_grid_fxc0 and xctype in ('GGA', 'MGGA')
     skip_vref1 = use_mo_grid_fxc1 and xctype in ('GGA', 'MGGA')
 
     def vind(dms_co, dms_cv, dms_oo, dms_ov):
@@ -447,14 +581,17 @@ def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True,
         dms1 = cp.concatenate((dms_co, dms_ov), axis=0)
 
         if xctype != 'HF':
-            vref0 = operator_profiler.measure(
-                'xc_response_seconds',
-                lambda: gpu_numint.nr_rks_fxc(
-                    ni, mol, mf.grids, mf.xc, None, dms0, 0, hermi,
-                    None, None, fxc_ref,
-                ),
-            )
-            vref0 = cp.asarray(vref0)
+            if skip_vref0:
+                vref0 = cp.zeros_like(dms0)
+            else:
+                vref0 = operator_profiler.measure(
+                    'xc_response_seconds',
+                    lambda: gpu_numint.nr_rks_fxc(
+                        ni, mol, mf.grids, mf.xc, None, dms0, 0, hermi,
+                        None, None, fxc_ref,
+                    ),
+                )
+                vref0 = cp.asarray(vref0)
             if skip_vref1:
                 vref1 = cp.zeros_like(dms1)
             elif xctype == 'LDA':
@@ -664,6 +801,7 @@ def gen_vind_sc(td):
     block decomposition.
     '''
     td._nttda_df_exchange_backend = 'dense'
+    td._nttda_xc_response_backend = 'ao_matrix'
     mf = td._scf
     mo = cp.asarray(mf.mo_coeff)
     csidx, osidx, vsidx = _orbital_indices(mf)
@@ -833,7 +971,7 @@ def gen_vind_sc(td):
     return vind, hdiag
 
 
-def gen_vind_sfd(td):
+def gen_vind_sfd(td, use_mo_grid_fxc0=True):
     from gpu4pyscf.df.df_jk import _DFHF
 
     mf = td._scf
@@ -870,6 +1008,14 @@ def gen_vind_sfd(td):
 
     ni = mf._numint
     xctype = ni._xc_type(mf.xc)
+    use_mo_grid_fxc0 = (
+        use_mo_grid_fxc0
+        and xctype in ('GGA', 'MGGA')
+        and mo_coeff.dtype.kind != 'c'
+    )
+    td._nttda_xc_response_backend = (
+        'mo_grid_fused' if use_mo_grid_fxc0 else 'ao_matrix'
+    )
     use_mo_grid_fxc1 = xctype in ('GGA', 'MGGA')
     fxc_ref = None
     if xctype != 'HF':
@@ -881,6 +1027,7 @@ def gen_vind_sfd(td):
     vresp, fockz = gen_rohf_response_sfd(
         mf, fxc_ref=fxc_ref, hermi=0, use_mo_grid_fxc1=use_mo_grid_fxc1,
         operator_profiler=operator_profiler,
+        use_mo_grid_fxc0=use_mo_grid_fxc0,
     )
 
     fock0 = _methods().get_method(td).fock0(mf, xp=cp)
@@ -954,7 +1101,59 @@ def gen_vind_sfd(td):
         v1mo_ov = contract('xpq,qo->xpo', v1ao_ov, orbos)
         v1mo_ov = contract('xpo,pv->xov', v1mo_ov, orbvs)
 
-        if use_mo_grid_fxc1:
+        if use_mo_grid_fxc0:
+            denom = 2 * s - 1
+            factor = np.sqrt((2 * s + 1) / (2 * s))
+            open_factor = np.sqrt(2 * s / denom)
+            cv_open_factor = np.sqrt((2 * s + 1) / denom)
+            in_blocks = {
+                'co': (zs_co, 'c', 'o'),
+                'cv': (zs_cv, 'c', 'v'),
+                'oo': (zs_oo, 'o', 'o'),
+                'ov': (zs_ov, 'o', 'v'),
+            }
+            out_blocks = {
+                'co': ('c', 'o'),
+                'cv': ('c', 'v'),
+                'oo': ('o', 'o'),
+                'ov': ('o', 'v'),
+            }
+            fxc0_terms = (
+                ('co', 'co', 1.0),
+                ('cv', 'co', factor),
+                ('oo', 'co', open_factor),
+                ('ov', 'co', 2 * s / denom),
+                ('co', 'cv', factor),
+                ('cv', 'cv', 1.0),
+                ('oo', 'cv', cv_open_factor),
+                ('ov', 'cv', factor),
+                ('co', 'oo', open_factor),
+                ('cv', 'oo', cv_open_factor),
+                ('oo', 'oo', 1.0),
+                ('ov', 'oo', open_factor),
+                ('co', 'ov', 2 * s / denom),
+                ('cv', 'ov', factor),
+                ('oo', 'ov', open_factor),
+                ('ov', 'ov', 1.0),
+            )
+            fxc1_terms = (
+                ('co', 'co', 1.0 / denom),
+                ('ov', 'co', -1.0 / denom),
+                ('co', 'ov', -1.0 / denom),
+                ('ov', 'ov', 1.0 / denom),
+            ) if use_mo_grid_fxc1 else ()
+            direct_xc = operator_profiler.measure(
+                'xc_response_seconds',
+                lambda: nr_rks_fxc_mo(
+                    mf, mo_blocks, in_blocks, out_blocks, fxc_ref,
+                    fxc0_terms=fxc0_terms, fxc1_terms=fxc1_terms,
+                ),
+            )
+            v1mo_co += direct_xc['co']
+            v1mo_cv += direct_xc['cv']
+            v1mo_oo += direct_xc['oo']
+            v1mo_ov += direct_xc['ov']
+        elif use_mo_grid_fxc1:
             denom = 2 * s - 1
             in_blocks = {
                 'co': (zs_co, 'c', 'o'),
@@ -1246,6 +1445,9 @@ class NTTDA(lib.StreamObject):
         #   final_residuals        — last-iteration residual norms (profile only)
         self._nttda_solver_stats = {
             'df_exchange_backend': getattr(self, '_nttda_df_exchange_backend', 'dense'),
+            'xc_response_backend': getattr(
+                self, '_nttda_xc_response_backend', 'ao_matrix',
+            ),
             'vind_calls': len(vind_widths),
             'vind_widths': vind_widths,
             'total_vector_applications': sum(vind_widths),

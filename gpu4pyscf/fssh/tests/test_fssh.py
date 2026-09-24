@@ -10,7 +10,7 @@ import h5py
 import numpy as np
 from pyscf import gto
 
-from gpu4pyscf.fssh.fssh import FSSH, PES
+from gpu4pyscf.fssh.fssh import FSSH, HoppingProbabilityError, PES
 
 
 class DeterministicHopFSSH(FSSH):
@@ -45,6 +45,52 @@ class DeterministicHopFSSH(FSSH):
 
     def rescale_velocity(self, hop_index, cur_state, energy, velocity, d_vec):
         return True, velocity
+
+
+class OversizedProbabilityFSSH(FSSH):
+    """Model whose coarse electronic step requires probability substeps."""
+
+    def __init__(self, mol):
+        super().__init__(mol, states=[0, 1])
+        self.mass = np.ones(mol.natm)
+        self.dt = 1.0
+        self.nsteps = 1
+        self.decoherence = False
+        self.save_force = True
+        self.random_calls = 0
+
+    def evaluate_pes(self, position, cur_state, with_nacv=True):
+        nacv = np.zeros((2, 2, self.mol.natm, 3))
+        nacv[0, 1, :, 0] = 0.75
+        nacv[1, 0, :, 0] = -0.75
+        return PES(
+            energy=np.zeros(2),
+            force=np.zeros((self.mol.natm, 3)),
+            nacv=nacv,
+        )
+
+    def update_coefficient(self, coeffs, energy, nact, dt=None):
+        return np.array(coeffs, copy=True)
+
+    def random_uniform(self):
+        self.random_calls += 1
+        return 0.99
+
+
+class NestedOversizedProbabilityFSSH(OversizedProbabilityFSSH):
+    """Model that also rejects the initially planned electronic substeps."""
+
+    def __init__(self, mol):
+        super().__init__(mol)
+        self.probability_calls = 0
+
+    def compute_hopping_probability(
+            self, coeffs, nact, cur_state, dt=None):
+        self.probability_calls += 1
+        electronic_dt = self.dt if dt is None else dt
+        if electronic_dt > 0.05:
+            raise HoppingProbabilityError(1.5)
+        return np.zeros(len(self.states))
 
 
 class KnownValues(unittest.TestCase):
@@ -100,6 +146,41 @@ class KnownValues(unittest.TestCase):
         ])
         with self.assertRaisesRegex(RuntimeError, "sum to"):
             driver.compute_hopping_probability(coeffs, nact, cur_state=0)
+
+    def test_kernel_retries_oversized_probability_with_electronic_substeps(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            driver = OversizedProbabilityFSSH(self.mol)
+            driver.filename = str(Path(tmpdir) / "trajectory.h5")
+            coefficient = np.full(2, 1 / np.sqrt(2), dtype=complex)
+
+            driver.kernel(
+                position=np.zeros((1, 3)),
+                velocity=np.array([[1.0, 0.0, 0.0]]),
+                coefficient=coefficient,
+            )
+
+            self.assertEqual(driver._last_electronic_substeps, 15)
+            self.assertEqual(driver.random_calls, 15)
+            self.assertEqual(driver.cur_step, 1)
+            with h5py.File(driver.filename, "r") as handle:
+                self.assertIn("1", handle)
+
+    def test_invalid_substeps_are_split_before_random_sampling(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            driver = NestedOversizedProbabilityFSSH(self.mol)
+            driver.filename = str(Path(tmpdir) / "trajectory.h5")
+            coefficient = np.full(2, 1 / np.sqrt(2), dtype=complex)
+
+            driver.kernel(
+                position=np.zeros((1, 3)),
+                velocity=np.array([[1.0, 0.0, 0.0]]),
+                coefficient=coefficient,
+            )
+
+            self.assertEqual(driver._last_electronic_substeps, 30)
+            self.assertEqual(driver.probability_calls, 46)
+            self.assertEqual(driver.random_calls, 30)
+            self.assertEqual(driver.cur_step, 1)
 
     def test_active_state_is_never_a_hop_target(self):
         driver = FSSH(self.mol, states=[0, 1])

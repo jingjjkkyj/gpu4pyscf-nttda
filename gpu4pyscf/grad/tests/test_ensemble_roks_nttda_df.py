@@ -100,6 +100,57 @@ def test_compute_frame_fuses_selected_reference_zvector():
     assert stats['z_solver']['converged']
 
 
+def test_compute_frame_batches_multiple_gradients_and_nac():
+    _import_forge()
+    td = make_td(make_reference())
+    gradients = {
+        state: td.Gradients().set(
+            cphf_conv_tol=1e-11, verbose=0,
+        ).kernel(state=state)
+        for state in (1, 2, 3)
+    }
+    expected_nac = td.NAC().set(
+        cphf_conv_tol=1e-11, ediff=True, verbose=0,
+    ).kernel(state_I=1, state_J=3, use_etfs=True)
+
+    with mock.patch.object(
+        ReferenceGradients,
+        '_solve_z',
+        side_effect=AssertionError(
+            'compute_frame must use the fused NTTDA adjoint solve'
+        ),
+    ):
+        frame = compute_frame(
+            td,
+            active_state=2,
+            gradient_states=(1, 2, 3),
+            nac_pairs=((1, 3),),
+            cphf_conv_tol=1e-11,
+        )
+
+    assert frame['grad'] is frame['gradients'][2]
+    for state, expected in gradients.items():
+        np.testing.assert_allclose(
+            frame['gradients'][state], expected, atol=5e-9, rtol=0,
+        )
+    np.testing.assert_allclose(
+        frame['nac'][(1, 3)], expected_nac, atol=5e-9, rtol=0,
+    )
+    stats = td._nttda_frame_stats
+    assert stats['gradient_states'] == (1, 2, 3)
+    assert stats['gradient_count'] == 3
+    assert stats['zvector_batch_width'] == 4
+    assert stats['xc_response_channels'] == 5
+    assert stats['xc_fockz_tasks'] == 4
+    assert stats['reference_gradient']['calls'] == 1
+    assert stats['reference_gradient']['fused']
+
+    with pytest.raises(ValueError, match='include active_state'):
+        compute_frame(td, active_state=2, gradient_states=(1, 3))
+    with pytest.raises(ValueError, match='unique'):
+        compute_frame(td, active_state=2, gradient_states=(1, 2, 2))
+
+
 @pytest.mark.parametrize('delta_s', [-1, 0])
 @pytest.mark.parametrize('xc', ['PBE', 'B3LYP', 'M06-2X', 'CAM-B3LYP'])
 def test_df_total_gradient_matches_selected_energy(xc, delta_s):

@@ -10,7 +10,7 @@ from pyscf import gto
 
 from gpu4pyscf.dft.roks import ROKS
 from gpu4pyscf.sftda import EnsembleRKS, EnsembleROKS, NTTDA
-from gpu4pyscf.sftda.nttda import _transition_density
+from gpu4pyscf.sftda.nttda import _transition_density, gen_vind_sfd
 from gpu4pyscf.grad.nttda_context import (
     EvaluationContext, make_gpu_response_cache,
 )
@@ -99,6 +99,28 @@ def test_dense_and_factorized_full_operator(operator_reference):
                 with mock.patch.dict(os.environ, {'NTTDA_DF_EXCHANGE_BACKEND': 'factorized'}):
                     gen()
                 assert td._nttda_df_exchange_backend == 'dense'
+
+
+def test_direct_mo_xc_full_operator_matches_ao_path():
+    mf = make_reference(EnsembleROKS)
+    td = NTTDA(mf)
+    rng = np.random.default_rng(91)
+    with mock.patch.dict(
+            os.environ, {'NTTDA_DF_EXCHANGE_BACKEND': 'factorized'}):
+        legacy, diagonal = gen_vind_sfd(td, use_mo_grid_fxc0=False)
+        direct, direct_diagonal = gen_vind_sfd(td, use_mo_grid_fxc0=True)
+    np.testing.assert_allclose(
+        cp.asnumpy(direct_diagonal), cp.asnumpy(diagonal),
+        atol=1e-12, rtol=0,
+    )
+    for width in (1, 3, 6):
+        vectors = cp.asarray(rng.normal(size=(width, diagonal.size)))
+        expected = legacy(vectors)
+        actual = direct(vectors)
+        np.testing.assert_allclose(
+            cp.asnumpy(actual), cp.asnumpy(expected),
+            atol=2e-10, rtol=1e-11,
+        )
 
 
 @pytest.mark.parametrize('kind', [EnsembleRKS, EnsembleROKS])

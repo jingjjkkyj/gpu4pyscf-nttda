@@ -2,9 +2,10 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-import types
+import pickle
 import shutil
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -30,6 +31,34 @@ class FakeNTTDA:
         self.deltaS = -1
         self.e = None
         self.xy = None
+
+
+class ScriptedSCF:
+    def __init__(self, mol, mo_coeff, mo_occ, converged=True):
+        self.mol = mol
+        self._scripted_coeff = cp.asarray(mo_coeff)
+        self._scripted_occ = cp.asarray(mo_occ)
+        self._scripted_converged = converged
+        self.mo_coeff = None
+        self.mo_occ = None
+        self.mo_energy = None
+        self.e_tot = None
+        self.converged = False
+        self.cycles = 0
+        self.kernel_calls = 0
+
+    def get_occ(self, mo_energy=None, mo_coeff=None):
+        return self._scripted_occ.copy()
+
+    def kernel(self, dm0=None):
+        self.kernel_calls += 1
+        self.mo_coeff = self._scripted_coeff.copy()
+        self.mo_energy = cp.arange(self.mo_coeff.shape[1], dtype=cp.float64)
+        self.mo_occ = self.get_occ(self.mo_energy, self.mo_coeff)
+        self.e_tot = -1.0
+        self.converged = self._scripted_converged
+        self.cycles = 3
+        return self.e_tot
 
 
 class KnownValues(unittest.TestCase):
@@ -155,6 +184,64 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(np.allclose(td.e, [0.2, 0.1]))
         self.assertEqual(driver.root_assignment, [1, 0])
 
+    def test_energy_ordering_keeps_low_overlap_as_diagnostic(self):
+        driver = FSSH_NTTDA(
+            FakeNTTDA(self.mol), states=[1, 2], root_overlap_tol=0.4,
+        )
+        td = types.SimpleNamespace(
+            e=np.array([0.1, 0.2]),
+            xy=[
+                (np.array([[1.0, 0.0]]), 0),
+                (np.array([[0.0, 1.0]]), 0),
+            ],
+            converged=np.array([True, True]),
+        )
+        tracking = {
+            'C': np.eye(2),
+            'occ': np.array([1.0, 0.0]),
+            'xy_p': [
+                np.array([[0.1, np.sqrt(0.99)]]),
+                np.array([[np.sqrt(0.99), 0.1]]),
+            ],
+            's_occ': np.eye(1),
+            's_vir': np.eye(2),
+        }
+
+        driver._track_roots(self.mol, td, tracking)
+
+        self.assertEqual(driver.root_assignment, [0, 1])
+        np.testing.assert_allclose(driver.root_overlaps, [0.1, 0.1])
+        np.testing.assert_allclose(td.e, [0.1, 0.2])
+
+    def test_overlap_ordering_rejects_unmatched_requested_state(self):
+        driver = FSSH_NTTDA(
+            FakeNTTDA(self.mol),
+            states=[1, 2],
+            state_ordering='overlap',
+            root_overlap_tol=0.4,
+        )
+        td = types.SimpleNamespace(
+            e=np.array([0.1, 0.2]),
+            xy=[
+                (np.array([[1.0, 0.0]]), 0),
+                (np.array([[0.0, 1.0]]), 0),
+            ],
+            converged=np.array([True, True]),
+        )
+        tracking = {
+            'C': np.eye(2),
+            'occ': np.array([1.0, 0.0]),
+            'xy_p': [
+                np.array([[0.1, 0.0]]),
+                np.array([[0.0, 0.1]]),
+            ],
+            's_occ': np.eye(1),
+            's_vir': np.eye(2),
+        }
+
+        with self.assertRaisesRegex(RuntimeError, 'root tracking overlap'):
+            driver._track_roots(self.mol, td, tracking)
+
     def test_invalid_root_tracking_buffer_is_rejected(self):
         td = FakeNTTDA(self.mol)
         for value in (-1, 1.5, True):
@@ -182,6 +269,123 @@ class KnownValues(unittest.TestCase):
                         td, states=[1, 2], cphf_max_cycle=value,
                     )
 
+    def test_invalid_scf_mom_overlap_tolerance_is_rejected(self):
+        td = FakeNTTDA(self.mol)
+        for value in (0, -0.1, 1.1, np.inf, '0.5', True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                        ValueError, 'scf_mom_overlap_tol'):
+                    FSSH_NTTDA(
+                        td, states=[1, 2],
+                        scf_mom_overlap_tol=value,
+                    )
+
+    def test_mom_occupation_preserves_closed_open_virtual_counts(self):
+        overlap = cp.eye(4)[:, [0, 3, 2, 1]]
+        reference_occ = cp.asarray([2.0, 2.0, 1.0, 0.0])
+
+        occupation = FSSH_NTTDA._mom_occupation(
+            overlap, reference_occ,
+        )
+
+        np.testing.assert_array_equal(
+            cp.asnumpy(occupation), [2.0, 0.0, 1.0, 2.0],
+        )
+        self.assertEqual(int(cp.count_nonzero(occupation == 2)), 2)
+        self.assertEqual(int(cp.count_nonzero(occupation == 1)), 1)
+        self.assertEqual(int(cp.count_nonzero(occupation == 0)), 1)
+
+    def _orthonormal_mos(self):
+        overlap = self.mol.intor_symmetric('int1e_ovlp')
+        values, vectors = np.linalg.eigh(overlap)
+        return (vectors / np.sqrt(values)) @ vectors.T
+
+    def _mom_recovery_driver(self, normal, recovered=None):
+        driver = FSSH_NTTDA(
+            FakeNTTDA(self.mol),
+            states=[1, 2],
+            scf_mom_overlap_tol=0.5,
+        )
+        previous_coeff = self._orthonormal_mos()
+        driver._last_mf = types.SimpleNamespace(
+            mol=self.mol,
+            mo_coeff=cp.asarray(previous_coeff),
+            mo_occ=cp.asarray([2.0, 0.0]),
+        )
+        scripted = iter(
+            [normal] if recovered is None else [normal, recovered]
+        )
+        driver._new_scf = types.MethodType(
+            lambda self, mol: next(scripted), driver,
+        )
+        return driver
+
+    def test_continuous_scf_does_not_retry_with_mom(self):
+        coeff = self._orthonormal_mos()
+        normal = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        driver = self._mom_recovery_driver(normal)
+
+        result = driver._run_scf_with_mom_recovery(
+            self.mol, dm0=cp.eye(2),
+        )
+
+        self.assertIs(result, normal)
+        self.assertFalse(driver.scf_mom_retry)
+        self.assertFalse(
+            driver.scf_mom_diagnostics['retry_triggered']
+        )
+        self.assertGreater(
+            driver.scf_mom_diagnostics[
+                'minimum_occupied_singular_value'
+            ],
+            0.999999,
+        )
+
+    def test_occupied_virtual_exchange_triggers_mom_retry(self):
+        coeff = self._orthonormal_mos()[:, [1, 0]]
+        normal = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        recovered = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        driver = self._mom_recovery_driver(normal, recovered)
+
+        result = driver._run_scf_with_mom_recovery(
+            self.mol, dm0=cp.eye(2),
+        )
+
+        self.assertIs(result, recovered)
+        self.assertTrue(driver.scf_mom_retry)
+        np.testing.assert_array_equal(
+            cp.asnumpy(recovered.mo_occ), [0.0, 2.0],
+        )
+        diagnostics = driver.scf_mom_diagnostics
+        self.assertTrue(diagnostics['retry_triggered'])
+        self.assertLess(
+            diagnostics['minimum_occupied_singular_value'], 1e-12,
+        )
+        self.assertGreater(
+            diagnostics[
+                'recovered_minimum_occupied_singular_value'
+            ],
+            0.999999,
+        )
+        self.assertEqual(diagnostics['recovered_changed_orbitals'], [])
+
+    def test_failed_mom_retry_is_fail_closed(self):
+        coeff = self._orthonormal_mos()[:, [1, 0]]
+        normal = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        failed = ScriptedSCF(
+            self.mol, coeff, [2.0, 0.0], converged=False,
+        )
+        driver = self._mom_recovery_driver(normal, failed)
+
+        with self.assertRaisesRegex(RuntimeError, 'MOM retry'):
+            driver._run_scf_with_mom_recovery(
+                self.mol, dm0=cp.eye(2),
+            )
+        self.assertTrue(driver.scf_mom_retry)
+        self.assertFalse(
+            driver.scf_mom_diagnostics['mom_scf_converged']
+        )
+
     def test_only_dfj_surface_is_rejected(self):
         td = FakeNTTDA(self.mol)
         td._scf.only_dfj = True
@@ -190,7 +394,11 @@ class KnownValues(unittest.TestCase):
 
     def test_checkpoint_restores_electronic_gauge_cache_and_rng(self):
         from gpu4pyscf.dft import roks
-        from gpu4pyscf.sftda import NTTDA
+        from gpu4pyscf.sftda import (
+            EnsembleROKS,
+            NTTDA,
+            NTTDA_EnsembleROKS,
+        )
 
         mf = roks.ROKS(self.mol, xc='B3LYP')
         mf.conv_tol = 1e-10
@@ -243,6 +451,45 @@ class KnownValues(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, 'does not match'):
                 mismatch.restore(trajectory)
+
+            ensemble_td = NTTDA_EnsembleROKS(
+                EnsembleROKS(self.mol, xc='B3LYP'),
+            )
+            method_mismatch = FSSH_NTTDA(
+                ensemble_td, states=[1, 2],
+            )
+            source_signature = driver._checkpoint_signature()
+            target_signature = method_mismatch._checkpoint_signature()
+            self.assertEqual(source_signature['method_id'], 'roks')
+            self.assertEqual(
+                target_signature['method_id'], 'ensemble_roks',
+            )
+            self.assertEqual(
+                {
+                    key: value
+                    for key, value in source_signature.items()
+                    if key != 'method_id'
+                },
+                {
+                    key: value
+                    for key, value in target_signature.items()
+                    if key != 'method_id'
+                },
+            )
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                method_mismatch.restore(trajectory)
+
+            checkpoint = driver._checkpoint_path()
+            with checkpoint.open('rb') as handle:
+                legacy_payload = pickle.load(handle)
+            legacy_payload['signature'].pop('scf_mom_overlap_tol')
+            legacy_payload['electronic'].pop('scf_mom_retry')
+            legacy_payload['electronic'].pop('scf_mom_diagnostics')
+            with checkpoint.open('wb') as handle:
+                pickle.dump(
+                    legacy_payload, handle,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
 
             restored = FSSH_NTTDA(td, states=[1, 2])
             restored.restore(trajectory)
@@ -394,6 +641,60 @@ class KnownValues(unittest.TestCase):
         self.assertIsNone(driver._last_mf)
         self.assertIsNone(driver._last_td)
         self.assertFalse(driver._initial_frame_available)
+
+    def test_rebuilt_scf_preserves_ensemble_roks_method(self):
+        from pyscf.sftda import nttda_methods
+        from gpu4pyscf.sftda import EnsembleROKS, NTTDA_EnsembleROKS
+
+        mf = EnsembleROKS(self.mol, xc='PBE').density_fit()
+        td = NTTDA_EnsembleROKS(mf)
+        driver = FSSH_NTTDA(td, states=[1, 2])
+
+        rebuilt_mf = driver._new_scf(self.mol.copy())
+        rebuilt_td = driver._new_td(rebuilt_mf)
+
+        self.assertIsInstance(rebuilt_mf, EnsembleROKS)
+        self.assertEqual(rebuilt_mf.nopen, mf.nopen)
+        self.assertIsNotNone(rebuilt_mf.with_df)
+        self.assertEqual(
+            nttda_methods.resolve_method(rebuilt_td).id,
+            'ensemble_roks',
+        )
+        self.assertEqual(
+            rebuilt_td._nttda_explicit_method,
+            'ensemble_roks',
+        )
+
+    def test_selected_reference_energy_is_used_for_fssh_surfaces(self):
+        from gpu4pyscf.sftda import EnsembleROKS, NTTDA_EnsembleROKS
+
+        mf = EnsembleROKS(self.mol, xc='PBE')
+        mf.conv_tol = 1e-10
+        mf.converged = True
+        mf.mo_coeff = cp.eye(self.mol.nao_nr())
+        mf.mo_occ = cp.asarray([2.0, 0.0])
+        mf.mo_energy = cp.asarray([-0.5, 0.2])
+        mf.e_tot = -1.0
+        mf.reference_energy = lambda: -2.0
+
+        td = NTTDA_EnsembleROKS(mf)
+        td.conv_tol = 1e-8
+        td.e = np.asarray([0.1, 0.2, 0.3])
+        td.xy = [
+            (cp.ones((1, 1)) * value, 0)
+            for value in (1.0, 2.0, 3.0)
+        ]
+        td.converged = np.ones(3, dtype=bool)
+
+        driver = FSSH_NTTDA(td, states=[1, 2])
+        energy, _force, _nacv = driver.calc_electronic(
+            self.mol.atom_coords(unit='Bohr'),
+            cur_state=2,
+            with_nacv=False,
+            with_frame=False,
+        )
+
+        np.testing.assert_allclose(energy, [-1.9, -1.8], atol=1e-14)
 
     def test_rebuilt_scf_preserves_tuned_range_separation(self):
         from gpu4pyscf.dft import roks

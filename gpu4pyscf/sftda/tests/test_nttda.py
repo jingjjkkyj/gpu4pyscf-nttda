@@ -27,6 +27,69 @@ class FakeMF:
 
 
 class KnownValues(unittest.TestCase):
+    def test_fxc1_broadcast_reductions_match_einsum(self):
+        rng = np.random.default_rng(23)
+        nvec, ngrids = 3, 17
+        for helper, ncomp in (
+                (nttda._fxc1_gga_mo_wv, 4),
+                (nttda._fxc1_mgga_mo_wv, 5)):
+            fxc = cp.asarray(rng.normal(size=(ncomp, ncomp, ngrids)))
+            t = cp.asarray(rng.normal(size=(nvec, 4, 4, ngrids)))
+            for i in range(4):
+                actual = helper(fxc, t, i)
+                if ncomp == 4:
+                    expected = self._fxc1_gga_einsum(fxc, t, i)
+                else:
+                    expected = self._fxc1_mgga_einsum(fxc, t, i)
+                np.testing.assert_allclose(
+                    cp.asnumpy(actual), cp.asnumpy(expected),
+                    atol=2e-14, rtol=2e-14,
+                )
+
+    @staticmethod
+    def _fxc1_gga_einsum(fxc, t, i):
+        wv = cp.empty((t.shape[0], 4, t.shape[-1]))
+        t00 = t[:, 0, 0]
+        if i == 0:
+            wv[:, 0] = cp.einsum('ijg,xijg->xg', fxc[:4, :4], t)
+            wv[:, 1:4] = fxc[0, 1:4][None] * t00[:, None]
+            wv[:, 1:4] += cp.einsum(
+                'ijg,xig->xjg', fxc[1:4, 1:4], t[:, 1:4, 0],
+            )
+        else:
+            wv[:, 0] = fxc[i, 0][None] * t00
+            wv[:, 0] += cp.einsum(
+                'jg,xjg->xg', fxc[i, 1:4], t[:, 0, 1:4],
+            )
+            wv[:, 1:4] = fxc[i, 1:4][None] * t00[:, None]
+        return wv
+
+    @staticmethod
+    def _fxc1_mgga_einsum(fxc, t, i):
+        wv = KnownValues._fxc1_gga_einsum(fxc, t, i)
+        if i == 0:
+            wv[:, 1:4] += (
+                0.5 * fxc[0, 4][None, None] * t[:, 0, 1:4]
+            )
+            wv[:, 1:4] += 0.5 * cp.einsum(
+                'ig,xijg->xjg', fxc[1:4, 4], t[:, 1:4, 1:4],
+            )
+        else:
+            wv[:, 0] += 0.5 * fxc[4, 0][None] * t[:, i, 0]
+            wv[:, 0] += 0.5 * cp.einsum(
+                'jg,xjg->xg', fxc[4, 1:4], t[:, i, 1:4],
+            )
+            wv[:, 1:4] += (
+                0.5 * fxc[i, 4][None, None] * t[:, 0, 1:4]
+            )
+            wv[:, 1:4] += (
+                0.5 * fxc[4, 1:4][None] * t[:, i, 0][:, None]
+            )
+            wv[:, 1:4] += (
+                0.25 * fxc[4, 4][None, None] * t[:, i, 1:4]
+            )
+        return wv
+
     def test_synchronized_operator_profiler_summarizes_regions(self):
         profiler = nttda._SynchronizedOperatorProfiler(True)
         timestamps = iter((0.0, 1.0, 3.0, 4.0, 7.0, 8.0, 12.0, 15.0))

@@ -46,6 +46,7 @@ from gpu4pyscf.grad.nttda import (
     _validate_supported_reference,
     compute_frame,
     make_frame_cache,
+    rebuild_reference,
 )
 from gpu4pyscf.grad.nttda_params import PARAMS as _NTTDA_PARAMS
 from gpu4pyscf.sftda.nttda import NTTDA
@@ -60,7 +61,8 @@ class FSSH_NTTDA(FSSH):
     def __init__(self, td, states, scf_conv_tol=1e-10, td_conv_tol=1e-8,
                  cphf_conv_tol=1e-9, cphf_max_cycle=None,
                  root_overlap_tol=0.4, use_etfs=True,
-                 root_tracking_buffer=1, state_ordering='energy'):
+                 root_tracking_buffer=1, state_ordering='energy',
+                 scf_mom_overlap_tol=0.5):
         if not isinstance(states, (list, tuple)) or len(states) < 2:
             raise ValueError('at least two NTTDA states must be specified')
         if any(
@@ -92,6 +94,17 @@ class FSSH_NTTDA(FSSH):
             raise ValueError(
                 "state_ordering must be either 'energy' or 'overlap'"
             )
+        if (
+                isinstance(scf_mom_overlap_tol, (bool, np.bool_))
+                or not isinstance(
+                    scf_mom_overlap_tol,
+                    (int, float, np.integer, np.floating),
+                )
+                or not np.isfinite(scf_mom_overlap_tol)
+                or not 0.0 < scf_mom_overlap_tol <= 1.0):
+            raise ValueError(
+                'scf_mom_overlap_tol must be in the interval (0, 1]'
+            )
 
         super().__init__(td._scf.mol, states)
         self.tddft = td
@@ -104,6 +117,7 @@ class FSSH_NTTDA(FSSH):
             self.cphf_max_cycle = _NTTDA_PARAMS.get('cphf_max_cycle')
         self.root_overlap_tol = root_overlap_tol
         self.state_ordering = state_ordering
+        self.scf_mom_overlap_tol = float(scf_mom_overlap_tol)
         self.use_etfs = bool(use_etfs)
         self.root_tracking_buffer = int(root_tracking_buffer)
         self.nstates_solver = max(states) + self.root_tracking_buffer
@@ -136,6 +150,8 @@ class FSSH_NTTDA(FSSH):
         self._reused_initial_reference = False
         self.root_assignment = None
         self.root_overlaps = None
+        self.scf_mom_retry = False
+        self.scf_mom_diagnostics = None
         self._step_phase_timing = {}
         self._restored_pes = None
 
@@ -156,12 +172,11 @@ class FSSH_NTTDA(FSSH):
             cls._copy_setting(source, target, name)
 
     def _new_scf(self, mol):
-        '''Rebuild the ROKS reference while preserving scientific settings.'''
+        '''Rebuild the concrete NTTDA reference with matching settings.'''
         from gpu4pyscf.df.df_jk import _DFHF
-        from gpu4pyscf.dft import roks as gpu_roks
 
         template = self.tddft._scf
-        mf = gpu_roks.ROKS(mol, xc=template.xc)
+        mf = rebuild_reference(template, mol)
         for name in (
                 'conv_tol_grad', 'max_cycle', 'max_memory', 'direct_scf_tol',
                 'init_guess', 'level_shift', 'damp', 'diis_space',
@@ -194,9 +209,12 @@ class FSSH_NTTDA(FSSH):
         return mf
 
     def _new_td(self, mf):
+        from pyscf.sftda import nttda_methods as methods
+
         td = NTTDA(mf)
         for name in ('deltaS', 'nobeta', 'lindep', 'max_cycle', 'max_memory'):
             self._copy_setting(self.tddft, td, name)
+        methods.copy_method(self.tddft, td)
         td.nstates = self.nstates_solver
         td.conv_tol = self.td_conv_tol
         td.verbose = 0
@@ -254,10 +272,13 @@ class FSSH_NTTDA(FSSH):
         return Path(str(trajectory) + '.checkpoint.pkl')
 
     def _checkpoint_signature(self):
+        from pyscf.sftda import nttda_methods as methods
+
         mf = self.tddft._scf
         mol = mf.mol
         with_df = getattr(mf, 'with_df', None)
         return {
+            'method_id': methods.resolve_method(self.tddft).id,
             'symbols': tuple(mol.atom_symbol(i) for i in range(mol.natm)),
             'charge': int(mol.charge),
             'spin': int(mol.spin),
@@ -274,6 +295,7 @@ class FSSH_NTTDA(FSSH):
             'state_ordering': self.state_ordering,
             'root_tracking_buffer': self.root_tracking_buffer,
             'root_overlap_tol': self.root_overlap_tol,
+            'scf_mom_overlap_tol': self.scf_mom_overlap_tol,
             'use_etfs': self.use_etfs,
             'delta_s': int(getattr(self.tddft, 'deltaS', -1)),
             'nobeta': bool(getattr(self.tddft, 'nobeta', False)),
@@ -347,6 +369,10 @@ class FSSH_NTTDA(FSSH):
                 ),
                 'root_assignment': copy.deepcopy(self.root_assignment),
                 'root_overlaps': self._array_or_none(self.root_overlaps),
+                'scf_mom_retry': bool(self.scf_mom_retry),
+                'scf_mom_diagnostics': copy.deepcopy(
+                    self.scf_mom_diagnostics
+                ),
                 'frame_cache': self._pack_frame_cache(),
             },
         }
@@ -395,6 +421,206 @@ class FSSH_NTTDA(FSSH):
         return data
 
     @staticmethod
+    def _mom_occupation(overlap, reference_occ):
+        '''Assign fixed 2/1/0 occupations by maximum subspace overlap.
+
+        The occupied projector is selected first.  The closed-shell projector
+        is then selected inside that occupied set, which guarantees that the
+        resulting beta-like occupied space remains a subset of the alpha-like
+        occupied space and preserves the exact closed/open/virtual counts.
+        '''
+        overlap = cp.asarray(overlap)
+        reference_occ = cp.asarray(reference_occ)
+        if overlap.ndim != 2 or overlap.shape[0] != reference_occ.size:
+            raise ValueError(
+                'MOM overlap must have one row per reference orbital'
+            )
+        valid = (
+            (reference_occ == 0)
+            | (reference_occ == 1)
+            | (reference_occ == 2)
+        )
+        if not bool(cp.all(valid)):
+            raise ValueError('MOM reference occupations must contain 0/1/2')
+
+        nclosed = int(cp.count_nonzero(reference_occ == 2))
+        nopen = int(cp.count_nonzero(reference_occ == 1))
+        noccupied = nclosed + nopen
+        nmo = overlap.shape[1]
+        if noccupied > nmo:
+            raise RuntimeError(
+                'MOM reference has more occupied orbitals than candidates'
+            )
+
+        mo_occ = cp.zeros(nmo, dtype=cp.float64)
+        if noccupied == 0:
+            return mo_occ
+
+        occupied_scores = cp.sum(
+            cp.abs(overlap[reference_occ > 0]) ** 2, axis=0,
+        ).real
+        occupied_order = cp.argsort(-occupied_scores, kind='stable')
+        occupied = occupied_order[:noccupied]
+        mo_occ[occupied] = 1
+
+        if nclosed:
+            closed_scores = cp.sum(
+                cp.abs(overlap[reference_occ == 2]) ** 2, axis=0,
+            ).real
+            restricted_scores = cp.full(nmo, -cp.inf)
+            restricted_scores[occupied] = closed_scores[occupied]
+            closed = cp.argsort(
+                -restricted_scores, kind='stable',
+            )[:nclosed]
+            mo_occ[closed] = 2
+        return mo_occ
+
+    def _scf_occupation_continuity(self, mol, mf):
+        if self._last_mf is None:
+            return None, None
+
+        previous_coeff = cp.asarray(self._last_mf.mo_coeff)
+        previous_occ = cp.asarray(self._last_mf.mo_occ)
+        current_coeff = cp.asarray(mf.mo_coeff)
+        current_occ = cp.asarray(mf.mo_occ)
+        if previous_occ.ndim != 1 or current_occ.ndim != 1:
+            raise RuntimeError(
+                'MOM recovery requires one-dimensional 0/1/2 occupations'
+            )
+        if previous_coeff.shape[1] != previous_occ.size:
+            raise RuntimeError(
+                'previous SCF orbitals and occupations are inconsistent'
+            )
+        if current_coeff.shape[1] != current_occ.size:
+            raise RuntimeError(
+                'current SCF orbitals and occupations are inconsistent'
+            )
+
+        s_cross = cp.asarray(gto.intor_cross(
+            'int1e_ovlp', self._last_mf.mol, mol,
+        ))
+        overlap = previous_coeff.conj().T @ s_cross @ current_coeff
+        proposed_occ = self._mom_occupation(overlap, previous_occ)
+
+        def minimum_singular_value(previous_mask, current_mask):
+            nprevious = int(cp.count_nonzero(previous_mask))
+            ncurrent = int(cp.count_nonzero(current_mask))
+            if nprevious != ncurrent:
+                raise RuntimeError(
+                    'SCF occupation class counts changed across FSSH frames'
+                )
+            if nprevious == 0:
+                return 1.0
+            block = overlap[previous_mask][:, current_mask]
+            singular_values = cp.linalg.svd(
+                block, compute_uv=False,
+            )
+            return float(cp.min(singular_values))
+
+        occupied_min = minimum_singular_value(
+            previous_occ > 0, current_occ > 0,
+        )
+        closed_min = minimum_singular_value(
+            previous_occ == 2, current_occ == 2,
+        )
+        current_occ_cpu = _asnumpy(current_occ)
+        proposed_occ_cpu = _asnumpy(proposed_occ)
+        changed = np.flatnonzero(current_occ_cpu != proposed_occ_cpu)
+        diagnostics = {
+            'minimum_occupied_singular_value': occupied_min,
+            'minimum_closed_singular_value': closed_min,
+            'minimum_class_singular_value': min(occupied_min, closed_min),
+            'current_occupation': current_occ_cpu.tolist(),
+            'mom_occupation': proposed_occ_cpu.tolist(),
+            'changed_orbitals': [
+                {
+                    'orbital_index': int(index),
+                    'current_occupation': float(current_occ_cpu[index]),
+                    'mom_occupation': float(proposed_occ_cpu[index]),
+                }
+                for index in changed
+            ],
+        }
+        return diagnostics, s_cross
+
+    def _install_mom_occupation(self, mf, s_cross):
+        previous_coeff = cp.asarray(self._last_mf.mo_coeff)
+        previous_occ = cp.asarray(self._last_mf.mo_occ)
+        overlap_left = previous_coeff.conj().T @ cp.asarray(s_cross)
+
+        def get_occ(mo_energy=None, mo_coeff=None):
+            if mo_coeff is None:
+                mo_coeff = mf.mo_coeff
+            overlap = overlap_left @ cp.asarray(mo_coeff)
+            return self._mom_occupation(overlap, previous_occ)
+
+        mf.get_occ = get_occ
+        return mf
+
+    def _run_scf_with_mom_recovery(self, mol, dm0=None):
+        self.scf_mom_retry = False
+        self.scf_mom_diagnostics = None
+
+        mf = self._new_scf(mol)
+        mf.kernel(dm0=dm0) if dm0 is not None else mf.kernel()
+        if not mf.converged:
+            raise RuntimeError('GPU ROKS SCF did not converge')
+
+        diagnostics, s_cross = self._scf_occupation_continuity(mol, mf)
+        if diagnostics is None:
+            return mf
+        diagnostics['overlap_tolerance'] = self.scf_mom_overlap_tol
+        diagnostics['normal_scf_cycles'] = int(getattr(mf, 'cycles', 0))
+        retry = bool(
+            diagnostics['changed_orbitals']
+            and diagnostics['minimum_class_singular_value']
+            < self.scf_mom_overlap_tol
+        )
+        diagnostics['retry_triggered'] = retry
+        self.scf_mom_diagnostics = diagnostics
+        if not retry:
+            return mf
+
+        recovered = self._install_mom_occupation(
+            self._new_scf(mol), s_cross,
+        )
+        recovered.kernel(dm0=dm0) if dm0 is not None else recovered.kernel()
+        self.scf_mom_retry = True
+        diagnostics['mom_scf_cycles'] = int(
+            getattr(recovered, 'cycles', 0)
+        )
+        diagnostics['mom_scf_converged'] = bool(recovered.converged)
+        if not recovered.converged:
+            raise RuntimeError('GPU ROKS SCF MOM retry did not converge')
+
+        recovered_diagnostics, _ = self._scf_occupation_continuity(
+            mol, recovered,
+        )
+        diagnostics['recovered_occupation'] = recovered_diagnostics[
+            'current_occupation'
+        ]
+        diagnostics['recovered_minimum_occupied_singular_value'] = (
+            recovered_diagnostics['minimum_occupied_singular_value']
+        )
+        diagnostics['recovered_minimum_closed_singular_value'] = (
+            recovered_diagnostics['minimum_closed_singular_value']
+        )
+        diagnostics['recovered_minimum_class_singular_value'] = (
+            recovered_diagnostics['minimum_class_singular_value']
+        )
+        diagnostics['recovered_changed_orbitals'] = (
+            recovered_diagnostics['changed_orbitals']
+        )
+        if (
+                recovered_diagnostics['changed_orbitals']
+                or recovered_diagnostics['minimum_class_singular_value']
+                < self.scf_mom_overlap_tol):
+            raise RuntimeError(
+                'GPU ROKS SCF MOM retry did not restore orbital continuity'
+            )
+        return recovered
+
+    @staticmethod
     def _project_previous_roots(tracking):
         if 'xy_p' not in tracking:
             return None
@@ -441,7 +667,8 @@ class FSSH_NTTDA(FSSH):
                 order[i] = int(j)
                 signs[i] = -1.0 if overlaps[i, j] < 0 else 1.0
                 self.root_overlaps[i] = abs(overlaps[i, j])
-                if (i + 1 in self.states
+                if (self.state_ordering == 'overlap'
+                        and i + 1 in self.states
                         and self.root_overlaps[i] < self.root_overlap_tol):
                     raise RuntimeError(
                         'NTTDA root tracking overlap %.3f below %.3f '
@@ -516,13 +743,9 @@ class FSSH_NTTDA(FSSH):
             dm0 = None
             if self._last_mf is not None:
                 dm0 = cp.asarray(self._last_mf.make_rdm1())
-            mf = self._new_scf(mol)
-
             t = time.perf_counter()
-            mf.kernel(dm0=dm0) if dm0 is not None else mf.kernel()
+            mf = self._run_scf_with_mom_recovery(mol, dm0=dm0)
             phase_timing['scf'] = time.perf_counter() - t
-            if not mf.converged:
-                raise RuntimeError('GPU ROKS SCF did not converge')
 
             t = time.perf_counter()
             tracking = self._tracking_data(mol, mf)
@@ -535,10 +758,8 @@ class FSSH_NTTDA(FSSH):
             phase_timing['root_tracking'] = time.perf_counter() - t
         self._validate_td_solution(td)
 
-        e_scf = float(_asnumpy(mf.e_tot))
-        energy = np.asarray(
-            [e_scf + float(td.e[s - 1]) for s in self.states],
-        )
+        total_energies = np.asarray(td.e_tot, dtype=float)
+        energy = total_energies[np.asarray(self.states) - 1]
 
         pairs = []
         if with_nacv:
@@ -627,7 +848,9 @@ class FSSH_NTTDA(FSSH):
                 'unsupported FSSH_NTTDA checkpoint schema %r'
                 % payload.get('schema_version')
             )
-        signature = payload.get('signature')
+        signature = copy.deepcopy(payload.get('signature'))
+        if isinstance(signature, dict):
+            signature.setdefault('scf_mom_overlap_tol', 0.5)
         expected = self._checkpoint_signature()
         if signature != expected:
             raise ValueError(
@@ -757,6 +980,12 @@ class FSSH_NTTDA(FSSH):
         )
         self.root_overlaps = self._array_or_none(
             electronic['root_overlaps']
+        )
+        self.scf_mom_retry = bool(
+            electronic.get('scf_mom_retry', False)
+        )
+        self.scf_mom_diagnostics = copy.deepcopy(
+            electronic.get('scf_mom_diagnostics')
         )
         self._initial_frame_available = False
         self._reused_initial_reference = bool(

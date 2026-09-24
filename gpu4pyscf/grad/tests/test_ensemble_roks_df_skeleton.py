@@ -114,7 +114,9 @@ class EnsembleROKSDFSkeletonGPU(unittest.TestCase):
             (0.5 * probe_host, spin_density, -1.0, omega),
             (0.5 * probe_host, spin_density, -1.0, omega),
         ))
-        contracted = DFLedgerBackend(mf)(
+        backend = DFLedgerBackend(mf)
+        backend.output_backend = 'slot_aware'
+        contracted = backend(
             ledger._terms, mf.mol, atoms, slots=('jk',),
         )['jk']
         if omega is None:
@@ -125,6 +127,7 @@ class EnsembleROKSDFSkeletonGPU(unittest.TestCase):
         np.testing.assert_allclose(
             contracted, cp.asnumpy(expected), atol=1e-8, rtol=0,
         )
+        self.assertEqual(backend.stats['output_kernel_tasks'], 1)
 
     def test_fractional_jk_ledger_contraction(self):
         self.compare_ledger_jk()

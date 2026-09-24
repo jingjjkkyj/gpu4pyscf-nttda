@@ -42,8 +42,10 @@ All variables are optional and use the ``NTTDA_`` prefix.
     NTTDA_DF_OUTPUT_BACKEND
         ``legacy`` (default) returns one derivative row per input task.
         Experimental ``slot_aware`` pre-sums already weighted compressed
-        tensors within the same ``(omega, operator, output slot)`` group and
-        runs the derivative CUDA kernel over the reduced output width.
+        tensors within the same ``(omega, output slot)`` group and runs the
+        three- and two-center derivative kernels over the reduced output
+        width. It also groups same-slot pure-K rank-(2,2) contractions
+        automatically; no ``NTTDA_DF_COMPRESSED_BACKEND`` override is needed.
 
     NTTDA_CPHF_MAX_CYCLE
         Default maximum CPHF/Z-vector iterations.  ``None`` (use forge

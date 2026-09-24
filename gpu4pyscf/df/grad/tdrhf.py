@@ -482,6 +482,32 @@ def _factor_contraction_groups(factors):
     return tuple(tuple(indices) for indices in groups.values())
 
 
+def _slot_rank_batched_plan(dm_factors, j_factor, k_factor,
+                            output_group_indices):
+    """Group pure-K rank-(2,R)/(R,2) tasks by output slot and ranks."""
+    candidates = {}
+    for index, (factors, kfac, output_group) in enumerate(zip(
+            dm_factors, k_factor, output_group_indices)):
+        rank1 = factors[0].shape[1]
+        rank2 = factors[2].shape[1]
+        if (
+                kfac != 0
+                and (j_factor is None or j_factor[index] == 0)
+                and (rank1 == 2 or rank2 == 2)):
+            key = (int(output_group), int(rank1), int(rank2))
+            candidates.setdefault(key, []).append(index)
+
+    groups = []
+    mask = np.zeros(len(dm_factors), dtype=bool)
+    for (output_group, rank1, rank2), indices in candidates.items():
+        if len(indices) < 2:
+            continue
+        indices = tuple(indices)
+        groups.append((output_group, rank1, rank2, indices))
+        mask[list(indices)] = True
+    return tuple(groups), mask
+
+
 def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
                                sum_results, verbose, stats_sink=None,
                                output_group_indices=None,
@@ -541,22 +567,23 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
                 or np.any(output_group_indices >= output_group_count)):
             raise ValueError('invalid output group indices/count')
     slot_aware = output_group_indices is not None
-    # The first rank-batched prototype uses task-contiguous output buffers.
-    # Keep slot-aware reduction on the established per-pair build until both
-    # optimizations have an explicitly tested combined path.
     effective_compressed_backend = (
-        'legacy' if slot_aware else compressed_backend
+        'slot_grouped' if slot_aware else compressed_backend
     )
     compressed_profile = _NTTDA_PARAMS['df_compressed_profile']
     rank_bucket_events = {}
     derivative_kernel_events = []
     original_order = None
+    slot_rank_2xr_groups = ()
+    slot_rank_2xr_mask = np.zeros(n_dm, dtype=bool)
     batch_ranges = {
         'j_only': (0, 0),
         'rank_2x2': (0, 0),
         'legacy': (0, n_dm),
     }
-    if effective_compressed_backend == 'rank_batched' and not sum_results:
+    if (
+            effective_compressed_backend == 'rank_batched'
+            and not sum_results and not slot_aware):
         permutation, batch_ranges = _rank_batched_compressed_plan(
             dm_factors, k_factor,
         )
@@ -568,6 +595,12 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             if output_group_indices is not None:
                 output_group_indices = output_group_indices[permutation]
             original_order = np.argsort(permutation)
+    elif slot_aware:
+        slot_rank_2xr_groups, slot_rank_2xr_mask = (
+            _slot_rank_batched_plan(
+                dm_factors, j_factor, k_factor, output_group_indices,
+            )
+        )
     _layer_t['compressed_backend'] = compressed_backend
     _layer_t['effective_compressed_backend'] = (
         effective_compressed_backend
@@ -588,6 +621,35 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     _layer_t['legacy_dm'] = (
         batch_ranges['legacy'][1] - batch_ranges['legacy'][0]
     )
+    slot_rank_2x2_groups = [
+        group for group in slot_rank_2xr_groups
+        if group[1] == 2 and group[2] == 2
+    ]
+    slot_rank_2x2_tasks = sum(len(group[3]) for group in slot_rank_2x2_groups)
+    slot_rank_2xr_tasks = int(slot_rank_2xr_mask.sum())
+    _layer_t['slot_rank_2x2_groups'] = len(slot_rank_2x2_groups)
+    _layer_t['slot_rank_2x2_tasks'] = slot_rank_2x2_tasks
+    _layer_t['slot_rank_2x2_tiles'] = 0
+    _layer_t['slot_rank_2xr_groups'] = len(slot_rank_2xr_groups)
+    _layer_t['slot_rank_2xr_tasks'] = slot_rank_2xr_tasks
+    _layer_t['slot_rank_2xr_mixed_groups'] = (
+        len(slot_rank_2xr_groups) - len(slot_rank_2x2_groups)
+    )
+    _layer_t['slot_rank_2xr_mixed_tasks'] = (
+        slot_rank_2xr_tasks - slot_rank_2x2_tasks
+    )
+    _layer_t['slot_rank_2xr_tiles'] = 0
+    _layer_t['slot_rank_2xr_rank_buckets'] = [
+        {
+            'output_group': output_group,
+            'rank_left': rank1,
+            'rank_right': rank2,
+            'task_count': len(indices),
+        }
+        for output_group, rank1, rank2, indices in slot_rank_2xr_groups
+    ]
+    if slot_rank_2xr_groups:
+        _layer_t['legacy_dm'] = n_dm - slot_rank_2xr_tasks
 
     dm1_factor_l, dm1_factor_r, dm2_factor_l, dm2_factor_r = zip(*dm_factors)
     dm1_noccs = [x.shape[1] for x in dm1_factor_l]
@@ -726,6 +788,44 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
         dm_aux = transpose_sum(dm_aux, inplace=True)
         dm_aux = dm_aux[aux_sorting[:,None], aux_sorting]
         ejk_aux = -cp.asarray(int2c2e_ip1_per_atom(auxmol, dm_aux))
+        int2c2e_kernel_dm = 1
+    elif slot_aware:
+        dm_aux = cp.empty((naux, naux))
+        grouped_dm_aux = cp.empty_like(dm_aux)
+        ejk_aux = []
+        int2c2e_kernel_dm = 0
+        for group in range(output_group_count):
+            members = np.flatnonzero(output_group_indices == group)
+            if not len(members):
+                ejk_aux.append(np.zeros((mol.natm, 3)))
+                continue
+            grouped_dm_aux.fill(0)
+            for i in members:
+                if j_factor is None:
+                    beta = 0
+                else:
+                    cp.multiply(
+                        auxvec1[i,:,None], auxvec2_jfac[i], out=dm_aux,
+                    )
+                    beta = 1
+                contract(
+                    'rij,sji->rs',
+                    j3c_o1o2[i], j3c_o2o1[i], -.5*k_factor[i],
+                    beta, out=dm_aux,
+                )
+                grouped_dm_aux += dm_aux
+            # Symmetrization, auxiliary reordering, and the derivative
+            # contraction are linear, so one call per output slot is exact.
+            transpose_sum(grouped_dm_aux, inplace=True)
+            sorted_dm_aux = grouped_dm_aux[
+                aux_sorting[:,None], aux_sorting
+            ]
+            ejk_aux.append(
+                -int2c2e_ip1_per_atom(auxmol, sorted_dm_aux)
+            )
+            int2c2e_kernel_dm += 1
+        ejk_aux = cp.asarray(np.stack(ejk_aux))
+        grouped_dm_aux = sorted_dm_aux = None
     else:
         dm_aux = cp.empty((naux, naux))
         ejk_aux = []
@@ -741,20 +841,12 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             dm_aux = transpose_sum(dm_aux, inplace=True)
             dm_aux = dm_aux[aux_sorting[:,None], aux_sorting]
             ejk_aux.append(-int2c2e_ip1_per_atom(auxmol, dm_aux))
-        ejk_aux = cp.array(np.stack(ejk_aux))
-        if slot_aware:
-            grouped_ejk_aux = cp.zeros(
-                (output_group_count, mol.natm, 3),
-                dtype=ejk_aux.dtype,
-            )
-            cp.add.at(
-                grouped_ejk_aux,
-                cp.asarray(output_group_indices),
-                ejk_aux,
-            )
-            ejk_aux = grouped_ejk_aux
+        ejk_aux = cp.asarray(np.stack(ejk_aux))
+        int2c2e_kernel_dm = n_dm
     t0 = log.timer_debug1('contract int2c2e_ip1', *t0)
     _layer_t['int2c2e_ip1'] = _time.perf_counter() - _t_int2c2e
+    _layer_t['int2c2e_input_dm'] = n_dm
+    _layer_t['int2c2e_kernel_dm'] = int2c2e_kernel_dm
     auxvec1 = auxvec2 = dm_aux = None
 
     # contract the derivatives and the pseudo DM/rho
@@ -827,8 +919,23 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             cp.stack(dm2_factor_l[rank_2x2_start:rank_2x2_stop]),
             cp.stack(dm2_factor_r[rank_2x2_start:rank_2x2_stop]),
         )
+    slot_rank_2xr_data = []
+    for output_group, rank1, rank2, indices in slot_rank_2xr_groups:
+        scale = cp.asarray(
+            [-.5*k_factor[index] for index in indices],
+        )[:, None, None]
+        slot_rank_2xr_data.append((
+            output_group, rank1, rank2,
+            cp.stack([j3c_o1o2[index] for index in indices]),
+            cp.stack([j3c_o2o1[index] for index in indices]),
+            cp.stack([dm1_factor_l[index] for index in indices]),
+            cp.stack([dm2_factor_l[index] for index in indices]),
+            cp.stack([dm2_factor_r[index] for index in indices]) * scale,
+            cp.stack([dm1_factor_r[index] for index in indices]) * scale,
+        ))
     _t_compressed_build = 0.0
     _t_rank_batched = 0.0
+    _t_slot_rank_2xr = 0.0
     _t_legacy = 0.0
     _t_kern_call = 0.0
     for kbatch, lk, in enumerate(uniq_l_ctr_aux[:,0]):
@@ -851,6 +958,7 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             # The two pre-planned groups are contiguous after the optional
             # permutation above. Reinterpret the existing work buffers as a
             # pair tile, avoiding an additional large GPU allocation.
+            _t_rank_batched_start = _time.perf_counter()
             for group_name in ('j_only', 'rank_2x2'):
                 group_start, group_stop = batch_ranges[group_name]
                 if group_stop <= group_start:
@@ -930,11 +1038,82 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
                         out=compressed[p0:p1, :, k0:k1],
                     )
                     _layer_t['rank_batched_tiles'] += 1
+            _t_rank_batched += (
+                _time.perf_counter() - _t_rank_batched_start
+            )
 
-            _t_rank_batched += _time.perf_counter() - _t_cb
+            _t_slot_rank_start = _time.perf_counter()
+            for (
+                    output_group, rank1, rank2, j3c_12, j3c_21,
+                    factor1_l, factor2_l,
+                    factor2_r_scaled, factor1_r_scaled,
+            ) in slot_rank_2xr_data:
+                group_size = j3c_12.shape[0]
+                workspace_rank = max(rank1, rank2)
+                max_tile = max(
+                    1,
+                    min(
+                        group_size,
+                        nao * blksize // (workspace_rank * dk),
+                    ),
+                )
+                dm_tensor = ndarray((nao, nao, dk), buffer=buf2)
+                dm_tensor[:] = 0
+                for p0, p1 in lib.prange(0, group_size, max_tile):
+                    tile = p1 - p0
+                    tmp = ndarray(
+                        (tile, rank2, nao, dk), buffer=buf1,
+                    )
+                    contract(
+                        'brji,bqj->biqr',
+                        j3c_12[p0:p1, aux0:aux1],
+                        factor1_l[p0:p1],
+                        out=tmp,
+                    )
+                    contract(
+                        'biqr,bpi->pqr',
+                        tmp, factor2_r_scaled[p0:p1],
+                        1, 1, out=dm_tensor,
+                    )
+                    tmp = ndarray(
+                        (tile, rank1, nao, dk), buffer=buf1,
+                    )
+                    contract(
+                        'brji,bqj->biqr',
+                        j3c_21[p0:p1, aux0:aux1],
+                        factor2_l[p0:p1],
+                        out=tmp,
+                    )
+                    contract(
+                        'biqr,bpi->pqr',
+                        tmp, factor1_r_scaled[p0:p1],
+                        1, 1, out=dm_tensor,
+                    )
+                    _layer_t['slot_rank_2xr_tiles'] += 1
+                    if rank1 == 2 and rank2 == 2:
+                        _layer_t['slot_rank_2x2_tiles'] += 1
+                dm_tensor1 = ndarray((nao, nao, dk), buffer=buf1)
+                dm_tensor1[:] = dm_tensor.transpose(1, 0, 2)
+                dm_tensor1 += dm_tensor
+                pair_compressed = ndarray(
+                    (nao_pair, dk), buffer=buf2,
+                )
+                cp.take(
+                    dm_tensor1.reshape(-1, dk),
+                    pair_addresses,
+                    axis=0,
+                    out=pair_compressed,
+                )
+                compressed[output_group, :, k0:k1] += pair_compressed
+            _t_slot_rank_2xr += (
+                _time.perf_counter() - _t_slot_rank_start
+            )
+
             legacy_start, legacy_stop = batch_ranges['legacy']
             _t_legacy_start = _time.perf_counter()
             for i in range(legacy_start, legacy_stop):
+                if slot_rank_2xr_mask[i]:
+                    continue
                 profile_events = None
                 if compressed_profile:
                     start_event = cp.cuda.Event()
@@ -1028,13 +1207,18 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     t0 = log.timer_debug1('contract int3c2e_ejk_ip1', *t0)
     _layer_t['ejk_kernel'] = _time.perf_counter() - _t_ejk_kernel
     _layer_t['compressed_build'] = _t_compressed_build
-    _layer_t['rank_batched_build'] = _t_rank_batched
+    _layer_t['rank_batched_build'] = (
+        _t_rank_batched + _t_slot_rank_2xr
+    )
+    _layer_t['slot_rank_2xr_build'] = _t_slot_rank_2xr
     _layer_t['legacy_build'] = _t_legacy
     _layer_t['kern_call'] = _t_kern_call
     if compressed_profile:
         bucket_task_counts = {}
         legacy_start, legacy_stop = batch_ranges['legacy']
         for index in range(legacy_start, legacy_stop):
+            if slot_rank_2xr_mask[index]:
+                continue
             operator = 'J' if k_factor[index] == 0 else 'K'
             key = (
                 operator, dm1_noccs[index], dm2_noccs[index],

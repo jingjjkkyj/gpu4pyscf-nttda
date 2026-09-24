@@ -444,12 +444,103 @@ class KnownValues(unittest.TestCase):
         assert batched_stats[0]['rank_batched_2x2'] == 5
         assert batched_stats[0]['legacy_dm'] == 1
         assert batched_stats[0]['rank_batched_tiles'] > 0
+        assert legacy_stats[0]['int2c2e_input_dm'] == n_dm
+        assert legacy_stats[0]['int2c2e_kernel_dm'] == n_dm
         grouped_ref = np.zeros((3,) + ref.shape[1:], dtype=ref.dtype)
         np.add.at(grouped_ref, group_indices, ref)
         assert abs(grouped - grouped_ref).max() < 3e-10
         assert slot_stats[0]['output_backend'] == 'slot_aware'
         assert slot_stats[0]['input_dm'] == 9
         assert slot_stats[0]['kernel_dm'] == 3
+        assert slot_stats[0]['int2c2e_input_dm'] == n_dm
+        assert slot_stats[0]['int2c2e_kernel_dm'] == 3
+        assert slot_stats[0]['compressed_backend'] == 'legacy'
+        assert slot_stats[0]['effective_compressed_backend'] == 'slot_grouped'
+        assert slot_stats[0]['slot_rank_2x2_groups'] == 2
+        assert slot_stats[0]['slot_rank_2x2_tasks'] == 5
+        assert slot_stats[0]['slot_rank_2x2_tiles'] > 0
+        assert slot_stats[0]['slot_rank_2xr_groups'] == 2
+        assert slot_stats[0]['slot_rank_2xr_tasks'] == 5
+        assert slot_stats[0]['slot_rank_2xr_mixed_groups'] == 0
+        assert slot_stats[0]['slot_rank_2xr_mixed_tasks'] == 0
+        assert slot_stats[0]['slot_rank_2xr_tiles'] > 0
+        assert slot_stats[0]['legacy_dm'] == 4
+
+    def test_slot_rank_2xr_compressed_build(self):
+        cp.random.seed(21)
+        opt = int3c2e.Int3c2eOpt(mol, auxmol).build()
+        nao = opt.mol.nao
+        ranks = [
+            (2, 3), (2, 3),
+            (3, 2), (3, 2), (3, 2),
+            (2, 2), (2, 2),
+            (4, 4), (4, 4),
+            (2, 5),
+            (2, 3),
+        ]
+        dm_factors = [
+            (
+                cp.random.rand(nao, rank1) - .5,
+                cp.random.rand(nao, rank1) - .5,
+                cp.random.rand(nao, rank2) - .5,
+                cp.random.rand(nao, rank2) - .5,
+            )
+            for rank1, rank2 in ranks
+        ]
+        j_factor = [0.0] * (len(ranks) - 1) + [0.25]
+        k_factor = [
+            1.0, -0.5,
+            -1.0, 0.75, 0.5,
+            -0.25, 1.25,
+            0.4, -0.3,
+            0.6,
+            -0.8,
+        ]
+        group_indices = np.asarray(
+            [0, 0, 1, 1, 1, 2, 2, 2, 2, 0, 0],
+            dtype=np.int32,
+        )
+
+        stats = []
+        reference = _jk_energies_by_dm_factors(
+            opt, dm_factors, j_factor, k_factor,
+            sum_results=False, verbose=None,
+        )
+        grouped = _jk_energies_by_dm_factors(
+            opt, dm_factors, j_factor, k_factor,
+            sum_results=False, verbose=None, stats_sink=stats,
+            output_group_indices=group_indices,
+            output_group_count=3,
+        )
+
+        grouped_reference = np.zeros(
+            (3,) + reference.shape[1:], dtype=reference.dtype,
+        )
+        np.add.at(grouped_reference, group_indices, reference)
+        assert abs(grouped - grouped_reference).max() < 3e-10
+        assert stats[0]['slot_rank_2xr_groups'] == 3
+        assert stats[0]['slot_rank_2xr_tasks'] == 7
+        assert stats[0]['slot_rank_2xr_mixed_groups'] == 2
+        assert stats[0]['slot_rank_2xr_mixed_tasks'] == 5
+        assert stats[0]['slot_rank_2x2_groups'] == 1
+        assert stats[0]['slot_rank_2x2_tasks'] == 2
+        assert stats[0]['slot_rank_2xr_tiles'] > (
+            stats[0]['slot_rank_2x2_tiles']
+        )
+        assert stats[0]['legacy_dm'] == 4
+        assert {
+            (
+                item['output_group'],
+                item['rank_left'],
+                item['rank_right'],
+                item['task_count'],
+            )
+            for item in stats[0]['slot_rank_2xr_rank_buckets']
+        } == {
+            (0, 2, 3, 2),
+            (1, 3, 2, 3),
+            (2, 2, 2, 2),
+        }
 
     def test_shared_factor_contractions(self):
         cp.random.seed(19)

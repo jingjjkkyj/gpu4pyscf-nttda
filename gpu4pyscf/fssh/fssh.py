@@ -61,6 +61,17 @@ class PES:
     force: np.ndarray = None
     nacv: np.ndarray = None
 
+
+class HoppingProbabilityError(RuntimeError):
+    def __init__(self, total_probability):
+        self.total_probability = float(total_probability)
+        super().__init__(
+            "FSSH hopping probabilities sum to "
+            f"{self.total_probability:.8g} (> 1). Reduce the nuclear time step "
+            "or introduce electronic substeps."
+        )
+
+
 class FSSH:
     """
     This class implements the FSSH algorithm for nonadiabatic molecular dynamics simulations.
@@ -132,6 +143,7 @@ class FSSH:
         self.velocity = None
         self.coefficient = None
         self.cur_step = 0
+        self._last_electronic_substeps = 1
 
     @property
     def timestep_fs(self):
@@ -261,7 +273,8 @@ class FSSH:
 
     def update_coefficient(self, coeffs: np.ndarray,
                            energy: np.ndarray,
-                           nact: np.ndarray) -> np.ndarray:
+                           nact: np.ndarray,
+                           dt: Optional[float] = None) -> np.ndarray:
         """
         Update quantum coefficients using the effective Hamiltonian.
 
@@ -283,14 +296,17 @@ class FSSH:
         Veff = np.diag(energy) - 1j * nact
 
         # Propagate coefficients
-        c_new = self.exp_propagator(coeffs, Veff, self.dt)
+        c_new = self.exp_propagator(
+            coeffs, Veff, self.dt if dt is None else dt,
+        )
 
         return c_new
 
     def evaluate_hopping(self,
                          coeffs: np.ndarray,
                          nact: np.ndarray,
-                         cur_state: int) -> np.ndarray:
+                         cur_state: int,
+                         dt: Optional[float] = None) -> np.ndarray:
         '''
         Calculate surface hopping probabilities using Tully's formula and
         determine if a surface hop occurs.
@@ -304,7 +320,9 @@ class FSSH:
             int: Index of target state (-1 if no hop occurs, r falls in the
             "stay" probability region)
         '''
-        p_ij = self.compute_hopping_probability(coeffs, nact, cur_state)
+        p_ij = self.compute_hopping_probability(
+            coeffs, nact, cur_state, dt=dt,
+        )
         r = self.random_uniform()
         hop_index = self.check_hop(r, p_ij)
         logger.debug(self.mol, f"Switching probability: {p_ij}, Random number: {r}")
@@ -313,7 +331,8 @@ class FSSH:
     def compute_hopping_probability(self,
                                     coeffs: np.ndarray,
                                     nact: np.ndarray,
-                                    cur_state: int) -> np.ndarray:
+                                    cur_state: int,
+                                    dt: Optional[float] = None) -> np.ndarray:
         """
         Calculate surface hopping probabilities using Tully's formula.
 
@@ -344,9 +363,10 @@ class FSSH:
             )
 
         # Calculate hopping probabilities
+        electronic_dt = self.dt if dt is None else dt
         g_ij = (
             2 * (nact[state_idx] * c_i.conj() * coeffs).real
-            * self.dt / population
+            * electronic_dt / population
         )
 
         # Adjust hopping probabilities
@@ -357,15 +377,66 @@ class FSSH:
 
         total_probability = float(np.sum(p_ij))
         if total_probability > 1.0 + 1e-12:
-            raise RuntimeError(
-                "FSSH hopping probabilities sum to "
-                f"{total_probability:.8g} (> 1). Reduce the nuclear time step "
-                "or introduce electronic substeps."
-            )
+            raise HoppingProbabilityError(total_probability)
         if total_probability > 1.0:
             p_ij /= total_probability
 
         return p_ij
+
+    def _apply_hop(self, hop_index, cur_state, pes, position, velocity,
+                   step, log, electronic_substep=None):
+        cur_idx = self.states.index(cur_state)
+        if hop_index == -1 or hop_index == cur_idx:
+            return cur_state, velocity, False
+
+        hop_pes = None
+        if self.coupling_method in ('nac', 'direct'):
+            d_vec = pes.nacv[cur_idx, hop_index]
+        elif self.coupling_method in ('ktdc', 'curvature'):
+            hop_pes = self.evaluate_pes(
+                position, self.states[hop_index], with_nacv=False,
+            )
+            dVh = -hop_pes.force
+            dVc = -pes.force
+            d_vec = dVh - dVc
+
+        ke = 0.5 * np.einsum(
+            'm,mx,mx->', self.mass, velocity, velocity,
+        )
+        ediff = pes.energy[cur_idx] - pes.energy[hop_index]
+        log.debug(
+            f"Current kinetic energy: {ke:.8f} Ha "
+            f"energy difference: {ediff:.8f} Ha"
+        )
+
+        hop_allowed, velocity = self.rescale_velocity(
+            hop_index, cur_state, pes.energy, velocity, d_vec,
+        )
+        if not hop_allowed:
+            log.debug(
+                f"Hop to state {self.states[hop_index]} rejected "
+                "due to insufficient kinetic energy."
+            )
+            return cur_state, velocity, False
+
+        old_state = cur_state
+        cur_state = self.states[hop_index]
+        if hop_pes is None:
+            hop_pes = self.evaluate_pes(
+                position, cur_state, with_nacv=False,
+            )
+        # Keep the energies and NACs used for this frame, but use the
+        # target-state force for the second velocity half-step and next step.
+        pes.force = hop_pes.force
+        suffix = (
+            ""
+            if electronic_substep is None
+            else f", electronic substep {electronic_substep}"
+        )
+        log.info(
+            f"Hop: {old_state} → {cur_state} at step {step}{suffix}"
+        )
+        return cur_state, velocity, True
 
     def check_hop(self, r: float, p_ij: np.ndarray) -> int:
         """
@@ -727,52 +798,101 @@ class FSSH:
             else:
                 raise RuntimeError(f'TDC method {self.coupling_method} not supported')
 
-            # 4. update the electronic amplitude within a full-time step
-            coefficient = self.update_coefficient(coefficient, pes.energy, nact)
+            # 4-6. Propagate the electronic amplitudes, sample a hop, and
+            # rescale the nuclear velocity. Normal steps retain the original
+            # one-draw path. If its probability is not a valid distribution,
+            # repeat only this electronic propagation with smaller substeps.
+            coefficient_start = np.array(coefficient, copy=True)
+            self._last_electronic_substeps = 1
+            try:
+                coefficient = self.update_coefficient(
+                    coefficient, pes.energy, nact,
+                )
+                hop_index = self.evaluate_hopping(
+                    coefficient, nact, cur_state,
+                )
+                cur_state, velocity, hopped = self._apply_hop(
+                    hop_index, cur_state, pes, position, velocity,
+                    step, log,
+                )
+                if hopped and self.coupling_method in ('nac', 'direct'):
+                    nact = np.einsum(
+                        'ijnd,nd->ij', pes.nacv, velocity,
+                    )
+            except HoppingProbabilityError as error:
+                target_probability = 0.1
+                planned_substeps = max(
+                    2,
+                    int(np.ceil(
+                        error.total_probability / target_probability
+                    )),
+                )
+                if planned_substeps > 1000:
+                    raise RuntimeError(
+                        "Adaptive FSSH electronic propagation would require "
+                        f"{planned_substeps} substeps; reduce the nuclear "
+                        "time step."
+                    ) from error
+                coefficient = coefficient_start
+                pending_intervals = deque(
+                    [self.dt / planned_substeps] * planned_substeps
+                )
+                completed_substeps = 0
+                log.warn(
+                    "FSSH hopping probability %.8g exceeds one at step %d; "
+                    "retrying the electronic propagation with %d substeps",
+                    error.total_probability, step, planned_substeps,
+                )
+                while pending_intervals:
+                    electronic_dt = pending_intervals.popleft()
+                    candidate_coefficient = self.update_coefficient(
+                        np.array(coefficient, copy=True),
+                        pes.energy,
+                        nact,
+                        dt=electronic_dt,
+                    )
+                    try:
+                        hop_index = self.evaluate_hopping(
+                            candidate_coefficient,
+                            nact,
+                            cur_state,
+                            dt=electronic_dt,
+                        )
+                    except HoppingProbabilityError as substep_error:
+                        prospective_substeps = (
+                            completed_substeps + len(pending_intervals) + 2
+                        )
+                        if prospective_substeps > 1000:
+                            raise RuntimeError(
+                                "Adaptive FSSH electronic propagation "
+                                "exceeded 1000 substeps; reduce the nuclear "
+                                "time step."
+                            ) from substep_error
+                        first_half = 0.5 * electronic_dt
+                        pending_intervals.appendleft(
+                            electronic_dt - first_half
+                        )
+                        pending_intervals.appendleft(first_half)
+                        continue
 
-            # 5. evaluate the switching probability
-            hop_index = self.evaluate_hopping(coefficient, nact, cur_state)
-
-            # 6. adjust nuclear velocity
-            cur_idx = self.states.index(cur_state)
-            if hop_index != -1 and hop_index != cur_idx:
-                hop_pes = None
-
-                # Calculate d_vec for velocity rescaling
-                if self.coupling_method in ('nac', 'direct'):
-                    d_vec = pes.nacv[cur_idx, hop_index]
-                elif self.coupling_method in ('ktdc', 'curvature'):
-                    # For κTDC, we need to calculate the gradient difference
-                    hop_pes = self.evaluate_pes(
-                        position, self.states[hop_index], with_nacv=False)
-                    dVh = -hop_pes.force
-                    dVc = -pes.force
-                    d_vec = dVh - dVc
-
-                ke = 0.5 * np.einsum('m,mx,mx->', self.mass, velocity, velocity)
-                ediff = pes.energy[cur_idx] - pes.energy[hop_index]
-                log.debug(f"Current kinetic energy: {ke:.8f} Ha "
-                          f"energy difference: {ediff:.8f} Ha")
-
-                # Attempt velocity rescaling
-                hop_allowed, velocity = self.rescale_velocity(
-                    hop_index, cur_state, pes.energy, velocity, d_vec)
-
-                if hop_allowed:
-                    cur_state, old_state = self.states[hop_index], cur_state
-                    if hop_pes is None:
-                        hop_pes = self.evaluate_pes(
-                            position, cur_state, with_nacv=False)
-                    # Keep the energies and NACs used for this frame, but use
-                    # the target-state force for the second velocity half-step
-                    # and as the force carried into the next step.
-                    pes.force = hop_pes.force
-
-                    log.info(f"Hop: {old_state} → {cur_state} at step {step}")
-
-                else:
-                    log.debug(f"Hop to state {self.states[hop_index]} rejected "
-                              f"due to insufficient kinetic energy.")
+                    coefficient = candidate_coefficient
+                    completed_substeps += 1
+                    cur_state, velocity, hopped = self._apply_hop(
+                        hop_index, cur_state, pes, position, velocity,
+                        step, log,
+                        electronic_substep=completed_substeps,
+                    )
+                    if hopped and self.coupling_method in ('nac', 'direct'):
+                        nact = np.einsum(
+                            'ijnd,nd->ij', pes.nacv, velocity,
+                        )
+                self._last_electronic_substeps = completed_substeps
+                if completed_substeps != planned_substeps:
+                    log.warn(
+                        "Adaptive FSSH refined step %d from %d to %d "
+                        "electronic substeps",
+                        step, planned_substeps, completed_substeps,
+                    )
 
             # 7. update nuclear velocity within a half time step
             velocity = velocity + 0.5 * self.dt * pes.force / self.mass[:,None]

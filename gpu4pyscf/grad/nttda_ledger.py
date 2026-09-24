@@ -341,7 +341,6 @@ class DFLedgerBackend:
             j_factors = []
             k_factors = []
             slot_index = []
-            operator_index = []
             compression_started = time.perf_counter()
             for (operator, slot), (raw_pairs, raw_factors) in (
                     _expanded_slot_pair_groups(items).items()):
@@ -424,11 +423,9 @@ class DFLedgerBackend:
                 if operator == 'j':
                     j_factors.extend(selected_factors)
                     k_factors.extend((0.0,) * len(selected_gpu))
-                    operator_index.extend(('j',) * len(selected_gpu))
                 else:
                     j_factors.extend((0.0,) * len(selected_gpu))
                     k_factors.extend(selected_factors)
-                    operator_index.extend(('k',) * len(selected_gpu))
             self.stats['compression_seconds'] += (
                 time.perf_counter() - compression_started
             )
@@ -442,13 +439,12 @@ class DFLedgerBackend:
                 output_group_keys = []
                 output_group_lookup = {}
                 output_group_indices = []
-                for operator, slot in zip(operator_index, slot_index):
-                    key = (operator, slot)
-                    group = output_group_lookup.get(key)
+                for slot in slot_index:
+                    group = output_group_lookup.get(slot)
                     if group is None:
                         group = len(output_group_keys)
-                        output_group_lookup[key] = group
-                        output_group_keys.append(key)
+                        output_group_lookup[slot] = group
+                        output_group_keys.append(slot)
                     output_group_indices.append(group)
             energies = _df_jk_energies_per_atom(
                 opt, pairs,
@@ -469,7 +465,7 @@ class DFLedgerBackend:
             if output_group_keys is None:
                 energy_slots = slot_index
             else:
-                energy_slots = [slot for _operator, slot in output_group_keys]
+                energy_slots = output_group_keys
             self.stats['output_kernel_tasks'] += len(energy_slots)
             for row, slot in zip(energies, energy_slots):
                 gradients[slot] += row[atoms]

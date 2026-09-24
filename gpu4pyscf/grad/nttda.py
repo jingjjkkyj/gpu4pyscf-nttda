@@ -202,8 +202,9 @@ Grad = Gradients
 
 
 def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
-                  cphf_max_cycle=None, use_etfs=True, frame_cache=None):
-    '''One dynamics frame: gradient of the active state plus NAC pairs.
+                  cphf_max_cycle=None, use_etfs=True, frame_cache=None,
+                  gradient_states=None):
+    '''One dynamics frame: one or more state gradients plus NAC pairs.
 
     All geometry-fixed intermediates -- the spin-flip reference kernel,
     reference response closures, spin Fock pair, F0/Fz, and the J/K derivative
@@ -217,10 +218,13 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     ``frame_cache`` may be a forge ``ZVectorFrameCache`` owned by a dynamics
     driver.  It is updated only after every requested property succeeds.
 
-    Returns ``{'grad': (natm, 3), 'nac': {(i, j): (natm, 3)}}``.  NAC
-    entries are derivative couplings (the energy-scaled numerator divided
-    by the state gap); ``use_etfs=False`` includes the moving-CSF term,
-    while ``use_etfs=True`` retains the ETF/Hellmann--Feynman term.
+    ``gradient_states`` defaults to ``(active_state,)``.  When multiple
+    states are requested, ``active_state`` must be included and the return
+    value additionally contains ``'gradients': {state: (natm, 3)}``;
+    ``'grad'`` remains the active-state gradient for compatibility.  NAC
+    entries are derivative couplings (the energy-scaled numerator divided by
+    the state gap); ``use_etfs=False`` includes the moving-CSF term, while
+    ``use_etfs=True`` retains the ETF/Hellmann--Feynman term.
     '''
     if td.deltaS != -1:
         raise NotImplementedError(
@@ -241,6 +245,26 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
             'active_state must be in [1, %d]' % nstates,
         )
     active_state = int(active_state)
+    if gradient_states is None:
+        gradient_states = (active_state,)
+    else:
+        parsed_states = []
+        for state in gradient_states:
+            if (
+                    isinstance(state, (bool, np.bool_))
+                    or not isinstance(state, (int, np.integer))):
+                raise ValueError('gradient states must be integer root indices')
+            parsed_states.append(int(state))
+        gradient_states = tuple(parsed_states)
+        if len(set(gradient_states)) != len(gradient_states):
+            raise ValueError('gradient states must be unique')
+        if active_state not in gradient_states:
+            raise ValueError('gradient_states must include active_state')
+        if any(not 1 <= state <= nstates for state in gradient_states):
+            raise ValueError(
+                'gradient states must be in [1, %d]' % nstates,
+            )
+    active_gradient_index = gradient_states.index(active_state)
     parsed_pairs = []
     for pair in nac_pairs:
         if len(pair) != 2:
@@ -278,7 +302,7 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     )
     forge_response = importlib.import_module('pyscf.grad.nttda.response')
     atmlst = tuple(range(td.mol.natm))
-    task_keys = [('grad', active_state)]
+    task_keys = [('grad', state) for state in gradient_states]
     nac = None
     nac_gradient = None
     if nac_pairs:
@@ -293,14 +317,18 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
     driver_seconds = time.perf_counter() - driver_started
 
     xc_started = time.perf_counter()
-    grad_xc_terms = None
+    grad_xc_terms = [None] * len(gradient_states)
     nac_xc_terms = [None] * len(nac_pairs)
     if xctype in ('GGA', 'MGGA') and gpu_xc_backend is not None:
-        grad_channel, spaces, grad_pz = delta.gradient_xc_request(
-            grad.base, grad.base.xy[active_state - 1],
-        )
-        channels = [grad_channel]
-        pz_batch = [grad_pz]
+        gradient_requests = [
+            delta.gradient_xc_request(
+                grad.base, grad.base.xy[state - 1],
+            )
+            for state in gradient_states
+        ]
+        channels = [request[0] for request in gradient_requests]
+        spaces = gradient_requests[0][1]
+        pz_batch = [request[2] for request in gradient_requests]
         for state_i, state_j in nac_pairs:
             request = delta.cross_xc_request(
                 nac.base,
@@ -321,27 +349,31 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
         fockz_xc = fockz_builder(
             grad, grad.base, spaces, pz_batch, atmlst=atmlst,
         )
-        grad_xc_terms = (response_xc[0], fockz_xc[0])
+        for index in range(len(gradient_states)):
+            grad_xc_terms[index] = (response_xc[index], fockz_xc[index])
         for index in range(len(nac_pairs)):
-            offset = 1 + 2 * index
+            offset = len(gradient_states) + 2 * index
             nac_xc_terms[index] = (
                 response_xc[offset],
                 response_xc[offset + 1],
-                fockz_xc[index + 1],
+                fockz_xc[len(gradient_states) + index],
             )
     xc_seconds = time.perf_counter() - xc_started
 
     prepare_started = time.perf_counter()
-    prepared = [context.method.prepare_gradient(
-        grad,
-        grad.base,
-        grad.base.xy[active_state - 1],
-        atmlst=atmlst,
-        tolerance=cphf_conv_tol,
-        max_cycle=cphf_max_cycle,
-        cache=cache,
-        xc_terms=grad_xc_terms,
-    )]
+    prepared = [
+        context.method.prepare_gradient(
+            grad,
+            grad.base,
+            grad.base.xy[state - 1],
+            atmlst=atmlst,
+            tolerance=cphf_conv_tol,
+            max_cycle=cphf_max_cycle,
+            cache=cache,
+            xc_terms=grad_xc_terms[index],
+        )
+        for index, state in enumerate(gradient_states)
+    ]
     for index, (state_i, state_j) in enumerate(nac_pairs):
         task_keys.append(('nac', state_i, state_j, bool(use_etfs)))
         prepared.append(context.method.prepare_cross(
@@ -370,11 +402,12 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
             raise RuntimeError(
                 'selected-reference preparation changed canonical pair order'
             )
-        prepared[0] = replace(
-            prepared[0],
-            orbital_rhs_shift=reference_prepared.orbital_rhs_shift,
-            tolerance=min(float(cphf_conv_tol), 1e-12),
-        )
+        for index in range(len(gradient_states)):
+            prepared[index] = replace(
+                prepared[index],
+                orbital_rhs_shift=reference_prepared.orbital_rhs_shift,
+                tolerance=min(float(cphf_conv_tol), 1e-12),
+            )
     reference_prepare_seconds = time.perf_counter() - reference_started
 
     initial = None
@@ -396,7 +429,8 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
         ),
     )
     finish_seconds = time.perf_counter() - finish_started
-    grad.nttda_details = components[0]
+    gradient_components = components[:len(gradient_states)]
+    grad.nttda_details = gradient_components[active_gradient_index]
     nuclear_started = time.perf_counter()
     if reference_prepared is None:
         reference_gradient = np.asarray(grad.grad_nuc())
@@ -406,7 +440,9 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
         grad.reference_z_solver_diagnostics = {
             'converged': True,
             'fused': True,
-            'residual_max_abs': float(components[0].residual),
+            'residual_max_abs': max(
+                float(item.residual) for item in gradient_components
+            ),
             'solve_tolerance': min(float(cphf_conv_tol), 1e-12),
         }
         grad.reference_zb_backend = 'fused_nttda'
@@ -414,8 +450,13 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
             getattr(reference_driver, 'z_df_cache_stats', {}),
         )
         grad.reference_zb_skeleton_stats = {}
+    gradients = {
+        state: reference_gradient + item.total
+        for state, item in zip(gradient_states, gradient_components)
+    }
     result = {
-        'grad': reference_gradient + components[0].total,
+        'grad': gradients[active_state],
+        'gradients': gradients,
         'nac': {},
     }
     nuclear_seconds = (
@@ -448,16 +489,18 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
         stats = {
             'method_id': context.method.id,
             'active_state': active_state,
+            'gradient_states': gradient_states,
+            'gradient_count': len(gradient_states),
             'nac_pairs': len(nac_pairs),
             'zvector_batch_width': len(prepared),
             'zvector_cache_hits': int(np.count_nonzero(cache_hits)),
             'xc_type': xctype,
             'xc_response_channels': (
-                1 + 2 * len(nac_pairs)
+                len(gradient_states) + 2 * len(nac_pairs)
                 if gpu_xc_backend is not None else 0
             ),
             'xc_fockz_tasks': (
-                1 + len(nac_pairs)
+                len(gradient_states) + len(nac_pairs)
                 if gpu_xc_backend is not None else 0
             ),
             'timings': {
@@ -515,14 +558,15 @@ def compute_frame(td, active_state, nac_pairs=(), cphf_conv_tol=1e-10,
                 grad.base,
                 pairs,
                 task_keys,
-                np.asarray([components[0].zvector]),
+                np.asarray([item.zvector for item in components]),
             )
         record_stats()
         return result
 
     forge_nac = importlib.import_module('pyscf.nac.nttda')
     csf_started = time.perf_counter()
-    for (state_i, state_j), item in zip(nac_pairs, components[1:]):
+    for (state_i, state_j), item in zip(
+            nac_pairs, components[len(gradient_states):]):
         gap = float(nac.base.e[state_j - 1] - nac.base.e[state_i - 1])
         if abs(gap) < nac.gap_tol:
             raise ZeroDivisionError(
