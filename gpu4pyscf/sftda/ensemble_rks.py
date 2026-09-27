@@ -123,5 +123,9 @@ class EnsembleRKS(rks.RKS):
         utils.to_cpu(self, out=mf)
         return mf
 
+    def newton(self):
+        from gpu4pyscf.sftda.ensemble_soscf import newton
+        return newton(self)
+
 
 __all__ = ['EnsembleRKS']

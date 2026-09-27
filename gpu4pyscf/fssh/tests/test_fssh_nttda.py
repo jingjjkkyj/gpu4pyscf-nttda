@@ -8,6 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cupy as cp
 import h5py
@@ -300,11 +301,13 @@ class KnownValues(unittest.TestCase):
         values, vectors = np.linalg.eigh(overlap)
         return (vectors / np.sqrt(values)) @ vectors.T
 
-    def _mom_recovery_driver(self, normal, recovered=None):
+    def _mom_recovery_driver(
+            self, normal, recovered=None, state_ordering='overlap'):
         driver = FSSH_NTTDA(
             FakeNTTDA(self.mol),
             states=[1, 2],
             scf_mom_overlap_tol=0.5,
+            state_ordering=state_ordering,
         )
         previous_coeff = self._orthonormal_mos()
         driver._last_mf = types.SimpleNamespace(
@@ -385,6 +388,168 @@ class KnownValues(unittest.TestCase):
         self.assertFalse(
             driver.scf_mom_diagnostics['mom_scf_converged']
         )
+
+    def test_failed_ensemble_scf_uses_second_order_recovery(self):
+        coeff = self._orthonormal_mos()
+        normal = ScriptedSCF(self.mol, coeff, [2.0, 0.0], converged=False)
+        normal.is_ensemble_rks = True
+        recovered = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        recovered.kernel()
+        driver = self._mom_recovery_driver(normal)
+        with mock.patch.object(
+                driver, '_ensemble_newton_recovery', return_value=recovered):
+            result = driver._run_scf_with_mom_recovery(
+                self.mol, dm0=cp.eye(2),
+            )
+        self.assertIs(result, recovered)
+        self.assertFalse(driver.scf_mom_diagnostics['normal_scf_converged'])
+        self.assertTrue(driver.scf_mom_diagnostics['newton_scf_converged'])
+        self.assertFalse(driver.scf_mom_retry)
+
+    def test_second_order_recovery_keeps_occupation_continuity_guard(self):
+        coeff = self._orthonormal_mos()[:, [1, 0]]
+        normal = ScriptedSCF(self.mol, coeff, [2.0, 0.0], converged=False)
+        normal.is_ensemble_rks = True
+        other_branch = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        other_branch.kernel()
+        failed_mom = ScriptedSCF(self.mol, coeff, [2.0, 0.0], converged=False)
+        driver = self._mom_recovery_driver(normal, failed_mom)
+        with (
+                mock.patch.object(
+                    driver, '_ensemble_newton_recovery',
+                    return_value=other_branch,
+                ),
+                mock.patch.object(
+                    driver, '_ensemble_newton_continuation',
+                    return_value=(None, [{'accepted': False}]),
+                )):
+            with self.assertRaisesRegex(RuntimeError, 'MOM retry'):
+                driver._run_scf_with_mom_recovery(self.mol, dm0=cp.eye(2))
+        self.assertTrue(driver.scf_mom_retry)
+        self.assertTrue(driver.scf_mom_diagnostics['newton_scf_converged'])
+        self.assertFalse(
+            driver.scf_mom_diagnostics['newton_continuation_converged']
+        )
+
+    def test_second_order_continuation_can_restore_local_continuity(self):
+        coeff = self._orthonormal_mos()
+        exchanged = coeff[:, [1, 0]]
+        normal = ScriptedSCF(self.mol, coeff, [2.0, 0.0], converged=False)
+        normal.is_ensemble_rks = True
+        direct = ScriptedSCF(self.mol, exchanged, [2.0, 0.0])
+        direct.kernel()
+        continued = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        continued.kernel()
+        driver = self._mom_recovery_driver(normal)
+        path = [{'fraction': 1.0, 'accepted': True}]
+        with (
+                mock.patch.object(
+                    driver, '_ensemble_newton_recovery',
+                    return_value=direct,
+                ),
+                mock.patch.object(
+                    driver, '_ensemble_newton_continuation',
+                    return_value=(continued, path),
+                )):
+            result = driver._run_scf_with_mom_recovery(
+                self.mol, dm0=cp.eye(2),
+            )
+        self.assertIs(result, continued)
+        self.assertFalse(driver.scf_mom_retry)
+        self.assertTrue(
+            driver.scf_mom_diagnostics['continuity_via_substeps']
+        )
+        self.assertEqual(
+            driver.scf_mom_diagnostics['newton_continuation_path'], path,
+        )
+
+    def test_converged_ensemble_scf_can_use_continuation_before_mom(self):
+        coeff = self._orthonormal_mos()
+        exchanged = coeff[:, [1, 0]]
+        normal = ScriptedSCF(self.mol, exchanged, [2.0, 0.0])
+        normal.is_ensemble_rks = True
+        continued = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        continued.kernel()
+        driver = self._mom_recovery_driver(normal)
+        with mock.patch.object(
+                driver, '_ensemble_newton_continuation',
+                return_value=(continued, [{'fraction': 1.0, 'accepted': True}])):
+            result = driver._run_scf_with_mom_recovery(
+                self.mol, dm0=cp.eye(2),
+            )
+        self.assertIs(result, continued)
+        self.assertTrue(
+            driver.scf_mom_diagnostics['continuity_via_substeps']
+        )
+        self.assertFalse(driver.scf_mom_retry)
+
+    def test_energy_ordering_accepts_converged_branch_switch(self):
+        coeff = self._orthonormal_mos()[:, [1, 0]]
+        candidate = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        candidate.is_ensemble_rks = True
+        driver = self._mom_recovery_driver(
+            candidate, state_ordering='energy',
+        )
+        result = driver._run_scf_with_mom_recovery(
+            self.mol, dm0=cp.eye(2),
+        )
+        self.assertIs(result, candidate)
+        self.assertFalse(driver.scf_mom_retry)
+        self.assertTrue(
+            driver.scf_mom_diagnostics[
+                'adiabatic_branch_switch_accepted'
+            ]
+        )
+
+    def test_failed_direct_newton_can_use_continuation(self):
+        coeff = self._orthonormal_mos()
+        normal = ScriptedSCF(self.mol, coeff, [2.0, 0.0], converged=False)
+        normal.is_ensemble_rks = True
+        failed = ScriptedSCF(self.mol, coeff, [2.0, 0.0], converged=False)
+        failed.kernel()
+        continued = ScriptedSCF(self.mol, coeff, [2.0, 0.0])
+        continued.kernel()
+        driver = self._mom_recovery_driver(normal)
+        with (
+                mock.patch.object(
+                    driver, '_ensemble_newton_recovery',
+                    return_value=failed,
+                ),
+                mock.patch.object(
+                    driver, '_ensemble_newton_continuation',
+                    return_value=(continued, [{'fraction': 1.0, 'accepted': True}]),
+                )):
+            result = driver._run_scf_with_mom_recovery(
+                self.mol, dm0=cp.eye(2),
+            )
+        self.assertIs(result, continued)
+        self.assertFalse(
+            driver.scf_mom_diagnostics['newton_scf_converged']
+        )
+        self.assertTrue(
+            driver.scf_mom_diagnostics['newton_continuation_converged']
+        )
+
+    def test_second_order_recovery_accepts_rotation_without_exchange(self):
+        coeff = self._orthonormal_mos()
+        normal = ScriptedSCF(self.mol, coeff, [2.0, 0.0], converged=False)
+        normal.is_ensemble_rks = True
+        cosine = .77
+        sine = np.sqrt(1 - cosine**2)
+        rotated = coeff @ np.array([[cosine, -sine], [sine, cosine]])
+        candidate = ScriptedSCF(self.mol, rotated, [2.0, 0.0])
+        candidate.kernel()
+        driver = self._mom_recovery_driver(normal)
+        with mock.patch.object(
+                driver, '_ensemble_newton_recovery', return_value=candidate):
+            result = driver._run_scf_with_mom_recovery(
+                self.mol, dm0=cp.eye(2),
+            )
+        self.assertIs(result, candidate)
+        diagnostics = driver.scf_mom_diagnostics
+        self.assertEqual(diagnostics['changed_orbitals'], [])
+        self.assertAlmostEqual(diagnostics['minimum_class_singular_value'], .77)
+        self.assertFalse(diagnostics['retry_triggered'])
 
     def test_only_dfj_surface_is_rejected(self):
         td = FakeNTTDA(self.mol)

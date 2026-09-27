@@ -323,6 +323,10 @@ def _davidson_cc(h_op, g_op, precond, x0, tol=1e-10, xs=[], ax=[],
     heff = np.zeros((max_cycle+nx+1,max_cycle+nx+1), dtype=x0.dtype)
     ovlp = np.eye(max_cycle+nx+1, dtype=x0.dtype)
     if nx == 0:
+        # The seed can be the previous (nearly vanishing) orbital step.
+        # Normalize trial vectors so the overlap cutoff tests dependence,
+        # rather than discarding useful directions solely for their scale.
+        x0 = x0 / max(float(cp.linalg.norm(x0)), 1e-300)
         xs.append(x0)
         ax.append(h_op(x0))
     else:
@@ -372,6 +376,7 @@ def _davidson_cc(h_op, g_op, precond, x0, tol=1e-10, xs=[], ax=[],
         else:
             yield False, istep+1, w_t, xtrial, hx, dx, s0
             x0 = precond(dx, w_t)
+            x0 = x0 / max(float(cp.linalg.norm(x0)), 1e-300)
             xs.append(x0)
             ax.append(h_op(x0))
 

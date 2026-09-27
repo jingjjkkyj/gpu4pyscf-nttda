@@ -475,12 +475,14 @@ class FSSH_NTTDA(FSSH):
             mo_occ[closed] = 2
         return mo_occ
 
-    def _scf_occupation_continuity(self, mol, mf):
-        if self._last_mf is None:
+    def _scf_occupation_continuity(self, mol, mf, previous=None):
+        if previous is None:
+            previous = self._last_mf
+        if previous is None:
             return None, None
 
-        previous_coeff = cp.asarray(self._last_mf.mo_coeff)
-        previous_occ = cp.asarray(self._last_mf.mo_occ)
+        previous_coeff = cp.asarray(previous.mo_coeff)
+        previous_occ = cp.asarray(previous.mo_occ)
         current_coeff = cp.asarray(mf.mo_coeff)
         current_occ = cp.asarray(mf.mo_occ)
         if previous_occ.ndim != 1 or current_occ.ndim != 1:
@@ -497,7 +499,7 @@ class FSSH_NTTDA(FSSH):
             )
 
         s_cross = cp.asarray(gto.intor_cross(
-            'int1e_ovlp', self._last_mf.mol, mol,
+            'int1e_ovlp', previous.mol, mol,
         ))
         overlap = previous_coeff.conj().T @ s_cross @ current_coeff
         proposed_occ = self._mom_occupation(overlap, previous_occ)
@@ -557,20 +559,137 @@ class FSSH_NTTDA(FSSH):
         mf.get_occ = get_occ
         return mf
 
+    def _ensemble_newton_recovery(self, mol, failed=None, previous=None):
+        from gpu4pyscf.sftda.ensemble_soscf import project_orbitals
+
+        mf = self._new_scf(mol)
+        if previous is None:
+            previous = self._last_mf
+        if previous is None:
+            if failed is None:
+                raise RuntimeError(
+                    'second-order recovery requires an orbital guess'
+                )
+            coeff, occ = failed.mo_coeff, failed.mo_occ
+        else:
+            coeff = project_orbitals(mf, previous)
+            occ = cp.asarray(previous.mo_occ)
+        solver = mf.newton()
+        solver.max_cycle = min(mf.max_cycle, 50)
+        cycles = [0]
+
+        def count_cycles(env):
+            cycles[0] = int(env['imacro']) + 1
+
+        solver.callback = count_cycles
+        solver.kernel(coeff, occ)
+        for name in ('mo_coeff', 'mo_occ', 'mo_energy', 'e_tot', 'converged'):
+            setattr(mf, name, getattr(solver, name))
+        mf.cycles = cycles[0]
+        return mf
+
+    def _ensemble_newton_continuation(self, mol):
+        '''Transport a difficult reference through intermediate geometries.
+
+        Every accepted electronic substep uses the same occupation-continuity
+        predicate as a normal FSSH frame. This can follow a rapidly rotating
+        stationary solution without weakening the configured guard.
+        '''
+        previous = self._last_mf
+        if previous is None:
+            return None, []
+        origin = previous.mol.atom_coords()
+        target = mol.atom_coords()
+        fraction = 0.0
+        increment = 0.25
+        path = []
+        while fraction < 1.0:
+            next_fraction = min(1.0, fraction + increment)
+            bridge = mol.set_geom_(
+                origin + next_fraction * (target - origin),
+                unit='Bohr', inplace=False,
+            )
+            candidate = self._ensemble_newton_recovery(
+                bridge, previous=previous,
+            )
+            diagnostics, _ = self._scf_occupation_continuity(
+                bridge, candidate, previous=previous,
+            )
+            accepted = bool(
+                candidate.converged
+                and not (
+                    diagnostics['changed_orbitals']
+                    and diagnostics['minimum_class_singular_value']
+                    < self.scf_mom_overlap_tol
+                )
+            )
+            path.append({
+                'fraction': next_fraction,
+                'converged': bool(candidate.converged),
+                'minimum_class_singular_value': diagnostics[
+                    'minimum_class_singular_value'
+                ],
+                'changed_orbitals': diagnostics['changed_orbitals'],
+                'accepted': accepted,
+            })
+            if accepted:
+                previous = candidate
+                fraction = next_fraction
+                increment = min(0.25, increment * 1.5)
+            else:
+                increment *= 0.5
+                if increment < 1e-4:
+                    return None, path
+        return previous, path
+
     def _run_scf_with_mom_recovery(self, mol, dm0=None):
         self.scf_mom_retry = False
         self.scf_mom_diagnostics = None
 
         mf = self._new_scf(mol)
         mf.kernel(dm0=dm0) if dm0 is not None else mf.kernel()
+        normal_converged = bool(mf.converged)
+        normal_cycles = int(getattr(mf, 'cycles', 0))
+        ensemble_reference = bool(
+            getattr(mf, 'is_ensemble_rks', False)
+        )
+        newton_diagnostics = {}
+        if not mf.converged and ensemble_reference:
+            mf = self._ensemble_newton_recovery(mol, mf)
+            newton_diagnostics = {
+                'newton_scf_converged': bool(mf.converged),
+                'newton_scf_cycles': int(mf.cycles),
+            }
+            self.scf_mom_diagnostics = {
+                'normal_scf_converged': normal_converged,
+                'normal_scf_cycles': normal_cycles,
+                **newton_diagnostics,
+            }
         if not mf.converged:
+            if ensemble_reference:
+                continued, path = self._ensemble_newton_continuation(mol)
+                self.scf_mom_diagnostics.update({
+                    'newton_continuation_attempted': True,
+                    'newton_continuation_converged': continued is not None,
+                    'newton_continuation_path': path,
+                })
+                if continued is not None:
+                    endpoint, _ = self._scf_occupation_continuity(
+                        mol, continued,
+                    )
+                    endpoint.update(self.scf_mom_diagnostics)
+                    endpoint['continuity_via_substeps'] = True
+                    self.scf_mom_diagnostics = endpoint
+                    return continued
             raise RuntimeError('GPU ROKS SCF did not converge')
 
         diagnostics, s_cross = self._scf_occupation_continuity(mol, mf)
         if diagnostics is None:
             return mf
         diagnostics['overlap_tolerance'] = self.scf_mom_overlap_tol
-        diagnostics['normal_scf_cycles'] = int(getattr(mf, 'cycles', 0))
+        diagnostics['normal_scf_cycles'] = normal_cycles
+        diagnostics['normal_scf_converged'] = normal_converged
+        diagnostics.update(newton_diagnostics)
         retry = bool(
             diagnostics['changed_orbitals']
             and diagnostics['minimum_class_singular_value']
@@ -580,6 +699,36 @@ class FSSH_NTTDA(FSSH):
         self.scf_mom_diagnostics = diagnostics
         if not retry:
             return mf
+        if self.state_ordering == 'energy':
+            # Energy-ordered dynamics is adiabatic: orbital character may
+            # change at a reference-state crossing. Record the switch, but do
+            # not force the old diabatic occupation map back with MOM.
+            diagnostics['adiabatic_branch_switch_accepted'] = True
+            return mf
+        if ensemble_reference:
+            continued, path = self._ensemble_newton_continuation(mol)
+            diagnostics['newton_continuation_attempted'] = True
+            diagnostics['newton_continuation_path'] = path
+            diagnostics['newton_continuation_converged'] = (
+                continued is not None
+            )
+            if continued is not None:
+                endpoint, _ = self._scf_occupation_continuity(
+                    mol, continued,
+                )
+                endpoint.update({
+                    'overlap_tolerance': self.scf_mom_overlap_tol,
+                    'normal_scf_cycles': normal_cycles,
+                    'normal_scf_converged': normal_converged,
+                    **newton_diagnostics,
+                    'retry_triggered': True,
+                    'newton_continuation_attempted': True,
+                    'newton_continuation_converged': True,
+                    'newton_continuation_path': path,
+                    'continuity_via_substeps': True,
+                })
+                self.scf_mom_diagnostics = endpoint
+                return continued
 
         recovered = self._install_mom_occupation(
             self._new_scf(mol), s_cross,

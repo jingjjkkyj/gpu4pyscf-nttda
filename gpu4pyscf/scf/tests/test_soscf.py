@@ -47,6 +47,21 @@ def tearDownModule():
     del h2o_z0, h2o_z1
 
 class KnownValues(unittest.TestCase):
+    def test_augmented_hessian_is_invariant_to_small_seed_scale(self):
+        from gpu4pyscf.scf.soscf import _davidson_cc
+        diagonal = cp.asarray([.2, .8])
+        gradient = cp.asarray([1e-9, 1e-9])
+        expected = -gradient / diagonal
+        for scale in (1., 1e-5):
+            result = list(_davidson_cc(
+                lambda x: diagonal * x, lambda: gradient,
+                lambda x, e: x / (diagonal - e), gradient * scale,
+                tol=1e-24, max_cycle=2, verbose=0,
+            ))[-1]
+            self.assertLess(
+                float(cp.linalg.norm(result[3] - expected)), 1e-15,
+            )
+
     def test_nr_rhf(self):
         mf = scf.RHF(h2o_z0)
         mf.max_cycle = 1
