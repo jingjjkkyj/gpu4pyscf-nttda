@@ -578,7 +578,10 @@ void ejk_int3c2e_ip1_kernel(double *ejk, double *ejk_aux,
             int k0, dm_tensor;
             if (density_auxvec == NULL) {
                 int k0 = envs.ao_loc[ksh0] - nao - aux_offset + ksh - ksh0;
-                size_t pair_offset = ao_pair_loc[pair_ij];
+                // Padded lanes reuse the first shell pair above. Reuse its
+                // density offset too; pair_ij can exceed ao_pair_loc's end.
+                int valid_pair = pair_ij < shl_pair1 ? pair_ij : shl_pair0;
+                size_t pair_offset = ao_pair_loc[valid_pair];
                 dm_tensor = pair_offset * naux + k0;
             } else {
                 int i0 = envs.ao_loc[ish];
