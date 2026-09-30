@@ -23,10 +23,15 @@ from gpu4pyscf.scf.jk import _VHFOpt
 
 def _density_view_key(density):
     """Identity of one exact NumPy density view without hashing its values."""
-    density = np.asarray(density)
-    interface = density.__array_interface__
+    if isinstance(density, cp.ndarray):
+        interface = density.__cuda_array_interface__
+        location = 'device'
+    else:
+        density = np.asarray(density)
+        interface = density.__array_interface__
+        location = 'host'
     return (
-        interface['data'][0], density.shape, density.strides,
+        location, interface['data'][0], density.shape, density.strides,
         density.dtype.str,
     )
 
@@ -39,7 +44,7 @@ class _DensityCombination:
         self.matrix = matrix
 
     def __array__(self, dtype=None, copy=None):
-        matrix = np.asarray(self.matrix, dtype=dtype)
+        matrix = np.asarray(cp.asnumpy(self.matrix), dtype=dtype)
         return matrix.copy() if copy else matrix
 
 def _density_cache_key(value):
@@ -59,10 +64,10 @@ def _linear_combination(densities, coefficients):
     dtype = np.result_type(
         *(density.dtype for density in densities), coefficients.dtype,
     )
-    output = np.zeros(densities[0].shape, dtype=dtype)
+    output = cp.zeros(densities[0].shape, dtype=dtype)
     for coefficient, density in zip(coefficients, densities):
         if coefficient != 0.0:
-            output += coefficient * density
+            output += coefficient * cp.asarray(density)
     return _DensityCombination(densities, coefficients, output)
 
 def _compress_bilinear_pairs(pairs, factors):
@@ -79,8 +84,6 @@ def _compress_bilinear_pairs(pairs, factors):
     right_indices = {}
     pair_indices = []
     for left, right in pairs:
-        left = np.asarray(left)
-        right = np.asarray(right)
         left_key = _density_view_key(left)
         right_key = _density_view_key(right)
         if left_key not in left_indices:
@@ -131,7 +134,7 @@ def _compress_bilinear_pairs(pairs, factors):
     return compressed, np.ones(rank), details
 
 def _expanded_slot_pair_groups(items):
-    """Map forge J/K terms to bilinear pairs without mixing output slots."""
+    """Map J/K terms to bilinear pairs without mixing output slots."""
     groups = {}
     for operator, term in items:
         pairs, factors = groups.setdefault(
@@ -151,7 +154,7 @@ def _expanded_slot_pair_groups(items):
     return groups
 
 class DFLedgerBackend:
-    '''Density-fitted GPU evaluation of a CPU ``_JKDerivativeLedger``.
+    '''Density-fitted GPU evaluation of the native ``_JKDerivativeLedger``.
 
     Same term mapping as :class:`LedgerBackend` (the DF per-atom kernels
     implement the same pair-energy derivative semantics), evaluated with
@@ -159,16 +162,12 @@ class DFLedgerBackend:
     -- the result is the exact derivative of the DF energy surface.
     '''
 
-    def __init__(self, gmf, compress_slots=None):
+    def __init__(self, gmf, compress_slots=True):
         from gpu4pyscf.df.df_jk import _DFHF
 
         assert isinstance(gmf, _DFHF)
         self._gmf = gmf
         self._opt = {}
-        if compress_slots is None:
-            compress_slots = os.environ.get(
-                'NTTDA_COMPRESS_DF_LEDGER', '1',
-            ) != '0'
         self.compress_slots = bool(compress_slots)
         self.output_backend = _NTTDA_PARAMS['df_output_backend']
         self.stats = {
@@ -225,12 +224,12 @@ class DFLedgerBackend:
 
         atoms = list(atoms)
         shape = (len(atoms), 3)
-        gradients = {slot: np.zeros(shape) for slot in slots}
+        gradients = {slot: cp.zeros(shape) for slot in slots}
         groups = {}
         self.stats['calls'] += 1
         for operator in ('j', 'k'):
             for term in terms[operator]:
-                gradients.setdefault(term.slot, np.zeros(shape))
+                gradients.setdefault(term.slot, cp.zeros(shape))
                 groups.setdefault(float(term.omega or 0.0), []).append(
                     (operator, term),
                 )
@@ -247,7 +246,7 @@ class DFLedgerBackend:
             combination = (
                 value if isinstance(value, _DensityCombination) else None
             )
-            array = np.asarray(value)
+            array = cp.asarray(value.matrix if isinstance(value, _DensityCombination) else value)
             key = (_density_cache_key(value), bool(factorize))
             density = density_cache.get(key)
             if density is None:
@@ -456,7 +455,7 @@ class DFLedgerBackend:
                     else len(output_group_keys)
                 ),
             )
-            energies = cp.asnumpy(cp.asarray(energies))
+            energies = cp.asarray(energies)
             self.stats['integral_seconds'] += (
                 time.perf_counter() - integral_started
             )
@@ -472,7 +471,7 @@ class DFLedgerBackend:
         return gradients
 
 class LedgerBackend:
-    '''Batched GPU evaluation of a CPU ``_JKDerivativeLedger``.
+    '''Batched GPU evaluation of the native ``_JKDerivativeLedger``.
 
     Implements the seam ``nttda_jk_ledger_backend(terms, mol, atoms,
     slots)``: every term of every slot is pushed into one
@@ -503,12 +502,12 @@ class LedgerBackend:
     def __call__(self, terms, mol, atoms, slots=()):
         atoms = list(atoms)
         shape = (len(atoms), 3)
-        gradients = {slot: np.zeros(shape) for slot in slots}
+        gradients = {slot: cp.zeros(shape) for slot in slots}
         groups = {}
         self.stats['calls'] += 1
         for operator in ('j', 'k'):
             for term in terms[operator]:
-                gradients.setdefault(term.slot, np.zeros(shape))
+                gradients.setdefault(term.slot, cp.zeros(shape))
                 groups.setdefault(float(term.omega or 0.0), []).append(
                     (operator, term),
                 )
@@ -539,7 +538,7 @@ class LedgerBackend:
                 self._get_vhfopt(omega), pairs,
                 j_factor=j_factors, k_factor=k_factors, sum_results=False,
             )
-            energies = cp.asnumpy(cp.asarray(energies))
+            energies = cp.asarray(energies)
             for row, slot in zip(energies, slot_index):
                 gradients[slot] += row[atoms]
         return gradients

@@ -35,7 +35,6 @@ def noh_radical():
 class NTTDADFReferenceDispatchGPU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        nttda._import_forge()
         cls.mf = EnsembleROKS(noh_radical()).set(
             xc='B3LYP',
             conv_tol=1e-12,

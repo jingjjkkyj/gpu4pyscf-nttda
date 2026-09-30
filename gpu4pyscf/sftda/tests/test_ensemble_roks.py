@@ -7,7 +7,7 @@ and only changes the reference zero used by NTTDA total energies.  These tests
 pin the GPU fixed-orbital high-spin ROKS energy against the T02 CPU oracle
 (``-123.76580902817798`` Ha for NOH/STO-3G/B3LYP/grid-level-1), check that the
 reference evaluation never runs an SCF kernel, and verify that the DF wrapper,
-``to_cpu`` and ``build_cpu_twin`` preserve the new reference semantics.
+``to_cpu`` preserves the selected reference semantics.
 '''
 
 import unittest
@@ -19,7 +19,7 @@ from pyscf import gto
 from pyscf.sftda import EnsembleROKS as CPUEnsembleROKS
 
 from gpu4pyscf.dft import roks as gpu_roks
-from gpu4pyscf.grad.nttda import build_cpu_twin
+
 from gpu4pyscf.sftda import EnsembleROKS, NTTDA
 
 
@@ -191,20 +191,6 @@ class EnsembleROKSGPU(unittest.TestCase):
             'roks_energy_on_ensemble_rks_orbitals',
         )
 
-    def test_build_cpu_twin_selects_ensemble_roks(self):
-        mf = converged_ensemble_roks()
-        td = NTTDA(mf).set(
-            deltaS=-1, nstates=1, conv_tol=1e-8, max_cycle=200, verbose=0,
-        ).run()
-        twin = build_cpu_twin(td)
-        self.assertIsInstance(twin._scf, CPUEnsembleROKS)
-        self.assertEqual(
-            twin._scf.reference_energy_semantics,
-            'roks_energy_on_ensemble_rks_orbitals',
-        )
-        self.assertAlmostEqual(
-            twin._scf.reference_energy(), mf.reference_energy(), places=8,
-        )
 
 
 if __name__ == '__main__':

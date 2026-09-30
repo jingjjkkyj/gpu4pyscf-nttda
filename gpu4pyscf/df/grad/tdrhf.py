@@ -431,43 +431,6 @@ def _jk_energies_per_atom(int3c2e_opt, dm_pairs, j_factor=None, k_factor=None,
         return np.vstack(out)
 
 
-def _rank_batched_compressed_plan(dm_factors, k_factor):
-    """Group supported compressed-build tasks while preserving a fallback.
-
-    J-only tasks have no rank-dependent K contraction and can be processed in
-    one contiguous group.  The first experimental K group is restricted to
-    exact rank-(2,2) pairs.  Single-element groups stay on the legacy path so
-    batching never adds packing overhead without reducing launch count.
-    """
-    j_only = []
-    rank_2x2 = []
-    legacy = []
-    for index, (factors, kfac) in enumerate(zip(dm_factors, k_factor)):
-        rank1 = factors[0].shape[1]
-        rank2 = factors[2].shape[1]
-        if kfac == 0:
-            j_only.append(index)
-        elif rank1 == 2 and rank2 == 2:
-            rank_2x2.append(index)
-        else:
-            legacy.append(index)
-    if len(j_only) < 2:
-        legacy.extend(j_only)
-        j_only = []
-    if len(rank_2x2) < 2:
-        legacy.extend(rank_2x2)
-        rank_2x2 = []
-
-    permutation = j_only + rank_2x2 + legacy
-    start_2x2 = len(j_only)
-    ranges = {
-        'j_only': (0, len(j_only)),
-        'rank_2x2': (start_2x2, start_2x2 + len(rank_2x2)),
-        'legacy': (start_2x2 + len(rank_2x2), len(permutation)),
-    }
-    return permutation, ranges
-
-
 def _factor_contraction_groups(factors):
     """Group exact CuPy factor views for shared three-center contractions."""
     groups = {}
@@ -546,7 +509,7 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     log = logger.new_logger(mol, verbose)
     t0 = log.init_timer()
     _layer_t = {}  # per-split layer timing dict, appended to stats_sink
-    compressed_backend = _NTTDA_PARAMS['df_compressed_backend']
+    compressed_backend = 'legacy'
     if output_group_indices is not None:
         if sum_results:
             raise ValueError(
@@ -573,34 +536,11 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     compressed_profile = _NTTDA_PARAMS['df_compressed_profile']
     rank_bucket_events = {}
     derivative_kernel_events = []
-    original_order = None
     slot_rank_2xr_groups = ()
     slot_rank_2xr_mask = np.zeros(n_dm, dtype=bool)
-    batch_ranges = {
-        'j_only': (0, 0),
-        'rank_2x2': (0, 0),
-        'legacy': (0, n_dm),
-    }
-    if (
-            effective_compressed_backend == 'rank_batched'
-            and not sum_results and not slot_aware):
-        permutation, batch_ranges = _rank_batched_compressed_plan(
-            dm_factors, k_factor,
-        )
-        if permutation != list(range(n_dm)):
-            dm_factors = [dm_factors[index] for index in permutation]
-            if j_factor is not None:
-                j_factor = [j_factor[index] for index in permutation]
-            k_factor = [k_factor[index] for index in permutation]
-            if output_group_indices is not None:
-                output_group_indices = output_group_indices[permutation]
-            original_order = np.argsort(permutation)
-    elif slot_aware:
-        slot_rank_2xr_groups, slot_rank_2xr_mask = (
-            _slot_rank_batched_plan(
-                dm_factors, j_factor, k_factor, output_group_indices,
-            )
-        )
+    if slot_aware:
+        slot_rank_2xr_groups, slot_rank_2xr_mask = _slot_rank_batched_plan(
+            dm_factors, j_factor, k_factor, output_group_indices)
     _layer_t['compressed_backend'] = compressed_backend
     _layer_t['effective_compressed_backend'] = (
         effective_compressed_backend
@@ -611,16 +551,7 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
         int(output_group_count) if slot_aware else n_dm
     )
     _layer_t['compressed_profile'] = compressed_profile
-    _layer_t['rank_batched_j_only'] = (
-        batch_ranges['j_only'][1] - batch_ranges['j_only'][0]
-    )
-    _layer_t['rank_batched_2x2'] = (
-        batch_ranges['rank_2x2'][1] - batch_ranges['rank_2x2'][0]
-    )
-    _layer_t['rank_batched_tiles'] = 0
-    _layer_t['legacy_dm'] = (
-        batch_ranges['legacy'][1] - batch_ranges['legacy'][0]
-    )
+    _layer_t['legacy_dm'] = n_dm
     slot_rank_2x2_groups = [
         group for group in slot_rank_2xr_groups
         if group[1] == 2 and group[2] == 2
@@ -908,17 +839,6 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     #
     # Optimization (Task 5): K contractions are skipped when k_factor[i]==0
     # (J-only DMs).  This avoids 4 wasted cupy contract calls per J pair.
-    rank_2x2_data = None
-    rank_2x2_start, rank_2x2_stop = batch_ranges['rank_2x2']
-    if rank_2x2_stop > rank_2x2_start:
-        rank_2x2_data = (
-            cp.stack(j3c_o1o2[rank_2x2_start:rank_2x2_stop]),
-            cp.stack(j3c_o2o1[rank_2x2_start:rank_2x2_stop]),
-            cp.stack(dm1_factor_l[rank_2x2_start:rank_2x2_stop]),
-            cp.stack(dm1_factor_r[rank_2x2_start:rank_2x2_stop]),
-            cp.stack(dm2_factor_l[rank_2x2_start:rank_2x2_stop]),
-            cp.stack(dm2_factor_r[rank_2x2_start:rank_2x2_stop]),
-        )
     slot_rank_2xr_data = []
     for output_group, rank1, rank2, indices in slot_rank_2xr_groups:
         scale = cp.asarray(
@@ -934,7 +854,6 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             cp.stack([dm1_factor_r[index] for index in indices]) * scale,
         ))
     _t_compressed_build = 0.0
-    _t_rank_batched = 0.0
     _t_slot_rank_2xr = 0.0
     _t_legacy = 0.0
     _t_kern_call = 0.0
@@ -954,93 +873,6 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
             dk = k1 - k0
             aux0, aux1 = aux1, aux1 + dk
             _t_cb = _time.perf_counter()
-
-            # The two pre-planned groups are contiguous after the optional
-            # permutation above. Reinterpret the existing work buffers as a
-            # pair tile, avoiding an additional large GPU allocation.
-            _t_rank_batched_start = _time.perf_counter()
-            for group_name in ('j_only', 'rank_2x2'):
-                group_start, group_stop = batch_ranges[group_name]
-                if group_stop <= group_start:
-                    continue
-                max_tile = max(1, min(DM_BLOCK, blksize // dk))
-                for p0, p1 in lib.prange(group_start, group_stop, max_tile):
-                    tile = p1 - p0
-                    dm_tensor = ndarray(
-                        (tile, nao, nao, dk), buffer=buf2,
-                    )
-                    dm_tensor1 = ndarray(
-                        (tile, nao, nao, dk), buffer=buf1,
-                    )
-                    if j_factor is None:
-                        dm_tensor[:] = 0
-                    else:
-                        cp.multiply(
-                            dm1[p0:p1, :, :, None],
-                            auxvec2_jfac[
-                                p0:p1, None, None, aux0:aux1
-                            ],
-                            out=dm_tensor,
-                        )
-                        cp.multiply(
-                            dm2[p0:p1, :, :, None],
-                            auxvec1_jfac[
-                                p0:p1, None, None, aux0:aux1
-                            ],
-                            out=dm_tensor1,
-                        )
-                        dm_tensor += dm_tensor1
-
-                    if group_name == 'rank_2x2':
-                        local0 = p0 - rank_2x2_start
-                        local1 = p1 - rank_2x2_start
-                        (
-                            j3c_12, j3c_21,
-                            factor1_l, factor1_r,
-                            factor2_l, factor2_r,
-                        ) = rank_2x2_data
-                        scale = cp.asarray(
-                            k_factor[p0:p1], dtype=dm_tensor.dtype,
-                        )[:, None, None, None] * -.5
-
-                        tmp = contract(
-                            'brji,bqj->biqr',
-                            j3c_12[local0:local1, aux0:aux1],
-                            factor1_l[local0:local1],
-                        )
-                        contract(
-                            'biqr,bpi->bpqr',
-                            tmp, factor2_r[local0:local1],
-                            out=dm_tensor1,
-                        )
-                        cp.multiply(dm_tensor1, scale, out=dm_tensor1)
-                        dm_tensor += dm_tensor1
-
-                        tmp = contract(
-                            'brji,bqj->biqr',
-                            j3c_21[local0:local1, aux0:aux1],
-                            factor2_l[local0:local1],
-                        )
-                        contract(
-                            'biqr,bpi->bpqr',
-                            tmp, factor1_r[local0:local1],
-                            out=dm_tensor1,
-                        )
-                        cp.multiply(dm_tensor1, scale, out=dm_tensor1)
-                        dm_tensor += dm_tensor1
-
-                    dm_tensor1[:] = dm_tensor.transpose(0, 2, 1, 3)
-                    dm_tensor1 += dm_tensor
-                    cp.take(
-                        dm_tensor1.reshape(tile, -1, dk),
-                        pair_addresses,
-                        axis=1,
-                        out=compressed[p0:p1, :, k0:k1],
-                    )
-                    _layer_t['rank_batched_tiles'] += 1
-            _t_rank_batched += (
-                _time.perf_counter() - _t_rank_batched_start
-            )
 
             _t_slot_rank_start = _time.perf_counter()
             for (
@@ -1109,9 +941,8 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
                 _time.perf_counter() - _t_slot_rank_start
             )
 
-            legacy_start, legacy_stop = batch_ranges['legacy']
             _t_legacy_start = _time.perf_counter()
-            for i in range(legacy_start, legacy_stop):
+            for i in range(n_dm):
                 if slot_rank_2xr_mask[i]:
                     continue
                 profile_events = None
@@ -1202,21 +1033,15 @@ def _jk_energies_by_dm_factors(int3c2e_opt, dm_factors, j_factor, k_factor,
     ejk += ejk_aux
     ejk *= .5
     ejk = ejk.get()
-    if original_order is not None:
-        ejk = ejk[original_order]
     t0 = log.timer_debug1('contract int3c2e_ejk_ip1', *t0)
     _layer_t['ejk_kernel'] = _time.perf_counter() - _t_ejk_kernel
     _layer_t['compressed_build'] = _t_compressed_build
-    _layer_t['rank_batched_build'] = (
-        _t_rank_batched + _t_slot_rank_2xr
-    )
     _layer_t['slot_rank_2xr_build'] = _t_slot_rank_2xr
     _layer_t['legacy_build'] = _t_legacy
     _layer_t['kern_call'] = _t_kern_call
     if compressed_profile:
         bucket_task_counts = {}
-        legacy_start, legacy_stop = batch_ranges['legacy']
-        for index in range(legacy_start, legacy_stop):
+        for index in range(n_dm):
             if slot_rank_2xr_mask[index]:
                 continue
             operator = 'J' if k_factor[index] == 0 else 'K'

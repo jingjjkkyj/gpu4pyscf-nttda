@@ -38,16 +38,13 @@ import os
 import time
 
 from pyscf import lib
+from gpu4pyscf.sftda import nttda_methods as methods
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import contract, tag_array
 from gpu4pyscf.dft import numint as gpu_numint
 from gpu4pyscf.scf import jk as jk_mod
 from gpu4pyscf.tdscf._lr_eig import eigh as lr_eigh
 
-
-def _methods():
-    from gpu4pyscf.grad.nttda_bridge import import_methods
-    return import_methods()
 
 
 class _SynchronizedOperatorProfiler:
@@ -824,7 +821,7 @@ def gen_vind_sc(td):
         mf, fxc_ref=fxc_ref, hermi=0,
         use_mo_grid_fxc1=use_mo_grid_fxc1,
     )
-    fock0 = _methods().get_method(td).fock0(mf, xp=cp)
+    fock0 = methods.fock0(methods.get_method(td), mf, xp=cp)
     td._nttda_gpu_fxc_ref = fxc_ref
     td._nttda_gpu_fock0_fockz = (fock0, fockz)
 
@@ -1030,7 +1027,7 @@ def gen_vind_sfd(td, use_mo_grid_fxc0=True):
         use_mo_grid_fxc0=use_mo_grid_fxc0,
     )
 
-    fock0 = _methods().get_method(td).fock0(mf, xp=cp)
+    fock0 = methods.fock0(methods.get_method(td), mf, xp=cp)
     td._nttda_gpu_fxc_ref = fxc_ref
     td._nttda_gpu_fock0_fockz = (fock0, fockz)
 
@@ -1273,7 +1270,7 @@ class NTTDA(lib.StreamObject):
 
     @property
     def method_id(self):
-        return _methods().resolve_method(self).id
+        return methods.resolve_method(self).id
 
     def get_precond(self, hdiag):
         def precond(x, e, *args):
@@ -1301,7 +1298,7 @@ class NTTDA(lib.StreamObject):
         return x0
 
     def kernel(self, x0=None, nstates=None):
-        _methods().begin_solution(self)
+        methods.begin_solution(self)
         log = logger.new_logger(self)
         t0 = log.init_timer()
         if self.deltaS not in (-1, 0):
@@ -1467,7 +1464,7 @@ class NTTDA(lib.StreamObject):
             ),
         }
         log.timer('GPU NTTDA', *t0)
-        _methods().record_solution(self)
+        methods.record_solution(self)
         return self.e, self.xy
 
     def run(self, **kwargs):
@@ -1483,7 +1480,7 @@ class NTTDA(lib.StreamObject):
         ``reference_energy`` selector; every other mean field keeps the
         historical ``mf.e_tot`` zero.
         '''
-        return _methods().resolve_method(self).reference_energy(self._scf)
+        return methods.reference_energy(methods.resolve_method(self), self._scf)
 
     @property
     def e_tot(self):
@@ -1509,19 +1506,19 @@ class NTTDA(lib.StreamObject):
 
 def NTTDA_ROKS(mf):
     """Build the explicit GPU roks NTTDA method."""
-    return _methods().explicit_solver(NTTDA, mf, 'roks')
+    return methods.explicit_solver(NTTDA, mf, 'roks')
 
 
 def NTTDA_ROKS_NoBeta(mf):
     """Build the explicit GPU roks_nobeta NTTDA method."""
-    return _methods().explicit_solver(NTTDA, mf, 'roks_nobeta')
+    return methods.explicit_solver(NTTDA, mf, 'roks_nobeta')
 
 
 def NTTDA_EnsembleRKS(mf):
     """Build the explicit GPU ensemble_rks NTTDA method."""
-    return _methods().explicit_solver(NTTDA, mf, 'ensemble_rks')
+    return methods.explicit_solver(NTTDA, mf, 'ensemble_rks')
 
 
 def NTTDA_EnsembleROKS(mf):
     """Build the explicit GPU ensemble_roks NTTDA method."""
-    return _methods().explicit_solver(NTTDA, mf, 'ensemble_roks')
+    return methods.explicit_solver(NTTDA, mf, 'ensemble_roks')

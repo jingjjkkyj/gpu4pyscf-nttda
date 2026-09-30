@@ -50,10 +50,10 @@ def diagonalize(a, b, nroots=5):
                      [-b.conj(),-a.conj()]])
     e, xy = np.linalg.eig(np.asarray(h))
     sorted_indices = np.argsort(e)
-    
+
     e_sorted = e[sorted_indices]
     xy_sorted = xy[:, sorted_indices]
-    
+
     e_sorted_final = e_sorted[e_sorted > 1e-3]
     xy_sorted = xy_sorted[:, e_sorted > 1e-3]
     return e_sorted_final[:nroots], xy_sorted[:, :nroots]
@@ -65,10 +65,10 @@ def diagonalize_tda(a, nroots=5):
     a = a.reshape(nov, nov)
     e, xy = np.linalg.eig(np.asarray(a))
     sorted_indices = np.argsort(e)
-    
+
     e_sorted = e[sorted_indices]
     xy_sorted = xy[:, sorted_indices]
-    
+
     e_sorted_final = e_sorted[e_sorted > 1e-3]
     xy_sorted = xy_sorted[:, e_sorted > 1e-3]
     return e_sorted_final[:nroots], xy_sorted[:, :nroots]
@@ -94,7 +94,7 @@ def cal_analytic_gradient(mol, td, tdgrad, nocc, nvir, grad_elec, tda):
         y = xy_diag[nsize:,0]*np.sqrt(0.5/(norm_1**2-norm_2**2))
         x = x.reshape(nocc, nvir)
         y = y.reshape(nocc, nvir)
-    
+
         de_td = grad_elec(tdgrad, (x, y))
         gradient_ana = de_td + tdgrad.grad_nuc(atmlst=atmlst)
 
@@ -356,7 +356,7 @@ class KnownValues(unittest.TestCase):
             ejk = _jk_energies_per_atom(opt, dm, j_factor=None, k_factor=k_factor)
         assert abs(ejk - ref).max() < 1e-11
 
-    def test_rank_batched_compressed_build(self):
+    def test_slot_grouped_compressed_build(self):
         cp.random.seed(18)
         opt = int3c2e.Int3c2eOpt(mol, auxmol).build()
         nao = opt.mol.nao
@@ -374,17 +374,11 @@ class KnownValues(unittest.TestCase):
             0.0, 0.0, 1.0, -1.0, 0.5, -0.25, 0.0, 0.75, -0.5,
         ]
 
-        old_backend = df_tdrhf_grad._NTTDA_PARAMS[
-            'df_compressed_backend'
-        ]
         old_profile = df_tdrhf_grad._NTTDA_PARAMS[
             'df_compressed_profile'
         ]
         try:
             legacy_stats = []
-            df_tdrhf_grad._NTTDA_PARAMS[
-                'df_compressed_backend'
-            ] = 'legacy'
             df_tdrhf_grad._NTTDA_PARAMS[
                 'df_compressed_profile'
             ] = True
@@ -393,25 +387,10 @@ class KnownValues(unittest.TestCase):
                 sum_results=False, verbose=None, stats_sink=legacy_stats,
             )
 
-            batched_stats = []
-            df_tdrhf_grad._NTTDA_PARAMS[
-                'df_compressed_backend'
-            ] = 'rank_batched'
-            df_tdrhf_grad._NTTDA_PARAMS[
-                'df_compressed_profile'
-            ] = False
-            out = _jk_energies_by_dm_factors(
-                opt, dm_factors, j_factor, k_factor,
-                sum_results=False, verbose=None, stats_sink=batched_stats,
-            )
-
             group_indices = np.asarray(
                 [0, 0, 1, 1, 1, 2, 0, 2, 2], dtype=np.int32,
             )
             slot_stats = []
-            df_tdrhf_grad._NTTDA_PARAMS[
-                'df_compressed_backend'
-            ] = 'legacy'
             grouped = _jk_energies_by_dm_factors(
                 opt, dm_factors, j_factor, k_factor,
                 sum_results=False, verbose=None, stats_sink=slot_stats,
@@ -420,13 +399,9 @@ class KnownValues(unittest.TestCase):
             )
         finally:
             df_tdrhf_grad._NTTDA_PARAMS[
-                'df_compressed_backend'
-            ] = old_backend
-            df_tdrhf_grad._NTTDA_PARAMS[
                 'df_compressed_profile'
             ] = old_profile
 
-        assert abs(out - ref).max() < 3e-10
         assert legacy_stats[0]['compressed_profile']
         assert legacy_stats[0]['compressed_build_gpu_ms'] > 0
         assert legacy_stats[0]['derivative_kernel_gpu_ms'] > 0
@@ -439,11 +414,6 @@ class KnownValues(unittest.TestCase):
             )
             for item in legacy_stats[0]['rank_bucket_gpu']
         } == {('J', 2, 2, 3), ('K', 2, 2, 5), ('K', 3, 3, 1)}
-        assert batched_stats[0]['compressed_backend'] == 'rank_batched'
-        assert batched_stats[0]['rank_batched_j_only'] == 3
-        assert batched_stats[0]['rank_batched_2x2'] == 5
-        assert batched_stats[0]['legacy_dm'] == 1
-        assert batched_stats[0]['rank_batched_tiles'] > 0
         assert legacy_stats[0]['int2c2e_input_dm'] == n_dm
         assert legacy_stats[0]['int2c2e_kernel_dm'] == n_dm
         grouped_ref = np.zeros((3,) + ref.shape[1:], dtype=ref.dtype)
@@ -454,7 +424,6 @@ class KnownValues(unittest.TestCase):
         assert slot_stats[0]['kernel_dm'] == 3
         assert slot_stats[0]['int2c2e_input_dm'] == n_dm
         assert slot_stats[0]['int2c2e_kernel_dm'] == 3
-        assert slot_stats[0]['compressed_backend'] == 'legacy'
         assert slot_stats[0]['effective_compressed_backend'] == 'slot_grouped'
         assert slot_stats[0]['slot_rank_2x2_groups'] == 2
         assert slot_stats[0]['slot_rank_2x2_tasks'] == 5

@@ -591,6 +591,10 @@ class ReferenceGradients(lib.StreamObject):
             max_memory=self.max_memory,
             with_nlc=False,
         )
+        if charge_mf._numint._xc_type(charge_mf.xc) == 'HF':
+            def charge_response(density):
+                coulomb, exchange = charge_mf.get_jk(mol, density, hermi=1)
+                return coulomb - .5 * exchange
 
         self._build_selected_intermediates(space, c0=c0, hcore=hcore)
         self._charge_mf = charge_mf
@@ -928,7 +932,7 @@ class ReferenceGradients(lib.StreamObject):
             self._charge_mf.xc, spin=mol.spin,
         )
         started = time.perf_counter()
-        from pyscf.grad.nttda.derivative_jk import _JKDerivativeLedger
+        from gpu4pyscf.grad._nttda.derivative_jk import _JKDerivativeLedger
         from gpu4pyscf.grad.nttda_ledger import DFLedgerBackend
 
         jk_ledger = _JKDerivativeLedger()
@@ -950,6 +954,7 @@ class ReferenceGradients(lib.StreamObject):
         jk = DFLedgerBackend(self._charge_mf)(
             jk_ledger._terms, mol, atoms, slots=('jk',),
         )['jk']
+        jk = cp.asnumpy(cp.asarray(jk))
         result += jk
         components['df_jk'] = jk
         cp.cuda.get_current_stream().synchronize()
@@ -970,6 +975,7 @@ class ReferenceGradients(lib.StreamObject):
                 spin_density, spin_density, spin_probe, spin_probe,
                 atmlst=atoms,
             )
+            xc = cp.asnumpy(cp.asarray(xc))
             result += xc
             components['xc'] = xc
             cp.cuda.get_current_stream().synchronize()

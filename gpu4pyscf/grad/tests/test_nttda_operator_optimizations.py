@@ -11,8 +11,8 @@ from pyscf import gto
 from gpu4pyscf.dft.roks import ROKS
 from gpu4pyscf.sftda import EnsembleRKS, EnsembleROKS, NTTDA
 from gpu4pyscf.sftda.nttda import _transition_density, gen_vind_sfd
-from gpu4pyscf.grad.nttda_context import (
-    EvaluationContext, make_gpu_response_cache,
+from gpu4pyscf.grad._nttda.response import (
+    ResponseCache,
 )
 
 
@@ -126,50 +126,44 @@ def test_direct_mo_xc_full_operator_matches_ao_path():
 @pytest.mark.parametrize('kind', [EnsembleRKS, EnsembleROKS])
 @pytest.mark.parametrize('df', [False, True])
 def test_ensemble_fock_cache_matches_cpu_and_hessian(kind, df):
-    from pyscf.grad.nttda import ensemble
+    from gpu4pyscf.grad._nttda import orbital as ensemble
 
     td = NTTDA(make_reference(kind, df=df))
     td.set(nstates=3, conv_tol=1e-10, max_cycle=200).run()
     assert np.all(td.converged)
-    with mock.patch.dict(os.environ, {'NTTDA_ENSEMBLE_FOCK_CACHE': '1'}):
-        context = EvaluationContext(td)
-        cache = context.response_cache
-    with mock.patch.dict(os.environ, {'NTTDA_ENSEMBLE_FOCK_CACHE': '0'}):
-        legacy = context.fresh_response_cache()
-    assert 'ensemble_fock_mo' not in legacy.extra
-    expected = ensemble._fock_mo(context.cpu_td._scf, legacy)
+    context = ResponseCache(td)
+    cache = context
+    legacy = ResponseCache(td)
+    legacy.extra.pop('ensemble_fock_mo', None)
+    expected = ensemble._fock_mo(td._scf, legacy)
     assert cache.stats['ensemble_fock_cache_hits'] == 1
-    np.testing.assert_allclose(cache.extra['ensemble_fock_mo'], expected, atol=2e-10, rtol=0)
-    old_action, pairs = ensemble.make_hessian_transpose_action(context.cpu_td, cache=legacy)
-    with mock.patch.object(context.cpu_td._scf, 'get_fock',
+    np.testing.assert_allclose(cp.asnumpy(cache.extra['ensemble_fock_mo']), cp.asnumpy(expected), atol=2e-10, rtol=0)
+    old_action, pairs = ensemble.make_hessian_transpose_action(td, cache=legacy)
+    with mock.patch.object(td._scf, 'get_fock',
                            side_effect=AssertionError('unexpected Fock rebuild')):
-        action, new_pairs = ensemble.make_hessian_transpose_action(context.cpu_td, cache=cache)
+        action, new_pairs = ensemble.make_hessian_transpose_action(td, cache=cache)
         assert new_pairs == pairs
         rng = np.random.default_rng(46)
         for shape in ((len(pairs),), (3, len(pairs))):
             vectors = rng.normal(size=shape)
-            np.testing.assert_allclose(action(vectors), old_action(vectors), atol=2e-9, rtol=0)
-    other = EvaluationContext(td).response_cache
-    assert not np.shares_memory(cache.extra['ensemble_fock_mo'], other.extra['ensemble_fock_mo'])
+            np.testing.assert_allclose(cp.asnumpy(action(vectors)), cp.asnumpy(old_action(vectors)), atol=2e-9, rtol=0)
+    other = ResponseCache(td)
+    assert not cp.shares_memory(cache.extra['ensemble_fock_mo'], other.extra['ensemble_fock_mo'])
     td.xy = list(td.xy)
     with pytest.raises(ValueError, match='create a new derivative driver'):
         context.validate()
 
 
-def test_missing_gpu_fock_keeps_cpu_fallback_and_roks_is_unchanged():
-    from gpu4pyscf.grad.nttda_bridge import build_cpu_twin
-
-    for kind in (ROKS, EnsembleRKS):
-        td = NTTDA(make_reference(kind))
-        td.set(nstates=3, conv_tol=1e-10, max_cycle=200).run()
-        cpu_td = build_cpu_twin(td)
-        if kind is ROKS:
-            cache = make_gpu_response_cache(cpu_td, td._scf, xc_backend=None)
-            assert 'ensemble_fock_mo' not in cache.extra
-        else:
-            del cpu_td._nttda_gpu_fock0_fockz
-            cache = make_gpu_response_cache(cpu_td, td._scf, xc_backend=None)
-            assert 'ensemble_fock_mo' not in cache.extra
+def test_missing_fock_is_built_on_the_gpu():
+    from gpu4pyscf.grad._nttda import orbital as ensemble
+    td = NTTDA(make_reference(EnsembleRKS))
+    td.set(nstates=3, conv_tol=1e-10, max_cycle=200).run()
+    del td._nttda_gpu_fock0_fockz
+    cache = ResponseCache(td)
+    assert 'ensemble_fock_mo' not in cache.extra
+    expected = td._scf.mo_coeff.T @ td._scf.get_fock() @ td._scf.mo_coeff
+    actual = ensemble._fock_mo(td._scf, cache)
+    np.testing.assert_allclose(cp.asnumpy(actual), cp.asnumpy(expected), atol=2e-10, rtol=0)
 
 
 def test_unknown_exchange_backend_is_rejected():

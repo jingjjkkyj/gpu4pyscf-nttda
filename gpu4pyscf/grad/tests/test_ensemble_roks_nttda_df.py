@@ -10,7 +10,7 @@ import pytest
 from unittest import mock
 
 from pyscf import gto
-from gpu4pyscf.grad.nttda import _import_forge, build_cpu_twin, compute_frame
+from gpu4pyscf.grad.nttda import compute_frame
 from gpu4pyscf.grad.ensemble_roks import ReferenceGradients
 from gpu4pyscf.sftda import EnsembleROKS, NTTDA
 
@@ -75,7 +75,6 @@ def test_df_reference_gradient_before_public_dispatch():
 
 
 def test_compute_frame_fuses_selected_reference_zvector():
-    _import_forge()
     td = make_td(make_reference())
     separate = td.Gradients().set(
         cphf_conv_tol=1e-11, verbose=0,
@@ -101,7 +100,6 @@ def test_compute_frame_fuses_selected_reference_zvector():
 
 
 def test_compute_frame_batches_multiple_gradients_and_nac():
-    _import_forge()
     td = make_td(make_reference())
     gradients = {
         state: td.Gradients().set(
@@ -154,7 +152,6 @@ def test_compute_frame_batches_multiple_gradients_and_nac():
 @pytest.mark.parametrize('delta_s', [-1, 0])
 @pytest.mark.parametrize('xc', ['PBE', 'B3LYP', 'M06-2X', 'CAM-B3LYP'])
 def test_df_total_gradient_matches_selected_energy(xc, delta_s):
-    _import_forge()
     mf = make_reference(xc)
     td = make_td(mf, delta_s)
     gradient = td.Gradients().set(cphf_conv_tol=1e-11, verbose=0)
@@ -175,17 +172,16 @@ def test_df_total_gradient_matches_selected_energy(xc, delta_s):
 
 
 def test_df_nac_wavefunction_difference_and_joint_frame():
-    _import_forge()
-    from pyscf.nac.nttda import _align_displaced_roots, awf_overlap
+    from gpu4pyscf.nac.nttda import _align_displaced_roots, awf_overlap
 
     mf = make_reference()
     td = make_td(mf)
-    original = build_cpu_twin(td)
+    original = td
     step = 3e-4
     numerical = []
     for plus, minus in displaced_points(mf, step=step):
-        plus_td = build_cpu_twin(make_td(plus))
-        minus_td = build_cpu_twin(make_td(minus))
+        plus_td = make_td(plus)
+        minus_td = make_td(minus)
         for point in (plus_td, minus_td):
             _align_displaced_roots(original, point, 0.8, required=(0, 1))
         forward = awf_overlap(minus_td, minus_td.xy[0], plus_td, plus_td.xy[1])
@@ -224,7 +220,6 @@ def test_df_nac_wavefunction_difference_and_joint_frame():
 
 
 def test_public_finite_differences_preserve_df_reference():
-    _import_forge()
     td = make_td(make_reference())
     gradient = td.Gradients().set(fixed_grid=True, cphf_conv_tol=1e-11, verbose=0)
     analytic = gradient.kernel(state=1, atmlst=[1])

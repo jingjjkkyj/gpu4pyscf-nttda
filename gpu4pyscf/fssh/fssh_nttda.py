@@ -43,11 +43,10 @@ from pyscf import gto
 
 from gpu4pyscf.fssh.fssh import FSSH, PES
 from gpu4pyscf.grad.nttda import (
-    _validate_supported_reference,
     compute_frame,
     make_frame_cache,
-    rebuild_reference,
 )
+from gpu4pyscf.grad._nttda.reference import _validate_supported_reference, rebuild_reference
 from gpu4pyscf.grad.nttda_params import PARAMS as _NTTDA_PARAMS
 from gpu4pyscf.sftda.nttda import NTTDA
 
@@ -209,7 +208,7 @@ class FSSH_NTTDA(FSSH):
         return mf
 
     def _new_td(self, mf):
-        from pyscf.sftda import nttda_methods as methods
+        from gpu4pyscf.sftda import nttda_methods as methods
 
         td = NTTDA(mf)
         for name in ('deltaS', 'nobeta', 'lindep', 'max_cycle', 'max_memory'):
@@ -272,7 +271,7 @@ class FSSH_NTTDA(FSSH):
         return Path(str(trajectory) + '.checkpoint.pkl')
 
     def _checkpoint_signature(self):
-        from pyscf.sftda import nttda_methods as methods
+        from gpu4pyscf.sftda import nttda_methods as methods
 
         mf = self.tddft._scf
         mol = mf.mol
@@ -312,8 +311,8 @@ class FSSH_NTTDA(FSSH):
             'signature': cache._signature,
             'entries': {
                 key: (
-                    np.array(alpha, copy=True),
-                    np.array(beta, copy=True),
+                    _asnumpy(alpha).copy(),
+                    _asnumpy(beta).copy(),
                 )
                 for key, (alpha, beta) in cache._entries.items()
             },
@@ -1076,8 +1075,8 @@ class FSSH_NTTDA(FSSH):
         cache._signature = cache_payload['signature']
         cache._entries = {
             key: (
-                np.array(alpha, copy=True),
-                np.array(beta, copy=True),
+                cp.array(alpha, copy=True),
+                cp.array(beta, copy=True),
             )
             for key, (alpha, beta) in cache_payload['entries'].items()
         }

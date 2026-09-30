@@ -1,16 +1,13 @@
-# GPU NTTDA method interfaces
+# GPU NTTDA gradients and nonadiabatic couplings
 
-The GPU constructors `NTTDA_ROKS`, `NTTDA_ROKS_NoBeta`, `NTTDA_EnsembleRKS`, and
-`NTTDA_EnsembleROKS` are exported by `gpu4pyscf.sftda`. They use the method
-definitions in the matching CPU forge checkout; set `NTTDA_FORGE_PATH` to that
-checkout. Legacy `NTTDA(mf).set(nobeta=...)` calls remain supported.
+## Installation and entry points
 
-See the companion CPU checkout's `docs/nttda_methods.md` for method semantics,
-interface compatibility and the shared-layer contract. Ensemble `nobeta`
-does not change either the selected method or its execution policy.
-
-The [validation record](../../pyscf-forge-nttda-opt/docs/nttda_methods_validation.md)
-documents the CPU and GPU regression groups and the original/new comparison.
+Install this checkout with its normal GPU4PySCF dependencies and standard PySCF.
+The GPU solver, gradients, NAC and FSSH do not import the customized pyscf-forge
+checkout. `NTTDA_FORGE_PATH` is no longer used. CPU/GPU numerical comparison tests
+add forge as a test-only dependency. Explicit `EnsembleRKS.to_cpu()` and
+`EnsembleROKS.to_cpu()` still require forge because standard PySCF has no matching
+CPU classes; ordinary GPU calculations never call these conversions.
 
 ```python
 from pyscf import gto
@@ -20,55 +17,69 @@ from gpu4pyscf.grad.nttda import compute_frame, make_frame_cache
 mol = gto.M(atom='C 0 0 0; H 0 .8 .6; H 0 -.9 .5', basis='sto-3g', spin=2)
 mf = EnsembleROKS(mol, xc='PBE').density_fit().run()
 td = NTTDA_EnsembleROKS(mf).set(deltaS=-1, nstates=3).run()
-guesses = make_frame_cache()
-frame = compute_frame(td, active_state=1, nac_pairs=[(1, 2)], frame_cache=guesses)
+grad = td.Gradients().kernel(state=1)
+nac = td.NAC().kernel(state_I=1, state_J=2, ediff=True, use_etfs=False)
+frame = compute_frame(td, active_state=1, nac_pairs=[(1, 2)],
+                      frame_cache=make_frame_cache())
 ```
 
-`compute_frame` retains its return structure, state numbering and ETF/gap
-conventions. Its statistics include `method_id`. All tasks in a frame use one
-CPU twin and the same response and ledger backends. Independent gradient or NAC
-calls get fresh response state. Create a new derivative driver after changing
-the source electronic solution.
+`NTTDA_ROKS`, `NTTDA_ROKS_NoBeta`, `NTTDA_EnsembleRKS` and
+`NTTDA_EnsembleROKS` remain available. Legacy `NTTDA(mf).set(nobeta=...)` remains
+supported. States are one-based; gradient state 0 selects the reference.
+Gradients support `deltaS=-1,0`; NAC and joint frames support `deltaS=-1`.
+With `gap = omega_J - omega_I`, full NAC is `N_HF/gap + d_CSF`.
+`use_etfs=True` omits `d_CSF`; `ediff=False` returns the energy-scaled result.
 
-The GPU modules separate these responsibilities:
+## Code map and ownership
 
-- `grad/nttda.py`: public gradient driver and joint-frame orchestration.
-- `grad/nttda_bridge.py`: forge loading/verification, CPU twins, reference
-  reconstruction and J/K routing.
-- `grad/nttda_context.py`: fixed-evaluation ownership and GPU response factories.
-- `grad/nttda_ledger.py`: exact/DF derivative integrals and DF compression.
-- `grad/nttda_xc.py`: GGA/MGGA contractions with the existing AO residency policy.
-- `grad/nttda_ao_reduce.py`: independent tiled AO-center contractions.
-- `df/grad/ensemble_roks.py`: the selected-reference fractional-occupation DF
-  Fock skeleton, including auxiliary-basis response.
+| Owner | Responsibility |
+|---|---|
+| `sftda/nttda_methods.py` | Four immutable physical identities and ordinary function dispatch |
+| `grad/nttda.py` | Static GPU `Gradients` class, validation and public results |
+| `nac/nttda.py` | Interstate numerator, moving-CSF term and overlap reference |
+| `grad/_nttda/delta_s_minus_one.py`, `delta_s_zero.py` | Channel algebra and explicit prepared derivative data |
+| `grad/_nttda/orbital.py` | ROKS and ensemble orbital Hessians, spin weights and adjoints |
+| `grad/_nttda/response.py` | One evaluation cache, strict GMRES and final contraction |
+| `grad/_nttda/frame.py` | Joint-frame scheduling, reference fusion and cross-frame initial guesses |
+| `grad/_nttda/derivative_jk.py`, `grad/nttda_ledger.py` | Derivative terms and GPU conventional/DF integral evaluation |
+| `grad/nttda_xc.py`, `nttda_ao_reduce.py`, `nttda_xc_fused.py` | GPU quadrature and fused AO-center contractions |
+| `grad/_nttda/xc.py`, `xc_host.py` | Explicit XC transfer boundary and locally owned fallback quadrature |
 
-Existing backend choices, SVD thresholds and DF auxiliary response are retained.
-ROKS NoBeta MGGA still uses the CPU XC path. The GPU numerical tests require an
-accessible CUDA device, including the four-method matrix in
-`gpu4pyscf/grad/tests/test_nttda_methods.py`. A sandbox without device access is
-not evidence that the host CUDA installation is unavailable.
+The former forge loader, bytecode checks, path changes, CPU twins and dynamically
+created gradient subclass have been removed. Production AO/MO arrays stay on the
+GPU. Public gradient/NAC results are NumPy arrays. Small SciPy GMRES vectors and
+AWF combinatorics run on the host. LDA and NoBeta MGGA retain bounded host XC
+quadrature using standard PySCF NumInt; standalone post-Z contractions can also
+use this local quadrature. No host fallback creates a CPU SCF or NTTDA solver.
 
-## Exact operator optimizations
+A prepared derivative contains its M matrix, direct terms, probes and J/K ledger.
+It contains no function callbacks. ROKS and ensemble Hessians retain their distinct
+spin/occupation factors. The selected EnsembleROKS reference contribution is
+nonstationary; `compute_frame` folds its RHS shift into the state-gradient solve
+and retains the stricter `min(cphf_conv_tol, 1e-12)` target.
 
-`NTTDA_DF_EXCHANGE_BACKEND=factorized` (default) preserves exact orbital
-factors of the directed CO/CV/OO/OV transition densities for real,
-hybrid, density-fitted `deltaS=-1` calculations. It uses the existing DF
-factorized exchange implementation without SVD or rank truncation. Coulomb
-and XC responses keep the dense densities. Range-separated exchange retains
-its per-omega DF integrals. Non-DF, `only_dfj`, complex inputs and `deltaS=0`
-retain the dense exchange path. Set the variable to `dense` for an oracle A/B;
-unknown values are rejected by the `deltaS=-1` builder.
+One response cache belongs to one electronic solution. Joint-frame drivers share
+that cache. Replacing orbitals/amplitudes or changing coordinates, method, channel,
+XC or DF settings requires a new derivative driver. Treat arrays and grids as
+immutable during an evaluation; in-place array edits are not content-hashed.
+Only AO-projected adjoint guesses survive across geometries, and only a fully
+successful frame updates them. GMRES acceptance uses the original equation's
+absolute residual 2-norm, without a tolerance floor or extra silent iterations.
 
-`NTTDA_ENSEMBLE_FOCK_CACHE=1` (default) initializes the per-evaluation
-`ensemble_fock_mo` cache from the existing GPU common Fock for EnsembleRKS
-and EnsembleROKS. It does not substitute the selected high-spin reference
-Fock, change the Hessian action or combine independent Z-vector solves.
-Set it to `0` to retain the CPU Fock rebuild. If no GPU Fock is available,
-the original fallback remains. ROKS cache semantics are unchanged.
+## Optimization policy
 
-The solver reports `df_exchange_backend`; response-cache statistics include
-`ensemble_fock_cache_hits` when the MO Fock is seeded. Use a new derivative
-evaluation after changing the electronic solution as required above.
-Tests in `grad/tests/test_nttda_operator_optimizations.py` cover random
-batch actions, hybrid/range-separated/non-DF paths, directed factors, Fock
-and Hessian parity, fallback and evaluation ownership.
+The default direct XC path is `ao_reduce`; the default DF output path is
+`slot_aware`, including grouping exact factors within the same output slot.
+Fused XC, exact DF exchange factors, cached Fock data, shared selected-reference
+response, and direct MO Davidson XC are retained. Non-slot `rank_batched`
+compressed construction and `NTTDA_DF_COMPRESSED_BACKEND` were removed.
+
+`NTTDA_XC_DIRECT_BACKEND=legacy` and `NTTDA_DF_OUTPUT_BACKEND=legacy` remain
+numerical comparison paths. Memory/tile controls and opt-in profiling remain in
+`grad/nttda_params.py`. Removing an experiment does not remove exact fallback
+paths required by unsupported shapes, complex factors or non-DF calculations.
+
+Historical performance evidence is in the companion project's
+`Gpu4pyscf/docs/nttda_performance_and_validation.md` and
+`nttda_optimization_evolution_report.md`. Local numerical validation is not an
+A100 performance measurement; see [this refactor's validation](nttda_refactor_validation.md).

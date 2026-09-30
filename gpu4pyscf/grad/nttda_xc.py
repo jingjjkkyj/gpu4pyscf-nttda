@@ -15,7 +15,6 @@ orchestrator.
 """
 
 from dataclasses import dataclass
-import importlib
 import os
 import time
 
@@ -251,8 +250,9 @@ def _mgga_pair_kernel_cross(left, right):
     return output
 
 
-def _forge_xc():
-    return importlib.import_module("pyscf.grad.nttda.xc")
+def _projection_helpers():
+    from ._nttda import xc
+    return xc
 
 
 class GPUXCFrameBackend:
@@ -265,9 +265,9 @@ class GPUXCFrameBackend:
     the SCF, so GPU acceleration does not introduce a second reference model.
     """
 
-    def __init__(self, gmf, cpu_td):
+    def __init__(self, gmf, td):
         self.gmf = gmf
-        self.cpu_td = cpu_td
+        self.td = td
         self.mol = gmf.mol
         self.ni = gmf._numint
         self.grids = gmf.grids
@@ -331,19 +331,19 @@ class GPUXCFrameBackend:
         the determinant alpha/beta densities from its 0/1/2 spatial
         occupations, matching the CPU formula backend.
         """
-        from pyscf.sftda import nttda_methods as methods
-        return methods.get_method(self.cpu_td).spin_densities(self.gmf, xp=cp)
+        from gpu4pyscf.sftda import nttda_methods as methods
+        return methods.spin_densities(methods.get_method(self.td), self.gmf, xp=cp)
 
     def spin_lowering_fock0_fockz(self):
         """Return the device-built ``F0/Fz`` pair used by the CPU formulas."""
-        cached = getattr(self.cpu_td, "_nttda_gpu_fock0_fockz", None)
+        cached = getattr(self.td, "_nttda_gpu_fock0_fockz", None)
         if cached is not None:
             self.stats["spin_fock_reuses"] += 1
-            return tuple(cp.asnumpy(cp.asarray(value)) for value in cached)
+            return tuple(cp.asarray(value) for value in cached)
 
         from gpu4pyscf.sftda import nttda as gpu_nttda
 
-        fxc_ref = getattr(self.cpu_td, "_nttda_gpu_fxc_ref", None)
+        fxc_ref = getattr(self.td, "_nttda_gpu_fxc_ref", None)
         if fxc_ref is None:
             fxc_ref = gpu_nttda.spin_flip_reference_fxc(self.gmf)
         _response, fockz = gpu_nttda.gen_rohf_response_sfd(
@@ -352,10 +352,10 @@ class GPUXCFrameBackend:
             hermi=0,
             use_mo_grid_fxc1=True,
         )
-        from pyscf.sftda import nttda_methods as methods
-        fock0 = methods.get_method(self.cpu_td).fock0(self.gmf, xp=cp)
+        from gpu4pyscf.sftda import nttda_methods as methods
+        fock0 = methods.fock0(methods.get_method(self.td), self.gmf, xp=cp)
         self.stats["spin_fock_builds"] += 1
-        return cp.asnumpy(fock0), cp.asnumpy(cp.asarray(fockz))
+        return fock0, cp.asarray(fockz)
 
     def _assert_high_order_xc(self):
         """Reject GPU libxc builds that silently return zero fxc/kxc.
@@ -429,10 +429,10 @@ class GPUXCFrameBackend:
         return self._response_kernel
 
     def response(self, hermi):
-        """Return a NumPy-in/NumPy-out GPU reference-response closure.
+        """Return a device-array reference-response closure.
 
         The closure is the same spin-resolved GGA/MGGA fxc plus Coulomb and
-        hybrid/range-separated exchange operator used by the forge adjoint.
+        hybrid/range-separated exchange operator used by the NTTDA adjoint.
         All grid algebra and J/K builds remain on the GPU.
         """
         hermi = int(hermi)
@@ -489,7 +489,7 @@ class GPUXCFrameBackend:
                         self.mol, density, hermi=hermi,
                     )
                     potential += coulomb[0] + coulomb[1]
-                return cp.asnumpy(potential)
+                return potential
 
             self._responses[hermi] = apply_response
         return self._responses[hermi]
@@ -668,11 +668,11 @@ class GPUXCFrameBackend:
         stats['event_elapsed_s'] += cp.cuda.get_elapsed_time(event, end) / 1000
         stats['calls'] += 1
 
-    def _unsort_numpy(self, matrix):
+    def _unsort_ao(self, matrix):
         matrix = self.opt.unsort_orbitals(
             matrix, axis=[matrix.ndim - 2, matrix.ndim - 1],
         )
-        return cp.asnumpy(matrix)
+        return matrix
 
     def _response_terms_batch(
             self, gradient_driver, tdobj, channel_data_batch,
@@ -694,7 +694,7 @@ class GPUXCFrameBackend:
         for channel_data in channel_data_batch:
             _spaces, _amplitudes, densities, blocks, terms = channel_data
             labels = tuple(densities)
-            sorted_densities = self._sort_density(np.asarray([
+            sorted_densities = self._sort_density(cp.asarray([
                 densities[label] for label in labels
             ]))
             density_map = dict(zip(labels, sorted_densities))
@@ -824,25 +824,25 @@ class GPUXCFrameBackend:
                 )
                 self._finish_direct_timer('response', direct_started)
 
-        forge_xc = _forge_xc()
+        projection = _projection_helpers()
         output = []
         for ctx in contexts:
             potentials = {
-                label: self._unsort_numpy(value)
+                label: self._unsort_ao(value)
                 for label, value in ctx["potentials"].items()
             }
-            q_alpha, q_beta = forge_xc._project_channel_potentials(
+            q_alpha, q_beta = projection._project_channel_potentials(
                 tdobj, potentials, ctx["blocks"],
             )
-            forge_xc._add_reference_q(
+            projection._add_reference_q(
                 tdobj,
                 q_alpha,
                 q_beta,
-                self._unsort_numpy(ctx["reference_alpha"]),
-                self._unsort_numpy(ctx["reference_beta"]),
+                self._unsort_ao(ctx["reference_alpha"]),
+                self._unsort_ao(ctx["reference_beta"]),
             )
-            output.append(forge_xc.XCGradientTerms(
-                q_alpha, q_beta, cp.asnumpy(ctx["direct"]),
+            output.append(projection.XCGradientTerms(
+                q_alpha, q_beta, ctx["direct"],
             ))
         return tuple(output)
 
@@ -861,7 +861,7 @@ class GPUXCFrameBackend:
             atmlst=None, with_direct=True):
         """Evaluate every frame ``Pz:Fz`` task in one GPU grid pass."""
         del gradient_driver
-        pz_batch = np.asarray(pz_batch)
+        pz_batch = cp.asarray(pz_batch)
         if pz_batch.size == 0:
             return tuple()
         if pz_batch.ndim == 2:
@@ -872,7 +872,7 @@ class GPUXCFrameBackend:
         atmlst = tuple(atmlst)
         ntask = len(pz_batch)
 
-        density_open = np.asarray(spaces.c_open @ spaces.c_open.T)
+        density_open = cp.asarray(spaces.c_open @ spaces.c_open.T)
         density_alpha, density_beta = self._reference_spin_densities()
         density_stack = self._sort_density(cp.concatenate((
             cp.asarray(pz_batch),
@@ -984,25 +984,25 @@ class GPUXCFrameBackend:
                     )
             self._finish_direct_timer('fockz', direct_started)
 
-        forge_xc = _forge_xc()
-        mo = np.asarray(tdobj._scf.mo_coeff)
+        projection = _projection_helpers()
+        mo = cp.asarray(tdobj._scf.mo_coeff)
         output = []
         for index in range(ntask):
-            q_alpha = np.zeros((mo.shape[1], mo.shape[1]))
-            q_beta = np.zeros_like(q_alpha)
-            potential = self._unsort_numpy(open_potential[index])
+            q_alpha = cp.zeros((mo.shape[1], mo.shape[1]))
+            q_beta = cp.zeros_like(q_alpha)
+            potential = self._unsort_ao(open_potential[index])
             q_alpha[:, spaces.open] += (
                 mo.conj().T @ (potential + potential.T) @ spaces.c_open
             )
-            forge_xc._add_reference_q(
+            projection._add_reference_q(
                 tdobj,
                 q_alpha,
                 q_beta,
-                self._unsort_numpy(reference_alpha[index]),
-                self._unsort_numpy(reference_beta[index]),
+                self._unsort_ao(reference_alpha[index]),
+                self._unsort_ao(reference_beta[index]),
             )
-            output.append(forge_xc.XCGradientTerms(
-                q_alpha, q_beta, cp.asnumpy(direct[index]),
+            output.append(projection.XCGradientTerms(
+                q_alpha, q_beta, direct[index],
             ))
         return tuple(output)
 
@@ -1023,8 +1023,8 @@ class GPUXCFrameBackend:
         if atmlst is None:
             atmlst = range(self.mol.natm)
         atmlst = tuple(atmlst)
-        probe_alpha = np.asarray(probe_alpha)
-        probe_beta = np.asarray(probe_beta)
+        probe_alpha = cp.asarray(probe_alpha)
+        probe_beta = cp.asarray(probe_beta)
         single_probe = probe_alpha.ndim == 2
         if single_probe:
             probe_alpha = probe_alpha[None]
@@ -1036,16 +1036,16 @@ class GPUXCFrameBackend:
             probe_beta + probe_beta.swapaxes(-1, -2)
         )
         density_alpha = 0.5 * (
-            np.asarray(density_alpha) + np.asarray(density_alpha).T
+            cp.asarray(density_alpha) + cp.asarray(density_alpha).T
         )
         density_beta = 0.5 * (
-            np.asarray(density_beta) + np.asarray(density_beta).T
+            cp.asarray(density_beta) + cp.asarray(density_beta).T
         )
-        probe_densities = np.stack(
+        probe_densities = cp.stack(
             (probe_alpha, probe_beta), axis=1,
         ).reshape(-1, self.nao, self.nao)
-        density_stack = self._sort_density(np.concatenate((
-            np.asarray((density_alpha, density_beta)), probe_densities,
+        density_stack = self._sort_density(cp.concatenate((
+            cp.stack((density_alpha, density_beta)), probe_densities,
         )))
         output = cp.zeros((len(probe_alpha), len(atmlst), 3))
 
@@ -1113,7 +1113,7 @@ class GPUXCFrameBackend:
                         "nbyg,byg->n", probe_rho, response_weights,
                     )
             self._finish_direct_timer('postz', direct_started)
-        output = cp.asnumpy(output)
+        output = output
         return output[0] if single_probe else output
 
     def contract_gga_vxc_derivative(self, *args, **kwargs):

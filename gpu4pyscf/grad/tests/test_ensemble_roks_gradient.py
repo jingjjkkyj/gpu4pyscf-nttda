@@ -120,7 +120,7 @@ class EnsembleROKSGradientGPU(unittest.TestCase):
         )
 
     def test_nttda_fusion_uses_canonical_pairs_and_shared_hessian(self):
-        from pyscf.grad.nttda import ensemble
+        from pyscf.grad.nttda import orbital as ensemble
 
         pairs = ensemble.canonical_pairs(SimpleNamespace(
             _scf=SimpleNamespace(mo_occ=cp.asnumpy(self.mf.mo_occ)),

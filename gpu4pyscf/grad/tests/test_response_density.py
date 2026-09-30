@@ -89,7 +89,9 @@ def test_factor_ownership_and_complex_dense_fallback():
 
 def test_nttda_hessian_seam_matches_dense_response():
     from types import SimpleNamespace
-    from pyscf.grad.nttda.ensemble import make_hessian_transpose_action, canonical_pairs
+    from pyscf.grad.nttda.orbital import (
+        ensemble_make_hessian_transpose_action as make_hessian_transpose_action,
+        ensemble_canonical_pairs as canonical_pairs)
 
     mol, builder, _, _ = case()
     c = cp.asnumpy(builder.orbitals)
@@ -128,7 +130,7 @@ def test_nttda_hessian_seam_matches_dense_response():
 
 def test_nondefault_stream_and_failed_solve_cleanup():
     from gpu4pyscf.grad.ensemble_roks import ReferenceGradients
-    from pyscf.grad.nttda import ensemble, response
+    from pyscf.grad.nttda import orbital as ensemble, response
 
     mol, builder, k, dense = case()
     df = DF(mol, auxbasis='weigend')
@@ -144,7 +146,7 @@ def test_nondefault_stream_and_failed_solve_cleanup():
     def action(vector):
         return vector
     action.clear = builder.clear
-    with mock.patch.object(response, 'solve_zvector_equations', side_effect=RuntimeError('failed')):
+    with mock.patch.object(ensemble, 'solve_zvector_equations', side_effect=RuntimeError('failed')):
         with pytest.raises(RuntimeError, match='failed'):
             ensemble.solve_zvectors(action, (), None, None)
     assert builder.cache.nbytes == 0

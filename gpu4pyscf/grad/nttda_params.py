@@ -1,8 +1,9 @@
 """Adaptive runtime parameters for NTTDA gradient/NAC GPU driver.
 
-All parameters default to values calibrated on RTX 4060 Laptop (8 GB VRAM).
-A100-specific tuning requires a discrete sweep on the actual hardware; until
-then every A100 path is marked ``unvalidated_on_A100``.
+Memory and tile defaults are conservative for an RTX 4060 Laptop (8 GB).
+AO reduction and slot-grouped DF follow the historical validated paths.
+This refactor still needs an A100 performance rerun; the hardware acceptance
+marker remains ``unvalidated_on_A100``.
 
 Environment variables
 ---------------------
@@ -28,27 +29,20 @@ All variables are optional and use the ``NTTDA_`` prefix.
         Larger values reduce Python launch overhead but increase register
         pressure and shared-memory usage in the CUDA kernel.
 
-    NTTDA_DF_COMPRESSED_BACKEND
-        ``legacy`` (default) or experimental ``rank_batched``. The latter
-        batches J-only tasks and exact rank-(2,2) K tasks while building the
-        compressed DF derivative tensor. Unsupported tasks fall back to the
-        legacy per-pair path.
-
     NTTDA_DF_COMPRESSED_PROFILE
         ``1`` records CUDA-event timings grouped by ``(J/K, left rank,
         right rank)`` for the compressed DF derivative build and the final
         derivative kernel. Default ``0`` creates no events.
 
     NTTDA_DF_OUTPUT_BACKEND
-        ``legacy`` (default) returns one derivative row per input task.
-        Experimental ``slot_aware`` pre-sums already weighted compressed
+        ``slot_aware`` (default) pre-sums already weighted compressed
         tensors within the same ``(omega, output slot)`` group and runs the
         three- and two-center derivative kernels over the reduced output
         width. It also groups same-slot pure-K rank-(2,2) contractions
-        automatically; no ``NTTDA_DF_COMPRESSED_BACKEND`` override is needed.
+        automatically. ``legacy`` is available for numerical comparisons.
 
     NTTDA_CPHF_MAX_CYCLE
-        Default maximum CPHF/Z-vector iterations.  ``None`` (use forge
+        Default maximum CPHF/Z-vector iterations.  ``None`` (use the solver
         default).  Range: ``[1, 1000]`` or unset.
 
     NTTDA_DAVIDSON_MAX_SUBSPACE
@@ -63,8 +57,8 @@ All variables are optional and use the ``NTTDA_`` prefix.
         driver falls back to cupy with a warning.
 
     NTTDA_XC_DIRECT_BACKEND
-        ``legacy`` (default) or experimental ``ao_reduce``. The latter
-        batches AO-center derivatives and still requires A100 acceptance.
+        ``ao_reduce`` (default) batches AO-center derivatives.
+        ``legacy`` remains available for numerical comparisons.
 
     NTTDA_XC_DIRECT_MAX_MEMORY_MB
         Additional AO-reduction tile budget in MiB, default 256. Does not
@@ -124,17 +118,12 @@ def _load_params():
         'df_batch_factor': _get_float('NTTDA_DF_BATCH_FACTOR', 1.0, 0.0, 10.0),
         'df_blk_factor': _get_float('NTTDA_DF_BLK_FACTOR', 1.0, 0.0, 10.0),
         'dm_block': _get_int('NTTDA_DM_BLOCK', 7, 1, 16),
-        'df_compressed_backend': _get_str(
-            'NTTDA_DF_COMPRESSED_BACKEND',
-            'legacy',
-            ('legacy', 'rank_batched'),
-        ),
         'df_compressed_profile': _get_str(
             'NTTDA_DF_COMPRESSED_PROFILE', '0', ('0', '1'),
         ) == '1',
         'df_output_backend': _get_str(
             'NTTDA_DF_OUTPUT_BACKEND',
-            'legacy',
+            'slot_aware',
             ('legacy', 'slot_aware'),
         ),
         'cphf_max_cycle': (
@@ -149,7 +138,7 @@ def _load_params():
             'NTTDA_CONTRACT_BACKEND', 'cupy', ('cupy', 'cutensor'),
         ),
         'xc_direct_backend': _get_str(
-            'NTTDA_XC_DIRECT_BACKEND', 'legacy', ('legacy', 'ao_reduce'),
+            'NTTDA_XC_DIRECT_BACKEND', 'ao_reduce', ('legacy', 'ao_reduce'),
         ),
         'xc_direct_max_memory_mb': _get_int(
             'NTTDA_XC_DIRECT_MAX_MEMORY_MB', 256, 1, 1048576,

@@ -10,8 +10,9 @@ from gpu4pyscf.sftda import (
     NTTDA_EnsembleRKS, NTTDA_EnsembleROKS,
 )
 from gpu4pyscf.grad.nttda import compute_frame, make_frame_cache
-from gpu4pyscf.grad.nttda_context import EvaluationContext
-from gpu4pyscf.grad.nttda_bridge import build_cpu_twin
+from gpu4pyscf.grad._nttda.response import ResponseCache
+import cupy as cp
+from gpu4pyscf.sftda import nttda_methods as methods
 
 
 CASES = (
@@ -48,13 +49,13 @@ def solve(td, delta_s=-1):
 @pytest.mark.parametrize('case', CASES, ids=[case[2] for case in CASES])
 @pytest.mark.parametrize('delta_s', [-1, 0])
 @pytest.mark.parametrize('df', [False, True])
-def test_explicit_legacy_and_cpu_twin_agree(case, delta_s, df):
+def test_explicit_and_legacy_agree(case, delta_s, df):
     kind, factory, ident, nobeta = case
     mf = reference(kind, df)
     legacy = solve(NTTDA(mf).set(nobeta=nobeta), delta_s)
     explicit = solve(factory(mf), delta_s)
     assert explicit.method_id == ident
-    assert build_cpu_twin(explicit).method_id == ident
+    assert explicit.Gradients().base is explicit
     np.testing.assert_allclose(explicit.e, legacy.e, atol=1e-11, rtol=0)
     expected = legacy.Gradients().kernel(state=1, atmlst=[1])
     actual = explicit.Gradients().kernel(state=1, atmlst=[1])
@@ -63,18 +64,13 @@ def test_explicit_legacy_and_cpu_twin_agree(case, delta_s, df):
 
 @pytest.mark.parametrize('case', CASES, ids=[case[2] for case in CASES])
 def test_joint_frame_and_warm_guess_match_independent_properties(case):
-    from unittest import mock
-    from gpu4pyscf.grad import nttda_bridge
-
     kind, factory, ident, _ = case
     td = solve(factory(reference(kind, df=True)))
     grad = td.Gradients().set(cphf_conv_tol=1e-10).kernel(state=1)
     nac = td.NAC().set(cphf_conv_tol=1e-10).kernel(state_I=1, state_J=2, ediff=True, use_etfs=True)
     cache = make_frame_cache()
     for _ in range(2):
-        with mock.patch.object(nttda_bridge, 'build_cpu_twin', wraps=build_cpu_twin) as twin:
-            result = compute_frame(td, 1, [(1, 2)], frame_cache=cache)
-            twin.assert_called_once()
+        result = compute_frame(td, 1, [(1, 2)], frame_cache=cache)
         np.testing.assert_allclose(result['grad'], grad, atol=5e-9, rtol=0)
         np.testing.assert_allclose(result['nac'][(1, 2)], nac, atol=5e-9, rtol=0)
         assert td._nttda_frame_stats['method_id'] == ident
@@ -113,11 +109,11 @@ def test_ensemble_nobeta_does_not_change_execution(kind):
 
 def test_contexts_do_not_share_mutable_response_state():
     td = solve(NTTDA_ROKS(reference(ROKS)))
-    first, second = EvaluationContext(td), EvaluationContext(td)
-    assert first.response_cache is not second.response_cache
+    first, second = ResponseCache(td), ResponseCache(td)
+    assert first is not second
     assert first.ledger is not second.ledger
     with pytest.raises(ValueError, match='different NTTDA evaluation'):
-        first.response_cache.assert_compatible(second.cpu_td)
+        first.assert_compatible(__import__("copy").copy(td))
     td.nobeta = True
     with pytest.raises(ValueError, match='explicit NTTDA method'):
         first.validate()
@@ -131,23 +127,21 @@ def test_spin_fock_cache_uses_gpu_and_preserves_method(case, df):
 
     kind, factory, _, _ = case
     td = solve(factory(reference(kind, df=df)))
-    context = EvaluationContext(td)
-    cpu_mf = context.cpu_td._scf
-    expected = context.method.spin_focks_mo(cpu_mf)
+    context = ResponseCache(td)
+    expected = methods.spin_focks_mo(context.method, td._scf)
     with (
-        mock.patch.object(cpu_mf, 'get_fock', side_effect=AssertionError('CPU Fock')),
         mock.patch.object(NumInt, 'nr_uks', side_effect=AssertionError('CPU UKS XC')),
         mock.patch.object(NumInt, 'nr_rks', side_effect=AssertionError('CPU RKS XC')),
     ):
-        cache = context.response_cache
+        cache = context
         assert cache._focks_mo is None
         with mock.patch.object(td._scf, 'get_fock', wraps=td._scf.get_fock) as build:
             actual = cache.spin_focks_mo()
             assert cache.spin_focks_mo() is actual
             build.assert_called_once()
     for spin, reference_fock in zip(actual, expected):
-        assert isinstance(spin, np.ndarray)
-        np.testing.assert_allclose(spin, reference_fock, atol=1e-9, rtol=0)
+        assert isinstance(spin, cp.ndarray)
+        np.testing.assert_allclose(cp.asnumpy(spin), cp.asnumpy(reference_fock), atol=1e-9, rtol=0)
 
 
 def test_existing_drivers_reject_replaced_solution_for_all_paths():
@@ -159,21 +153,3 @@ def test_existing_drivers_reject_replaced_solution_for_all_paths():
             grad.kernel(state=1, method=mode)
     with pytest.raises(ValueError, match='create a new derivative driver'):
         nac.kernel(state_I=1, state_J=2)
-
-
-@pytest.mark.parametrize('case', CASES, ids=[case[2] for case in CASES])
-def test_joint_frame_uses_selected_method_preparation(case):
-    from dataclasses import replace
-    from importlib import import_module
-    from unittest import mock
-
-    kind, factory, ident, _ = case
-    td = solve(factory(reference(kind, df=True)))
-    module = import_module('pyscf.sftda.nttda_methods.' + ident)
-    for entry, pairs in (('prepare_gradient', ()), ('prepare_cross', ((1, 2),))):
-        replacement = mock.Mock(side_effect=RuntimeError('selected method preparation'))
-        method = replace(module.METHOD, **{entry: replacement})
-        with mock.patch.object(module, 'METHOD', method):
-            with pytest.raises(RuntimeError, match='selected method preparation'):
-                compute_frame(td, 1, pairs)
-            replacement.assert_called_once()

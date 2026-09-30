@@ -808,7 +808,7 @@ class KnownValues(unittest.TestCase):
         self.assertFalse(driver._initial_frame_available)
 
     def test_rebuilt_scf_preserves_ensemble_roks_method(self):
-        from pyscf.sftda import nttda_methods
+        from gpu4pyscf.sftda import nttda_methods
         from gpu4pyscf.sftda import EnsembleROKS, NTTDA_EnsembleROKS
 
         mf = EnsembleROKS(self.mol, xc='PBE').density_fit()
