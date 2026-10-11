@@ -16,7 +16,7 @@
 
 GPU port of pyscf.sftda.nttda for high-spin ROKS and average-occupation
 EnsembleRKS references.  This module implements the production
-``deltaS = -1`` and ``deltaS = 0`` channels.  The vref0
+``deltaS = -1/0/+1`` channels.  The vref0
 (spin-flip kernel) and GGA/MGGA vref1 actions are evaluated directly in the
 MO blocks on the grid for the real-orbital ``deltaS = -1`` path.  This avoids
 materializing full AO response matrices and the CPU-only sparse-AO primitives
@@ -25,7 +25,7 @@ gpu4pyscf ``nr_rks_fxc`` fallback with an injected reference kernel.
 
 ``F0`` always follows the selected ground-state model: the ROKS common Fock
 for a ROKS reference, or the equal-spin restricted Fock for EnsembleRKS.
-``Fz`` is an auxiliary spin-lowering response used only to assemble the
+``Fz`` is an auxiliary transverse-spin response used only to assemble the
 NTTDA matrix; it is not the EnsembleRKS SCF Fock.  The corresponding equations
 and block conventions are documented in
 ``docs/derivations/ensemble_rks_nttda_gradient_nac.md`` of the companion
@@ -539,6 +539,66 @@ def nr_rks_fxc1_mo(mf, mo_blocks, in_blocks, out_blocks, terms, fxc_ref):
         mf, mo_blocks, in_blocks, out_blocks, fxc_ref,
         fxc1_terms=terms,
     )
+
+
+def gen_rohf_response_sfu(mf, fxc_ref=None, hermi=0):
+    """Spin-raising K0 response and Fz, including hybrid/RSH exchange."""
+    mol, ni = mf.mol, mf._numint
+    ni.libxc.test_deriv_order(mf.xc, 2, raise_error=True)
+    omega, alpha, hybrid = ni.rsh_and_hybrid_coeff(mf.xc, mol.spin)
+    xctype = ni._xc_type(mf.xc)
+    if xctype != 'HF' and fxc_ref is None:
+        fxc_ref = spin_flip_reference_fxc(mf)
+
+    def vind(densities, hermi=hermi):
+        densities = cp.asarray(densities)
+        if xctype == 'HF':
+            result = cp.zeros_like(densities)
+        else:
+            result = cp.asarray(gpu_numint.nr_rks_fxc(
+                ni, mol, mf.grids, mf.xc, None, densities, 0, hermi,
+                None, None, fxc_ref,
+            ))
+        if ni.libxc.is_hybrid_xc(mf.xc):
+            result -= hybrid * mf.get_k(mol, densities, hermi=hermi)
+            if omega != 0:
+                result -= (alpha - hybrid) * mf.get_k(mol, densities, hermi=hermi, omega=omega)
+        return result
+
+    open_orbitals = cp.asarray(mf.mo_coeff)[:, cp.asarray(mf.mo_occ) == 1]
+    density_open = open_orbitals @ open_orbitals.T
+    return vind, 0.5 * vind(density_open[None], hermi=1)[0]
+
+
+def gen_vind_sfu(td):
+    """GPU action for deltaS=+1: closed beta holes, virtual alpha particles."""
+    mf = td._scf
+    mo = cp.asarray(mf.mo_coeff)
+    closed, _, virtual = _orbital_indices(mf)
+    c, v = mo[:, closed], mo[:, virtual]
+    nc, nv = len(closed), len(virtual)
+    if not nc or not nv:
+        raise ValueError('deltaS=+1 NTTDA requires closed and virtual orbitals')
+    fxc_ref = None if mf._numint._xc_type(mf.xc) == 'HF' else spin_flip_reference_fxc(mf)
+    response, fockz = gen_rohf_response_sfu(mf, fxc_ref=fxc_ref)
+    fock0 = methods.fock0(methods.get_method(td), mf)
+    td._nttda_gpu_fxc_ref = fxc_ref
+    td._nttda_gpu_fock0_fockz = (fock0, fockz)
+    td._nttda_df_exchange_backend = 'dense'
+    td._nttda_xc_response_backend = 'ao_matrix'
+    fock_v = v.T @ (fock0 + fockz) @ v
+    fock_c = c.T @ (fock0 - fockz) @ c
+    hdiag = (fock_v.diagonal()[None] - fock_c.diagonal()[:, None]).ravel()
+
+    def vind(vectors):
+        x = cp.asarray(vectors).reshape(-1, nc, nv)
+        densities = cp.einsum('xia,pa,qi->xpq', x, v, c)
+        result = cp.einsum('xpq,qi,pa->xia', response(densities), c, v)
+        result += cp.einsum('ab,xib->xia', fock_v, x)
+        result -= cp.einsum('ji,xja->xia', fock_c, x)
+        return result.reshape(len(x), nc * nv)
+
+    return vind, hdiag
 
 
 def gen_rohf_response_sfd(mf, fxc_ref=None, hermi=0, use_mo_grid_fxc1=True,
@@ -1238,7 +1298,7 @@ def gen_vind_sfd(td, use_mo_grid_fxc0=True):
 class NTTDA(lib.StreamObject):
     '''GPU NTTDA excitation energies for ROKS or EnsembleRKS references.
 
-    The production ``deltaS = -1`` and ``deltaS = 0`` channels are native;
+    All three ``deltaS = -1/0/+1`` channels are native;
     the spin-lowered zero-energy reference is filtered only for ``deltaS=-1``.
     '''
 
@@ -1267,6 +1327,7 @@ class NTTDA(lib.StreamObject):
 
     gen_vind_sfd = gen_vind_sfd
     gen_vind_sc = gen_vind_sc
+    gen_vind_sfu = gen_vind_sfu
 
     @property
     def method_id(self):
@@ -1301,10 +1362,8 @@ class NTTDA(lib.StreamObject):
         methods.begin_solution(self)
         log = logger.new_logger(self)
         t0 = log.init_timer()
-        if self.deltaS not in (-1, 0):
-            raise NotImplementedError(
-                'GPU NTTDA currently implements deltaS=-1 and deltaS=0'
-            )
+        if self.deltaS not in (-1, 0, 1):
+            raise ValueError('deltaS must be -1, 0, or 1')
         if nstates is None:
             nstates = self.nstates
         else:
@@ -1314,8 +1373,10 @@ class NTTDA(lib.StreamObject):
         self._nttda_operator_profiler = None
         if self.deltaS == -1:
             vind_orig, hdiag = self.gen_vind_sfd()
-        else:
+        elif self.deltaS == 0:
             vind_orig, hdiag = self.gen_vind_sc()
+        else:
+            vind_orig, hdiag = self.gen_vind_sfu()
         precond = self.get_precond(hdiag)
         warm_start = x0 is not None
         if x0 is None:
@@ -1353,20 +1414,22 @@ class NTTDA(lib.StreamObject):
         def all_eigs(w, v, nroots, envs):
             return w, v, np.arange(w.size)
 
+        # Linear-dependency screening acts on preconditioned corrections.
+        # Core/valence gaps can shrink a residual by much more than ten;
+        # account for that scale instead of stopping above conv_tol.
+        diagonal_span = max(1.0, float(cp.max(hdiag) - cp.min(hdiag)))
+        correction_cutoff = (0.1 * self.conv_tol / diagonal_span) ** 2
         converged, energies, x1 = lr_eigh(
             counted_vind, x0, precond,
             tol_residual=self.conv_tol,
-            # ``lr_eigh`` compares the squared norm of a preconditioned trial
-            # vector against ``lindep``.  Keep a small margin below the target
-            # residual squared so the last useful correction is not discarded
-            # before a tightly converged root reaches ``conv_tol``.
-            lindep=min(self.lindep, 1e-2 * self.conv_tol ** 2),
+            lindep=min(self.lindep, correction_cutoff),
             nroots=nroots,
             pick=all_eigs,
             max_cycle=self.max_cycle,
             max_memory=self.max_memory,
             verbose=log,
             callback=callback,
+            reorthogonalize=self.conv_tol < np.sqrt(np.finfo(float).eps),
         )
         energies = np.asarray(cp.asnumpy(cp.asarray(energies)))
         converged = np.atleast_1d(

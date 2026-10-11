@@ -43,7 +43,7 @@ MAX_SPACE_INC = None
 
 def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
          x0sym=None, pick=None, max_cycle=50, max_memory=MAX_MEMORY,
-         verbose=logger.WARN, callback=None):
+         verbose=logger.WARN, callback=None, reorthogonalize=False):
     '''
     Solve symmetric eigenvalues.
 
@@ -83,6 +83,9 @@ def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
             ``subspace_size``, ``residuals`` (numpy), ``converged`` (numpy),
             and ``energies`` (numpy).  When None (default), no overhead is
             incurred.
+        reorthogonalize : bool
+            Refresh the complete trial-space metric by QR each iteration.
+            Useful for tight residual targets; requires x0sym=None.
 
     Returns:
         e : list of floats
@@ -93,6 +96,8 @@ def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
 
     assert callable(pick)
     assert callable(precond)
+    if reorthogonalize and x0sym is not None:
+        raise NotImplementedError('full trial-space QR requires x0sym=None')
 
     if isinstance(verbose, logger.Logger):
         log = verbose
@@ -148,7 +153,15 @@ def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
             xs_ir = cp.hstack([xs_ir, xt_ir[xt_idx]])
 
         # Compute heff = xs.conj().dot(ax.T)
-        if w is None:
+        if reorthogonalize:
+            # Projecting only the new corrections can leave accumulated
+            # metric errors in retained Ritz vectors. Transform A*X with the
+            # same QR, preserving the linear action without another aop call.
+            q, r = cp.linalg.qr(xs.T, mode='reduced')
+            xs = q.T
+            ax = cupyx.scipy.linalg.solve_triangular(r.T, ax, lower=True)
+            heff = xs.conj().dot(ax.T)
+        elif w is None:
             heff = xs.conj().dot(ax.T)
         else:
             hsub = xt.conj().dot(ax.T)
