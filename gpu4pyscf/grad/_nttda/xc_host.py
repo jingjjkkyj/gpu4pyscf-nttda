@@ -876,7 +876,6 @@ def lda_response_terms(gradient_driver, tdobj, channel_data, atmlst=None, with_d
     reference_alpha = np.zeros((nao, nao))
     reference_beta = np.zeros_like(reference_alpha)
     direct = np.zeros((len(atmlst), 3))
-    mo = np.asarray(mf.mo_coeff)
     density_alpha, density_beta = _reference_spin_densities(tdobj)
     density_labels, density_stack = _response_density_stack(
         densities,
@@ -1113,8 +1112,10 @@ def mgga_response_terms(gradient_driver, tdobj, channel_data, atmlst=None, with_
     pair_labels = tuple(
         label for label in densities if any(term.vref1 and label in (term.target, term.source) for term in terms)
     )
-    pair_density_stack = np.asarray([densities[label] for label in pair_labels])
     nao = mol.nao_nr()
+    # Spin raising has only vref0 terms: retain the AO axes for an empty
+    # vref1 batch so the shared pair contractions also accept this channel.
+    pair_density_stack = np.asarray([densities[label] for label in pair_labels]).reshape(-1, nao, nao)
     potentials = {label: np.zeros((nao, nao)) for label in densities}
     reference_alpha = np.zeros((nao, nao))
     reference_beta = np.zeros_like(reference_alpha)
@@ -1230,7 +1231,7 @@ def mgga_response_terms(gradient_driver, tdobj, channel_data, atmlst=None, with_
                     kref_beta,
                 )
         ordinary_weight_stack = np.asarray([ordinary_weights[label] for label in density_labels])
-        special_weight_stack = np.asarray([special_weights[label] for label in pair_labels])
+        special_weight_stack = np.asarray([special_weights[label] for label in pair_labels]).reshape(-1, 4, 4, weights.size)
 
         for label in potentials:
             add_mgga_matrix(

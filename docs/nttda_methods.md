@@ -26,7 +26,12 @@ frame = compute_frame(td, active_state=1, nac_pairs=[(1, 2)],
 `NTTDA_ROKS`, `NTTDA_ROKS_NoBeta`, `NTTDA_EnsembleRKS` and
 `NTTDA_EnsembleROKS` remain available. Legacy `NTTDA(mf).set(nobeta=...)` remains
 supported. States are one-based; gradient state 0 selects the reference.
-Gradients support `deltaS=-1,0`; NAC and joint frames support `deltaS=-1`.
+The solver, gradients, NAC and joint frames support `deltaS=-1,0,+1`.
+The reference requires S >= 1 for -1 and S >= 1/2 for 0; +1 also supports
+closed shells and requires nonempty closed and virtual spaces. NACs couple
+different roots within the selected spin channel, not roots in different channels.
+The FSSH adapter still selects `deltaS=-1` surfaces.
+See the [spin-channel derivation](derivations/nttda_spin_channels.md).
 With `gap = omega_J - omega_I`, full NAC is `N_HF/gap + d_CSF`.
 Here `d_CSF = d_AO + d_orbital`. `use_etfs=True` removes only `d_AO`,
 retaining `N_HF/gap + d_orbital`; `ediff=False` returns the energy-scaled result.
@@ -44,7 +49,7 @@ calculations now also incur that solve. See the [ETF derivation](derivations/ntt
 | `sftda/nttda_methods.py` | Four immutable physical identities and ordinary function dispatch |
 | `grad/nttda.py` | Static GPU `Gradients` class, validation and public results |
 | `nac/nttda.py` | Interstate numerator, moving-CSF term and overlap reference |
-| `grad/_nttda/delta_s_minus_one.py`, `delta_s_zero.py` | Channel algebra and explicit prepared derivative data |
+| `grad/_nttda/delta_s_minus_one.py`, `delta_s_zero.py`, `delta_s_plus_one.py` | Channel algebra and explicit prepared derivative data |
 | `grad/_nttda/orbital.py` | ROKS and ensemble orbital Hessians, spin weights and adjoints |
 | `grad/_nttda/response.py` | One evaluation cache, strict GMRES and final contraction |
 | `grad/_nttda/frame.py` | Joint-frame scheduling, reference fusion and cross-frame initial guesses |
@@ -64,6 +69,12 @@ It contains no function callbacks. ROKS and ensemble Hessians retain their disti
 spin/occupation factors. The selected EnsembleROKS reference contribution is
 nonstationary; `compute_frame` folds its RHS shift into the state-gradient solve
 and retains the stricter `min(cphf_conv_tol, 1e-12)` target.
+
+For deltaS=0/+1, interstate preparation polarizes the unrelaxed functional
+before a single adjoint solve and merged J/K contraction; the deltaS=-1 direct
+preparation remains specialized. DeltaS=0 root tracking uses exact AWF overlaps
+also when `root_overlap_method="approx"` is selected, because its five blocks
+cannot use the single-rectangle approximation. This costs more for large AWFs.
 
 One response cache belongs to one electronic solution. Joint-frame drivers share
 that cache. Replacing orbitals/amplitudes or changing coordinates, method, channel,
@@ -90,3 +101,11 @@ Historical performance evidence is in the companion project's
 `Gpu4pyscf/docs/nttda_performance_and_validation.md` and
 `nttda_optimization_evolution_report.md`. Local numerical validation is not an
 A100 performance measurement; see [this refactor's validation](nttda_refactor_validation.md).
+
+For strict NTTDA residual targets below `sqrt(machine epsilon)`, Davidson
+refreshes the full trial-space metric by GPU QR and transforms the cached
+operator action with it. Linear-dependency screening also accounts for the
+preconditioner's diagonal energy span. This prevents premature termination or
+stagnation in the closed-shell/doublet acceptance cases without relaxing the
+residual target or adding iterations beyond `max_cycle`. It adds GPU subspace
+linear algebra; large-system timing for this strict mode has not been measured.

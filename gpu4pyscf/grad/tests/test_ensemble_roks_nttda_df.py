@@ -99,8 +99,10 @@ def test_compute_frame_fuses_selected_reference_zvector():
     assert stats['z_solver']['converged']
 
 
-def test_compute_frame_batches_multiple_gradients_and_nac():
-    td = make_td(make_reference())
+@pytest.mark.parametrize('delta_s', [-1, 0, 1])
+@pytest.mark.parametrize('xc', ['B3LYP', 'TPSS'])
+def test_compute_frame_batches_multiple_gradients_and_nac(delta_s, xc):
+    td = make_td(make_reference(xc), delta_s)
     gradients = {
         state: td.Gradients().set(
             cphf_conv_tol=1e-11, verbose=0,

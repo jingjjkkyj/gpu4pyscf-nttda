@@ -243,16 +243,25 @@ def same_spin_fock_q(tdobj, xy, max_memory=None, cache=None):
     spin-resolved probes.  DFT callers add the independent ``Fz`` and
     ``nobeta`` response ledgers after this common ``F0`` contribution.
     """
+    return fock_projection_q(
+        tdobj, same_spin_fock_projections(tdobj, xy),
+        fock0_fockz(tdobj, max_memory=max_memory, cache=cache),
+        same_spin_fock_probes(tdobj, xy), cache=cache,
+    )
+
+
+def fock_projection_q(tdobj, projections, operators, probes, cache=None):
+    """MO derivative of F0/Fz projections, shared with the raising channel."""
     mf = tdobj._scf
     mo = cp.asarray(mf.mo_coeff)
     nmo = mo.shape[1]
-    fock0, fockz = fock0_fockz(tdobj, max_memory=max_memory, cache=cache)
+    fock0, fockz = operators
     fock0_mo = mo.conj().T @ fock0 @ mo
     fockz_mo = mo.conj().T @ fockz @ mo
     q_alpha = cp.zeros((nmo, nmo))
     q_beta = cp.zeros_like(q_alpha)
 
-    for term in same_spin_fock_projections(tdobj, xy):
+    for term in projections:
         left = term.left_indices
         right = term.right_indices
         coeff = term.coefficient
@@ -271,7 +280,7 @@ def same_spin_fock_q(tdobj, xy, max_memory=None, cache=None):
         else:
             project(q_alpha, fockz_mo, term.weight_fz)
 
-    p0, pz = same_spin_fock_probes(tdobj, xy)
+    p0, pz = probes
     p_alpha = 0.5 * p0
     p_beta = 0.5 * p0
     if mf._numint._xc_type(mf.xc) == 'HF':
@@ -463,7 +472,24 @@ def same_spin_fockz_hfx_terms(gradient_driver, tdobj, pz, atmlst=None, with_dire
 # Channel assembly
 
 
-def prepare_grad_elec(gradient_driver, tdobj, xy, atmlst=None, tolerance=1e-12, max_cycle=None, cache=None):
+def gradient_xc_request(tdobj, xy):
+    """Return native response blocks and Fz probe for frame batching."""
+    spaces, amplitudes, densities = same_spin_transition_densities(tdobj, xy)
+    blocks = {
+        'CO': (spaces.open, spaces.closed, amplitudes.co.T),
+        'CV': (spaces.virtual, spaces.closed, amplitudes.cv.T),
+        'OV': (spaces.virtual, spaces.open, amplitudes.ov.T),
+        'CV0': (spaces.virtual, spaces.closed, amplitudes.cv0.T),
+    }
+    response_terms = same_spin_response_terms(spaces.spin)
+    channel_data = (spaces, amplitudes, densities, blocks, response_terms)
+    p0, pz = same_spin_fock_probes(tdobj, xy)
+    return channel_data, spaces, pz
+
+
+def prepare_grad_elec(
+    gradient_driver, tdobj, xy, atmlst=None, tolerance=1e-12, max_cycle=None, cache=None, xc_terms=None,
+):
     """Build the complete analytic excitation gradient for deltaS=0.
 
     The function follows the physical order of the Lagrangian: native
@@ -481,19 +507,11 @@ def prepare_grad_elec(gradient_driver, tdobj, xy, atmlst=None, tolerance=1e-12, 
     xctype = mf._numint._xc_type(mf.xc)
 
     # 1. Native amplitudes, transition densities, and explicit Fock probes.
-    spaces, amplitudes, densities = same_spin_transition_densities(tdobj, xy)
-    blocks = {
-        'CO': (spaces.open, spaces.closed, amplitudes.co.T),
-        'CV': (spaces.virtual, spaces.closed, amplitudes.cv.T),
-        'OV': (spaces.virtual, spaces.open, amplitudes.ov.T),
-        'CV0': (spaces.virtual, spaces.closed, amplitudes.cv0.T),
-    }
-    response_terms = same_spin_response_terms(spaces.spin)
-    channel_data = (spaces, amplitudes, densities, blocks, response_terms)
-    p0, pz = same_spin_fock_probes(tdobj, xy)
+    channel_data, spaces, pz = gradient_xc_request(tdobj, xy)
+    _, amplitudes, densities, blocks, response_terms = channel_data
+    p0, _ = same_spin_fock_probes(tdobj, xy)
     jk_ledger = _JKDerivativeLedger()
     direct_slot = 'direct'
-    zvector_slot = 'zvector'
 
     # 2. Explicit Fock contribution to the orbital-rotation M matrix.
     fock_alpha, fock_beta = same_spin_fock_q(tdobj, xy, cache=cache)
@@ -545,19 +563,22 @@ def prepare_grad_elec(gradient_driver, tdobj, xy, atmlst=None, tolerance=1e-12, 
             raise NotImplementedError('NTTDA deltaS=0 gradient does not support XC type %s' % xctype) from error
 
         hfx_alpha, hfx_beta = same_spin_hfx_projection_q(tdobj, xy)
-        response_xc = response_builder(
-            gradient_driver,
-            tdobj,
-            channel_data,
-            atmlst=atmlst,
-        )
-        fockz_xc = fockz_builder(
-            gradient_driver,
-            tdobj,
-            spaces,
-            pz,
-            atmlst=atmlst,
-        )
+        if xc_terms is None:
+            response_xc = response_builder(
+                gradient_driver,
+                tdobj,
+                channel_data,
+                atmlst=atmlst,
+            )
+            fockz_xc = fockz_builder(
+                gradient_driver,
+                tdobj,
+                spaces,
+                pz,
+                atmlst=atmlst,
+            )
+        else:
+            response_xc, fockz_xc = xc_terms
         fockz_hfx = same_spin_fockz_hfx_terms(
             gradient_driver,
             tdobj,

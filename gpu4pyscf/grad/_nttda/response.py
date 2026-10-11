@@ -340,6 +340,70 @@ def prepare_gradient(
     )
 
 
+def _combine_amplitudes(xy_i, xy_j, sign):
+    xi = xy_i[0] if isinstance(xy_i, (tuple, list)) else xy_i
+    xj = xy_j[0] if isinstance(xy_j, (tuple, list)) else xy_j
+    return cp.asarray(xi) + sign * cp.asarray(xj)
+
+
+def cross_xc_request(tdobj, xy_i, xy_j):
+    """Polarize the response channels while batching the linear Fz probe."""
+    channel = methods.gradient_channel(tdobj)
+    plus = channel.gradient_xc_request(tdobj, _combine_amplitudes(xy_i, xy_j, 1))
+    minus = channel.gradient_xc_request(tdobj, _combine_amplitudes(xy_i, xy_j, -1))
+    return (plus[0], minus[0]), plus[1], 0.25 * (plus[2] - minus[2])
+
+
+def prepare_polarized_cross(
+    driver, tdobj, xy_i, xy_j, atmlst=None, tolerance=1e-12,
+    max_cycle=None, cache=None, xc_terms=None,
+):
+    """Prepare a bilinear numerator with one adjoint and one J/K contraction.
+
+    The scalar functional is quadratic in X. Polarize its unrelaxed data,
+    without normalizing X_i +/- X_j, before solving the linear adjoint.
+    The spin-lowering channel retains its specialized direct preparation.
+    """
+    from .derivative_jk import _JKDerivativeLedger
+    from .xc import XCGradientTerms
+
+    if cache is None:
+        cache = ResponseCache(tdobj)
+    method = methods.get_method(tdobj)
+    tasks = []
+    for index, sign in enumerate((1, -1)):
+        terms = None
+        if xc_terms is not None:
+            fockz = xc_terms[2]
+            zero = XCGradientTerms(
+                cp.zeros_like(fockz.q_alpha), cp.zeros_like(fockz.q_beta), cp.zeros_like(fockz.direct),
+            )
+            terms = (xc_terms[index], zero)
+        tasks.append(methods.prepare_gradient(
+            method, driver, tdobj, _combine_amplitudes(xy_i, xy_j, sign),
+            atmlst=atmlst, tolerance=tolerance, max_cycle=max_cycle,
+            cache=cache, xc_terms=terms,
+        ))
+    plus, minus = tasks
+    m_matrix = 0.25 * (plus.m_matrix - minus.m_matrix)
+    direct = 0.25 * (plus.direct - minus.direct)
+    if xc_terms is not None:
+        # Fz is linear in its probe; the frame already contracted the cross
+        # probe once, independently of the two quadratic response channels.
+        fockz = xc_terms[2]
+        m_matrix += fockz.q_alpha + fockz.q_beta
+        direct += fockz.direct
+    ledger = _JKDerivativeLedger()
+    ledger.extend(plus.jk_ledger, 0.25)
+    ledger.extend(minus.jk_ledger, -0.25)
+    return prepare_gradient(
+        driver, tdobj, m_matrix, direct, plus.atmlst, tolerance, max_cycle,
+        jk_ledger=ledger, nobeta_p0=0.25 * (plus.nobeta_p0 - minus.nobeta_p0),
+        direct_fock_probes=tuple(0.25 * (p - m) for p, m in zip(plus.direct_fock_probes, minus.direct_fock_probes)),
+        cache=cache,
+    )
+
+
 def _prepared_orbital_rhs(prepared, pairs):
     """Pack one adjoint RHS and apply any objective-specific additive shift."""
     rhs = pack_m_matrix(prepared.m_matrix, pairs)

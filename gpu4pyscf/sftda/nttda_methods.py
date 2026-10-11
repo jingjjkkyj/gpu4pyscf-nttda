@@ -172,25 +172,27 @@ def ensemble_hf_probes(p0, pz):
     return 0.5 * p0, 0.5 * p0
 
 
-def prepare_gradient(method, driver, td, xy, **options):
-    from gpu4pyscf.grad._nttda import delta_s_minus_one, delta_s_zero
+def gradient_channel(td):
+    """Return the channel's scalar functional and XC requests."""
+    from gpu4pyscf.grad._nttda import delta_s_minus_one, delta_s_zero, delta_s_plus_one
 
-    channels = {-1: delta_s_minus_one, 0: delta_s_zero}
-    if td.deltaS == 1:
-        raise NotImplementedError(
-            "Analytic NTTDA gradients are not implemented for deltaS=1; use method='finite_diff'."
-        )
+    channels = {-1: delta_s_minus_one, 0: delta_s_zero, 1: delta_s_plus_one}
     if td.deltaS not in channels:
         raise ValueError('deltaS must be -1, 0, or 1')
-    return channels[td.deltaS].prepare_grad_elec(driver, td, xy, **options)
+    return channels[td.deltaS]
+
+
+def prepare_gradient(method, driver, td, xy, **options):
+    return gradient_channel(td).prepare_grad_elec(driver, td, xy, **options)
 
 
 def prepare_cross(method, driver, td, xy_i, xy_j, **options):
-    from gpu4pyscf.grad._nttda import delta_s_minus_one
+    from gpu4pyscf.grad._nttda.response import prepare_polarized_cross
 
-    if td.deltaS != -1:
-        raise NotImplementedError('NTTDA NAC currently supports only deltaS=-1')
-    return delta_s_minus_one.prepare_grad_elec_cross(driver, td, xy_i, xy_j, **options)
+    channel = gradient_channel(td)
+    if td.deltaS == -1:
+        return channel.prepare_grad_elec_cross(driver, td, xy_i, xy_j, **options)
+    return prepare_polarized_cross(driver, td, xy_i, xy_j, **options)
 
 
 def gradient_components(method, driver, xy, atmlst, response_cache=None):

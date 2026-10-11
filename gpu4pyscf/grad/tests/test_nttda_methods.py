@@ -47,7 +47,7 @@ def solve(td, delta_s=-1):
 
 
 @pytest.mark.parametrize('case', CASES, ids=[case[2] for case in CASES])
-@pytest.mark.parametrize('delta_s', [-1, 0])
+@pytest.mark.parametrize('delta_s', [-1, 0, 1])
 @pytest.mark.parametrize('df', [False, True])
 def test_explicit_and_legacy_agree(case, delta_s, df):
     kind, factory, ident, nobeta = case
@@ -64,9 +64,10 @@ def test_explicit_and_legacy_agree(case, delta_s, df):
 
 @pytest.mark.parametrize('case', CASES, ids=[case[2] for case in CASES])
 @pytest.mark.parametrize('df', [False, True])
-def test_joint_frame_and_warm_guess_match_independent_properties(case, df):
+@pytest.mark.parametrize('delta_s', [-1, 0, 1])
+def test_joint_frame_and_warm_guess_match_independent_properties(case, df, delta_s):
     kind, factory, ident, _ = case
-    td = solve(factory(reference(kind, df=df)))
+    td = solve(factory(reference(kind, df=df)), delta_s)
     grad = td.Gradients().set(cphf_conv_tol=1e-10).kernel(state=1)
     nac_driver = td.NAC().set(cphf_conv_tol=1e-10, ediff=True)
     full = nac_driver.kernel(state_I=1, state_J=2, use_etfs=False)

@@ -192,11 +192,7 @@ def compute_frame(
     while ``use_etfs=True`` removes only its AO connection and retains its
     additional orbital response.
     """
-    if td.deltaS != -1:
-        raise NotImplementedError(
-            'compute_frame batching currently supports only deltaS=-1; '
-            'use td.Gradients().kernel() for a deltaS=0 gradient'
-        )
+    delta = methods.gradient_channel(td)
 
     from gpu4pyscf.nac.nttda import _nac_from_context
     from gpu4pyscf.grad.nttda import _gradients_from_context
@@ -263,7 +259,7 @@ def compute_frame(
     cache = context
     backend = context.ledger
 
-    from . import delta_s_minus_one as delta, response
+    from . import response
 
     atmlst = tuple(range(td.mol.natm))
     task_keys = [('grad', state) for state in gradient_states]
@@ -293,7 +289,7 @@ def compute_frame(
         spaces = gradient_requests[0][1]
         pz_batch = [request[2] for request in gradient_requests]
         for state_i, state_j in nac_pairs:
-            request = delta.cross_xc_request(
+            request = response.cross_xc_request(
                 nac.base,
                 nac.base.xy[state_i - 1],
                 nac.base.xy[state_j - 1],

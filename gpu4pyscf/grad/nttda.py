@@ -37,7 +37,7 @@ def _reference_energy(mf):
 
 
 class Gradients(rhf_grad.GradientsBase):
-    """Analytic NTTDA gradients for ``deltaS=-1`` and ``deltaS=0``."""
+    """Analytic NTTDA gradients for ``deltaS=-1/0/+1``."""
 
     _keys = rhf_grad.GradientsBase._keys | {
         'state',

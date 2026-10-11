@@ -528,39 +528,6 @@ def gradient_xc_request(tdobj, xy):
     return channel_data, spaces, pz
 
 
-def cross_xc_request(tdobj, xy_i, xy_j):
-    """Return the two polarized XC channels and cross Fz probe."""
-    quarter = 0.25
-    x_plus = _combine_amplitudes(xy_i, xy_j, 1.0)
-    x_minus = _combine_amplitudes(xy_i, xy_j, -1.0)
-    spaces, amp_plus, dens_plus = spin_lowering_transition_densities(
-        tdobj,
-        x_plus,
-    )
-    _spaces_m, amp_minus, dens_minus = spin_lowering_transition_densities(
-        tdobj,
-        x_minus,
-    )
-    terms = spin_lowering_response_terms(spaces.spin)
-    channel_plus = (
-        spaces,
-        amp_plus,
-        dens_plus,
-        spin_lowering_block_data(spaces, amp_plus),
-        terms,
-    )
-    channel_minus = (
-        spaces,
-        amp_minus,
-        dens_minus,
-        spin_lowering_block_data(spaces, amp_minus),
-        terms,
-    )
-    _p0_plus, pz_plus = spin_lowering_fock_probes(tdobj, x_plus)
-    _p0_minus, pz_minus = spin_lowering_fock_probes(tdobj, x_minus)
-    return (channel_plus, channel_minus), spaces, quarter * (pz_plus - pz_minus)
-
-
 def prepare_grad_elec(
     gradient_driver, tdobj, xy, atmlst=None, tolerance=1e-12, max_cycle=None, cache=None, xc_terms=None
 ):
@@ -586,7 +553,6 @@ def prepare_grad_elec(
     p0, pz = spin_lowering_fock_probes(tdobj, xy)
     jk_ledger = _JKDerivativeLedger()
     direct_slot = 'direct'
-    zvector_slot = 'zvector'
 
     # 2. Explicit Fock contribution to the orbital-rotation M matrix.
     fock_alpha, fock_beta = spin_lowering_fock_q(tdobj, xy, cache=cache)
@@ -874,7 +840,6 @@ def prepare_grad_elec_cross(
 
     jk_ledger = _JKDerivativeLedger()
     direct_slot = 'direct'
-    zvector_slot = 'zvector'
 
     if xctype == 'HF':
         m_matrix = fock_alpha + fock_beta + hfx_alpha + hfx_beta

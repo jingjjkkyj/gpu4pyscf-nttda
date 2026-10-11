@@ -76,7 +76,8 @@ def test_derivatives_match_cpu_on_identical_solution(case, xc, channel):
         np.testing.assert_allclose(actual, expected, atol=1e-6, rtol=0)
 
 
-def test_solver_gradient_and_nac_do_not_import_forge():
+@pytest.mark.parametrize('channel', [-1, 0, 1])
+def test_solver_gradient_and_nac_do_not_import_forge(channel):
     script = '''
 import importlib.abc
 import sys
@@ -92,13 +93,13 @@ mol = gto.M(atom='C 0 0 0; H 0 .8 .6; H 0 -.9 .5', basis='sto-3g', spin=2, verbo
 mf = EnsembleROKS(mol, xc='PBE').set(conv_tol=1e-12)
 mf.grids.level = 0
 mf.run()
-td = NTTDA_EnsembleROKS(mf).set(nstates=3, conv_tol=1e-9).run()
+td = NTTDA_EnsembleROKS(mf).set(deltaS=CHANNEL, nstates=3, conv_tol=1e-9).run()
 td.Gradients().kernel(state=1)
 td.NAC().kernel(state_I=1, state_J=2, use_etfs=False)
 compute_frame(td, 1, [(1, 2)], use_etfs=False)
 assert not any(n.startswith(('pyscf.sftda', 'pyscf.grad.nttda', 'pyscf.nac')) for n in sys.modules)
 '''
-    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, '-c', script.replace('CHANNEL', str(channel))], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -137,8 +138,9 @@ def test_displaced_roks_retains_functional_and_integral_model(density_fit):
 
 
 @pytest.mark.parametrize('use_etfs', [False, True])
-def test_nac_scanner_uses_the_new_electronic_solution(use_etfs):
-    td = solution(ROKS, NTTDA_ROKS, 'PBE', -1)
+@pytest.mark.parametrize('channel', [-1, 0, 1])
+def test_nac_scanner_uses_the_new_electronic_solution(use_etfs, channel):
+    td = solution(ROKS, NTTDA_ROKS, 'PBE', channel)
     scanner = td.NAC().set(state_I=1, state_J=2, use_etfs=use_etfs).as_scanner()
     previous_cache = scanner._context
     coordinates = td.mol.atom_coords()

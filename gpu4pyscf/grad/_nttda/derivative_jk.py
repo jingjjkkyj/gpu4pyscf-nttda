@@ -19,7 +19,7 @@ class _JKDerivativeTerm:
 
 
 class _JKDerivativeLedger:
-    """Spin-lowering scheduler for fixed-AO J/K derivatives."""
+    """Scheduler for fixed-AO J/K derivatives in any spin channel."""
 
     def __init__(self):
         self._terms = {'j': [], 'k': []}
@@ -33,6 +33,12 @@ class _JKDerivativeLedger:
 
     def contract(self, gradient_driver, mol, atoms, slots=()):
         return gradient_driver._context.ledger(self._terms, mol, atoms, slots)
+
+    def extend(self, other, scale=1.0):
+        """Accumulate another uncontracted functional, preserving its slots."""
+        for operator, terms in other._terms.items():
+            for term in terms:
+                self.add(operator, term.slot, [(term.left, term.right, scale * term.scale, term.omega)])
 
 
 def _reference_spin_densities(tdobj):

@@ -1,5 +1,18 @@
-#!/usr/bin/env python
-"""Analytic nonadiabatic couplings for NTTDA ``deltaS=-1``.
+# Copyright 2026 The NEST Developers and The PySCF Developers. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Analytic nonadiabatic couplings for all three NTTDA spin channels.
 
 The interstate numerator is a bilinear derivative of the analytic
 excitation-gradient functional.  The moving-CSF connection is evaluated
@@ -73,8 +86,12 @@ def _orbital_partition(tdobj):
     closed = np.flatnonzero(occ == 2)
     open_ = np.flatnonzero(occ == 1)
     virtual = np.flatnonzero(occ == 0)
-    if len(open_) < 2:
+    if tdobj.deltaS not in (-1, 0, 1):
+        raise ValueError('deltaS must be -1, 0, or 1')
+    if tdobj.deltaS == -1 and len(open_) < 2:
         raise ValueError('NTTDA deltaS=-1 NAC requires reference spin S >= 1')
+    if tdobj.deltaS == 0 and not len(open_):
+        raise ValueError('NTTDA deltaS=0 NAC requires reference spin S >= 1/2')
     return closed, open_, virtual
 
 
@@ -176,15 +193,32 @@ def _tensor_component(state, target, source, projection, nmo):
 
 
 @lru_cache(maxsize=None)
-def _spin_adapted_configuration(nclosed, nopen, nvirtual, target, source):
-    """One normalized NTTDA ``S_t=S-1`` tensor configuration.
+def _spin_adapted_configuration(nclosed, nopen, nvirtual, target, source, delta_s=-1, rank=1):
+    """Highest-weight CSF with the solver's normalization and CV0 phase.
 
-    The three terms couple rank-one spin-tensor projections ``-1/0/+1`` to
-    normalized reference components ``M=S/S-1/S-2``.  The final factor
-    depends on whether the source is closed/open and target is open/virtual.
+    Spin-lowering uses three tensor projections and its redundant OO metric;
+    same-spin uses two projections, and raising uses only the +1 projection.
     """
     nmo = nclosed + nopen + nvirtual
     spin = 0.5 * nopen
+    if delta_s != -1:
+        reference = _thaw_state(_reference_component(nclosed, nopen, nvirtual, 0))
+        if rank == 0:
+            # The solver's CV0 basis has a minus sign relative to E_ai/sqrt(2).
+            state = _state_combine([
+                (-1 / math.sqrt(2), _apply_one_body(reference, target, source)),
+                (-1 / math.sqrt(2), _apply_one_body(reference, nmo + target, nmo + source)),
+            ])
+        elif delta_s == 1:
+            state = _tensor_component(reference, target, source, 1, nmo)
+        else:
+            lowered = _thaw_state(_reference_component(nclosed, nopen, nvirtual, 1))
+            state = _state_combine([
+                (math.sqrt(spin / (spin + 1)), _tensor_component(reference, target, source, 0, nmo)),
+                (-1 / math.sqrt(spin + 1), _tensor_component(lowered, target, source, 1, nmo)),
+            ])
+        return _freeze_state(_state_scale(state, 1 / _state_norm(state)))
+
     coefficients = (
         math.sqrt((2.0 * spin - 1.0) / (2.0 * spin + 1.0)),
         -math.sqrt((2.0 * spin - 1.0) / (spin * (2.0 * spin + 1.0))),
@@ -254,41 +288,47 @@ class CSFConnectionComponents:
     residual: float
 
 
+def _amplitude_blocks(tdobj, xy):
+    """Host CO/CV/OO/OV/CV0 blocks in the solver's native convention."""
+    nc, no, nv = map(len, _orbital_partition(tdobj))
+    x = _as_x_array(xy)
+    if tdobj.deltaS == 1:
+        return None, x.reshape(nc, nv), None, None, None
+    if tdobj.deltaS == -1:
+        x = x.reshape(nc + no, no + nv)
+        return x[:nc, :no], x[:nc, no:], x[nc:, :no], x[nc:, no:], None
+    sizes = (nc * no, nc * nv, 1, no * nv, nc * nv)
+    if x.size != sum(sizes):
+        raise ValueError('deltaS=0 amplitude has size %d; expected %d' % (x.size, sum(sizes)))
+    co, cv, oo, ov, cv0 = np.split(x.ravel(), np.cumsum(sizes)[:-1])
+    return co.reshape(nc, no), cv.reshape(nc, nv), oo[0], ov.reshape(no, nv), cv0.reshape(nc, nv)
+
+
 def build_spin_adapted_awf(tdobj, xy, cutoff=_COEFFICIENT_CUTOFF):
-    """Expand one NTTDA ``deltaS=-1`` root in spin-adapted determinants."""
-    if getattr(tdobj, 'deltaS', None) != -1:
-        raise NotImplementedError('NTTDA AWF currently supports only deltaS=-1')
-    closed, open_, virtual = _orbital_partition(tdobj)
-    nclosed, nopen, nvirtual = len(closed), len(open_), len(virtual)
-    nmo = nclosed + nopen + nvirtual
-    amplitude = _as_x_array(xy)
-    expected = (nclosed + nopen, nopen + nvirtual)
-    if amplitude.size != expected[0] * expected[1]:
-        raise ValueError('deltaS=-1 amplitude has shape %s; expected %s' % (amplitude.shape, expected))
-    amplitude = amplitude.reshape(expected)
+    """Expand a root in spin-adapted determinants, without normalizing X."""
+    nc, no, nv = map(len, _orbital_partition(tdobj))
+    nmo = nc + no + nv
+    co, cv, oo, ov, cv0 = _amplitude_blocks(tdobj, xy)
+    closed, open_, virtual = range(nc), range(nc, nc + no), range(nc + no, nmo)
+    blocks = [(cv, closed, virtual, 1)]
     state = {}
-    for source_local, source in enumerate(range(nclosed + nopen)):
-        for target_local, target in enumerate(range(nclosed, nmo)):
-            weight = amplitude[source_local, target_local]
-            if abs(weight) < cutoff:
-                continue
-            configuration = _thaw_state(
-                _spin_adapted_configuration(
-                    nclosed,
-                    nopen,
-                    nvirtual,
-                    target,
-                    source,
-                )
-            )
-            for determinant, coefficient in configuration.items():
-                _state_add(state, determinant, weight * coefficient)
-    return AuxiliaryWavefunction(
-        nmo=nmo,
-        nalpha=nclosed + nopen - 1,
-        nbeta=nclosed + 1,
-        coefficients=state,
-    )
+    if tdobj.deltaS != 1:
+        blocks.extend(((co, closed, open_, 1), (ov, open_, virtual, 1)))
+        if tdobj.deltaS == 0:
+            state = _state_scale(_thaw_state(_reference_component(nc, no, nv, 0)), oo)
+            blocks.append((cv0, closed, virtual, 0))
+        else:
+            blocks.append((oo, open_, open_, 1))
+    for block, sources, targets, rank in blocks:
+        for i, source in enumerate(sources):
+            for a, target in enumerate(targets):
+                weight = block[i, a]
+                if abs(weight) < cutoff:
+                    continue
+                configuration = _spin_adapted_configuration(nc, no, nv, target, source, tdobj.deltaS, rank)
+                for determinant, coefficient in configuration:
+                    _state_add(state, determinant, weight * coefficient)
+    return AuxiliaryWavefunction(nmo, nc + no + tdobj.deltaS, nc - tdobj.deltaS, state)
 
 
 def _spin_summed_rdm1(left, right):
@@ -341,10 +381,14 @@ def interstate_rdm1(tdobj, xy_i, xy_j, method='analytic'):
     if method == 'analytic':
         return interstate_rdm1_analytic(tdobj, xy_i, xy_j)
     if method == 'determinant':
-        return _spin_summed_rdm1(
+        canonical = _spin_summed_rdm1(
             build_spin_adapted_awf(tdobj, xy_i),
             build_spin_adapted_awf(tdobj, xy_j),
         )
+        order = np.concatenate(_orbital_partition(tdobj))
+        gamma = np.empty_like(canonical)
+        gamma[np.ix_(order, order)] = canonical
+        return gamma
     raise ValueError('unknown interstate RDM method %s' % method)
 
 
@@ -357,30 +401,51 @@ def interstate_rdm1_analytic(tdobj, xy_i, xy_j):
     """
     closed, open_, virtual = _orbital_partition(tdobj)
     ncs, nos, nvs = len(closed), len(open_), len(virtual)
-    nocc, nvir = ncs + nos, nos + nvs
     nmo = ncs + nos + nvs
     spin = 0.5 * nos
 
-    def get_x(xy):
-        return _as_x_array(xy).reshape(nocc, nvir)
+    m_co, m_cv, m_oo, m_ov, m_cv0 = (
+        None if block is None else block.conj() for block in _amplitude_blocks(tdobj, xy_i)
+    )
+    n_co, n_cv, n_oo, n_ov, n_cv0 = _amplitude_blocks(tdobj, xy_j)
+    gamma = np.zeros((nmo, nmo), dtype=np.result_type(m_cv, n_cv))
 
-    mx = get_x(xy_i).conj()
-    nx = get_x(xy_j)
-    m_co, m_cv = mx[:ncs, :nos], mx[:ncs, nos:]
-    m_oo, m_ov = mx[ncs:, :nos], mx[ncs:, nos:]
-    n_co, n_cv = nx[:ncs, :nos], nx[:ncs, nos:]
-    n_oo, n_ov = nx[ncs:, :nos], nx[ncs:, nos:]
+    def add(rows, cols, block):
+        gamma[np.ix_(rows, cols)] += block
+
+    if tdobj.deltaS == 1:
+        add(closed, closed, -np.einsum('ia,ja->ji', m_cv, n_cv))
+        add(virtual, virtual, np.einsum('ia,ib->ab', m_cv, n_cv))
+        return gamma
+    if tdobj.deltaS == 0:
+        f = math.sqrt((spin + 1) / (2 * spin))
+        add(closed, open_, -m_oo * n_co)
+        add(open_, closed, -m_co.T * n_oo)
+        add(open_, virtual, m_oo * n_ov)
+        add(virtual, open_, m_ov.T * n_oo)
+        add(closed, virtual, -math.sqrt(2) * m_oo * n_cv0)
+        add(virtual, closed, -math.sqrt(2) * m_cv0.T * n_oo)
+        add(open_, open_, np.einsum('iu,iv->uv', m_co, n_co) - np.einsum('ua,va->vu', m_ov, n_ov))
+        add(closed, closed, -np.einsum('iu,ju->ji', m_co, n_co))
+        add(virtual, virtual, np.einsum('ua,ub->ab', m_ov, n_ov))
+        for left, right in ((m_cv, n_cv), (m_cv0, n_cv0)):
+            add(closed, closed, -np.einsum('ia,ja->ji', left, right))
+            add(virtual, virtual, np.einsum('ia,ib->ab', left, right))
+        add(open_, virtual, f * np.einsum('iu,ib->ub', m_co, n_cv))
+        add(virtual, open_, f * np.einsum('ia,iv->av', m_cv, n_co))
+        add(closed, open_, -f * np.einsum('ua,ja->ju', m_ov, n_cv))
+        add(open_, closed, -f * np.einsum('ia,va->vi', m_cv, n_ov))
+        add(open_, virtual, np.einsum('iu,ib->ub', m_co, n_cv0) / math.sqrt(2))
+        add(virtual, open_, np.einsum('ia,iv->av', m_cv0, n_co) / math.sqrt(2))
+        add(closed, open_, np.einsum('ua,ja->ju', m_ov, n_cv0) / math.sqrt(2))
+        add(open_, closed, np.einsum('ia,va->vi', m_cv0, n_ov) / math.sqrt(2))
+        return gamma
 
     a = math.sqrt(2.0 * spin / (2.0 * spin - 1.0))
     b = 1.0 / math.sqrt(2.0 * spin * (2.0 * spin - 1.0))
     f = math.sqrt((2.0 * spin + 1.0) / (2.0 * spin))
     tr_moo = np.trace(m_oo)
     tr_noo = np.trace(n_oo)
-
-    gamma = np.zeros((nmo, nmo), dtype=np.result_type(mx, nx))
-
-    def add(rows, cols, block):
-        gamma[np.ix_(rows, cols)] += block
 
     # OO-OO
     add(open_, open_, np.einsum('ut,uv->tv', m_oo, n_oo))
@@ -448,8 +513,8 @@ def awf_overlap(td_left, xy_left, td_right, xy_right, ao_overlap=None):
             td_left.mol,
             td_right.mol,
         )
-    coefficient_left = _host_array(td_left._scf.mo_coeff)
-    coefficient_right = _host_array(td_right._scf.mo_coeff)
+    coefficient_left = _host_array(td_left._scf.mo_coeff)[:, np.concatenate(_orbital_partition(td_left))]
+    coefficient_right = _host_array(td_right._scf.mo_coeff)[:, np.concatenate(_orbital_partition(td_right))]
     mo_overlap = coefficient_left.conj().T @ ao_overlap @ coefficient_right
     return _awf_overlap_from_mo(left, right, mo_overlap)
 
@@ -607,25 +672,25 @@ def get_hf_interstate_numerator(td_nac, x_y_i, x_y_j, atmlst=None, verbose=logge
     r"""Return the relaxed-orbital numerator ``X_I^T A^[R] X_J``.
 
     ``method="direct"`` (default) evaluates the bilinear cross functional
-    with a single Z-vector solve, one shared J/K derivative ledger, and
-    single evaluations of the probe-linear layers.
+    with a single Z-vector solve and one shared J/K derivative ledger.
+    DeltaS=-1 has specialized bilinear preparation; deltaS=0/+1 polarize
+    unrelaxed data before that solve.
     ``method="polarization"`` uses the original
     ``0.25*(g(X_I+X_J) - g(X_I-X_J))`` route (two full gradient
     evaluations sharing one geometry-fixed cache); the two agree to
     solver precision and the polarization route is kept as a validation
     reference.
     """
-    if td_nac.base.deltaS != -1:
-        raise NotImplementedError('NTTDA NAC currently supports only deltaS=-1')
     if method is None:
         method = getattr(td_nac, 'numerator_method', 'direct')
     if cache is None:
         cache = ResponseCache(td_nac.base)
     gradient = td_nac._gradient_driver(verbose=verbose)
     if method == 'direct':
-        from gpu4pyscf.grad._nttda.delta_s_minus_one import grad_elec_cross
+        from gpu4pyscf.grad._nttda.response import finish_prepared_gradients
 
-        components = grad_elec_cross(
+        prepared = methods.prepare_cross(
+            methods.get_method(td_nac.base),
             gradient,
             td_nac.base,
             x_y_i,
@@ -635,7 +700,7 @@ def get_hf_interstate_numerator(td_nac, x_y_i, x_y_j, atmlst=None, verbose=logge
             max_cycle=td_nac.cphf_max_cycle,
             cache=cache,
         )
-        return components.total
+        return finish_prepared_gradients((prepared,))[0].total
     if method != 'polarization':
         raise ValueError('unknown NAC numerator method %s' % method)
     plus = gradient.grad_elec(
@@ -687,12 +752,19 @@ def _approx_root_overlap_matrix(reference, displaced, ao_overlap):
     phase alignment need; it is NOT a substitute for ``awf_overlap`` in
     finite-difference couplings.
     """
+    if reference.deltaS == 0:
+        # A single occupied/virtual rectangle cannot represent the scalar OO
+        # and the two differently coupled CV blocks. Use the exact AWF metric.
+        return _root_overlap_matrix(reference, displaced, method='awf')
     closed_r, open_r, virtual_r = _orbital_partition(reference)
     closed_d, open_d, virtual_d = _orbital_partition(displaced)
     rows_r = np.concatenate((closed_r, open_r))
     rows_d = np.concatenate((closed_d, open_d))
     cols_r = np.concatenate((open_r, virtual_r))
     cols_d = np.concatenate((open_d, virtual_d))
+    if reference.deltaS == 1:
+        rows_r, rows_d = closed_r, closed_d
+        cols_r, cols_d = virtual_r, virtual_d
     coeff_r = _host_array(reference._scf.mo_coeff)
     coeff_d = _host_array(displaced._scf.mo_coeff)
     mo_overlap = coeff_r.conj().T @ ao_overlap @ coeff_d
@@ -770,7 +842,7 @@ def _copy_td_snapshot(tdobj):
 
 
 class NonAdiabaticCouplings(rhf_grad.GradientsBase):
-    """Analytic NTTDA ``deltaS=-1`` excited-state NAC driver.
+    """Analytic NTTDA excited-state NAC driver for deltaS=-1/0/+1.
 
     ``use_etfs=False`` includes the full moving-CSF contribution.
     ``use_etfs=True`` removes only its antisymmetric AO connection and
@@ -824,7 +896,7 @@ class NonAdiabaticCouplings(rhf_grad.GradientsBase):
 
     def dump_flags(self, verbose=None):
         log = logger.new_logger(self, verbose)
-        log.info('******** NTTDA deltaS=-1 NAC ********')
+        log.info('******** NTTDA deltaS=%+d NAC ********', self.base.deltaS)
         log.info('state_I = %s', self.state_I)
         log.info('state_J = %s', self.state_J)
         log.info('ediff = %s', self.ediff)
@@ -862,8 +934,7 @@ class NonAdiabaticCouplings(rhf_grad.GradientsBase):
 
     def _validate_states(self, state_i, state_j):
         self._context.validate()
-        if self.base.deltaS != -1:
-            raise NotImplementedError('NTTDA NAC currently supports only deltaS=-1')
+        _orbital_partition(self.base)
         if self.base.xy is None:
             self.base.run()
         methods.bind_method(self.base, derivative=True)
