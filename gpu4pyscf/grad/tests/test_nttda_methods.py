@@ -63,11 +63,16 @@ def test_explicit_and_legacy_agree(case, delta_s, df):
 
 
 @pytest.mark.parametrize('case', CASES, ids=[case[2] for case in CASES])
-def test_joint_frame_and_warm_guess_match_independent_properties(case):
+@pytest.mark.parametrize('df', [False, True])
+def test_joint_frame_and_warm_guess_match_independent_properties(case, df):
     kind, factory, ident, _ = case
-    td = solve(factory(reference(kind, df=True)))
+    td = solve(factory(reference(kind, df=df)))
     grad = td.Gradients().set(cphf_conv_tol=1e-10).kernel(state=1)
-    nac = td.NAC().set(cphf_conv_tol=1e-10).kernel(state_I=1, state_J=2, ediff=True, use_etfs=True)
+    nac_driver = td.NAC().set(cphf_conv_tol=1e-10, ediff=True)
+    full = nac_driver.kernel(state_I=1, state_J=2, use_etfs=False)
+    ao = nac_driver.nttda_nac_details['csf_ao']
+    nac = nac_driver.kernel(state_I=1, state_J=2, use_etfs=True)
+    np.testing.assert_allclose(nac, full - ao, atol=5e-9, rtol=0)
     cache = make_frame_cache()
     for _ in range(2):
         result = compute_frame(td, 1, [(1, 2)], frame_cache=cache)

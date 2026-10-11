@@ -28,7 +28,14 @@ frame = compute_frame(td, active_state=1, nac_pairs=[(1, 2)],
 supported. States are one-based; gradient state 0 selects the reference.
 Gradients support `deltaS=-1,0`; NAC and joint frames support `deltaS=-1`.
 With `gap = omega_J - omega_I`, full NAC is `N_HF/gap + d_CSF`.
-`use_etfs=True` omits `d_CSF`; `ediff=False` returns the energy-scaled result.
+Here `d_CSF = d_AO + d_orbital`. `use_etfs=True` removes only `d_AO`,
+retaining `N_HF/gap + d_orbital`; `ediff=False` returns the energy-scaled result.
+This applies to both the standalone NAC driver and `compute_frame`, including
+FSSH calls. The previous ETF implementation dropped all of `d_CSF` and thus
+missed the additional orbital response of NTTDA's moving spin-adapted basis.
+The correction reuses the existing CSF adjoint solve and response cache; ETF
+calculations now also incur that solve. See the [ETF derivation](derivations/nttda_etf.md).
+`NAC.finite_difference()` always returns the full AWF derivative coupling.
 
 ## Code map and ownership
 

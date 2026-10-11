@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 """Analytic nonadiabatic couplings for NTTDA ``deltaS=-1``.
 
-The Hellmann--Feynman/ETF numerator is obtained by polarizing the trusted
-analytic excitation-gradient functional.  The remaining moving-CSF
-connection is evaluated from an explicitly spin-adapted auxiliary
-wavefunction (AWF).  The same AWF supplies a deliberately slow,
-cross-geometry overlap finite-difference reference.
+The interstate numerator is a bilinear derivative of the analytic
+excitation-gradient functional.  The moving-CSF connection is evaluated
+from the spin-adapted auxiliary wavefunction (AWF) interstate density.
+The same AWF supplies a deliberately slow, cross-geometry overlap
+finite-difference reference.
 
 With ``gap = omega_J-omega_I``, the full derivative coupling is
 ``d_IJ = N_HF/gap + d_CSF``.  ``N_HF`` is a relaxed bilinear derivative of
 the NTTDA action; ``d_CSF`` contains AO-basis motion plus its own orbital
-response.  See ``docs/derivations/ensemble_rks_nttda_gradient_nac.md`` for
-the tensor-CSF coefficients, interstate 1-RDM, and sign convention.
+response.  ETFs remove only the AO part: ``d_ETF = N_HF/gap + d_orbital``.
+See ``docs/derivations/nttda_etf.md`` for the correction and conventions.
 """
 
 import copy
@@ -772,8 +772,9 @@ def _copy_td_snapshot(tdobj):
 class NonAdiabaticCouplings(rhf_grad.GradientsBase):
     """Analytic NTTDA ``deltaS=-1`` excited-state NAC driver.
 
-    ``use_etfs=False`` includes the moving-CSF contribution.  With
-    ``use_etfs=True`` only the Hellmann--Feynman/ETF term is retained.
+    ``use_etfs=False`` includes the full moving-CSF contribution.
+    ``use_etfs=True`` removes only its antisymmetric AO connection and
+    retains the additional orbital response of the moving CSFs.
     ``ediff=False`` returns the energy-scaled numerator; ``ediff=True``
     returns the derivative coupling in inverse length units.
     """
@@ -897,8 +898,8 @@ class NonAdiabaticCouplings(rhf_grad.GradientsBase):
         self.x_y_J_prev = copy.deepcopy(xy_j)
         gap = self.base.e[state_j - 1] - self.base.e[state_i - 1]
 
-        # This cross derivative already includes reference-orbital relaxation
-        # through one gradient-like Z-vector equation.
+        # This cross derivative includes relaxation of the excitation matrix;
+        # the moving CSFs still contribute their own orbital response below.
         cache = self._make_response_cache()
         hf_numerator = get_hf_interstate_numerator(
             self,
@@ -909,28 +910,23 @@ class NonAdiabaticCouplings(rhf_grad.GradientsBase):
             cache=cache,
         )
         hf_numerator = _host_array(hf_numerator)
-        if use_etfs:
-            csf = np.zeros_like(hf_numerator)
-            csf_components = None
-            numerator = hf_numerator
-        else:
-            # Moving CSFs contribute directly to d_IJ.  Multiplication by the
-            # gap converts them to the energy-scaled numerator convention.
-            csf_components = nac_csf_components(
-                self,
-                xy_i,
-                xy_j,
-                atmlst=atmlst,
-                cache=cache,
-            )
-            csf = csf_components.total
-            numerator = hf_numerator + gap * csf
+        csf_components = nac_csf_components(
+            self,
+            xy_i,
+            xy_j,
+            atmlst=atmlst,
+            cache=cache,
+        )
+        # ETFs remove the AO connection, not the independent orbital response.
+        # Multiply the retained connection by the gap for the numerator API.
+        csf = csf_components.orbital if use_etfs else csf_components.total
+        numerator = hf_numerator + gap * csf
         self.nttda_nac_details = {
             'hf_numerator': hf_numerator,
             'csf': csf,
-            'csf_ao': None if csf_components is None else csf_components.ao,
-            'csf_orbital': (None if csf_components is None else csf_components.orbital),
-            'csf_residual': (None if csf_components is None else csf_components.residual),
+            'csf_ao': csf_components.ao,
+            'csf_orbital': csf_components.orbital,
+            'csf_residual': csf_components.residual,
             'full_numerator': numerator,
             'gap': gap,
             'state_I': state_i,
@@ -987,7 +983,7 @@ class NonAdiabaticCouplings(rhf_grad.GradientsBase):
         return tdobj
 
     def finite_difference(self, state_I=None, state_J=None, atmlst=None, step=None):
-        """Balanced spin-adapted AWF-overlap finite-difference NAC."""
+        """Full AWF-overlap derivative coupling, independent of use_etfs/ediff."""
         state_i = self.state_I if state_I is None else state_I
         state_j = self.state_J if state_J is None else state_J
         if state_i is None or state_j is None:

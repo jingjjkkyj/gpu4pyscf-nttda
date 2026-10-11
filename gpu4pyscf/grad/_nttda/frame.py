@@ -188,8 +188,9 @@ def compute_frame(
     value additionally contains ``'gradients': {state: (natm, 3)}``;
     ``'grad'`` remains the active-state gradient for compatibility.  NAC
     entries are derivative couplings (the energy-scaled numerator divided by
-    the state gap); ``use_etfs=False`` includes the moving-CSF term, while
-    ``use_etfs=True`` retains the ETF/Hellmann--Feynman term.
+    the state gap); ``use_etfs=False`` includes the full moving-CSF term,
+    while ``use_etfs=True`` removes only its AO connection and retains its
+    additional orbital response.
     """
     if td.deltaS != -1:
         raise NotImplementedError(
@@ -541,14 +542,14 @@ def compute_frame(
         if abs(gap) < nac.gap_tol:
             raise ZeroDivisionError('NTTDA state gap %.6e is below gap_tol %.6e' % (gap, nac.gap_tol))
         numerator = cp.asnumpy(cp.asarray(item.total))
-        if not use_etfs:
-            csf = nac_module.nac_csf_components(
-                nac,
-                nac.base.xy[state_i - 1],
-                nac.base.xy[state_j - 1],
-                cache=cache,
-            )
-            numerator = numerator + gap * cp.asnumpy(cp.asarray(csf.total))
+        csf = nac_module.nac_csf_components(
+            nac,
+            nac.base.xy[state_i - 1],
+            nac.base.xy[state_j - 1],
+            cache=cache,
+        )
+        connection = csf.orbital if use_etfs else csf.total
+        numerator = numerator + gap * connection
         result['nac'][(state_i, state_j)] = np.real_if_close(
             numerator / gap,
         )

@@ -136,14 +136,15 @@ def test_displaced_roks_retains_functional_and_integral_model(density_fit):
     assert not cp.shares_memory(displaced.grids.coords, mf.grids.coords)
 
 
-def test_nac_scanner_uses_the_new_electronic_solution():
+@pytest.mark.parametrize('use_etfs', [False, True])
+def test_nac_scanner_uses_the_new_electronic_solution(use_etfs):
     td = solution(ROKS, NTTDA_ROKS, 'PBE', -1)
-    scanner = td.NAC().set(state_I=1, state_J=2, use_etfs=False).as_scanner()
+    scanner = td.NAC().set(state_I=1, state_J=2, use_etfs=use_etfs).as_scanner()
     previous_cache = scanner._context
     coordinates = td.mol.atom_coords()
     coordinates[1, 2] += 1e-3
     mol = td.mol.copy().set_geom_(coordinates, unit='Bohr')
     actual = scanner(mol)
-    expected = td.NAC().kernel(state_I=1, state_J=2, use_etfs=False)
+    expected = td.NAC().kernel(state_I=1, state_J=2, use_etfs=use_etfs)
     assert scanner._context is not previous_cache
     np.testing.assert_allclose(actual, expected, atol=1e-8, rtol=0)

@@ -68,3 +68,40 @@ host quadrature；这不需要 forge。大型体系和 cuTENSOR 后端的性能�
 本次运行日志保存在 `/tmp/nttda-refactor/`：`cpu-acceptance.log`、
 `cpu-independent.log`、`gpu-acceptance.log`、`gpu-kernels.log`，
 以及 `baseline_comparison.json`。上述测试在提交源码前完成。
+
+## ETF 修正验收（2026-10-11）
+
+独立 NAC 和 `compute_frame` 的 `use_etfs=True` 现在只删除反对称 AO 联络，
+保留移动组态基的额外轨道响应。完整 NAC 的公式保持不变。
+这修正了上述历史版本的 ETF 行为；当前公式见 [推导](derivations/nttda_etf.md)。
+
+新增独立重叠差分回归在修改前先复现 HF 算例的 ETF 最大误差
+`0.04729087` Bohr^-1，同时完整 NAC 检查通过。修正后 HF/PBE 的完整/ETF
+差分均满足原定 `3e-5` Bohr^-1 阈值，没有放宽收敛或验收条件。
+
+环境：WSL CUDA GPU、Python 3.10、PySCF 2.8.0、CuPy 13.4.1；
+`OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1`，
+`PYTHONPATH=.`。本地环境使用
+`LD_LIBRARY_PATH=/usr/lib/wsl/lib:/home/jing/anaconda3/envs/gpu4pyscf_dev/lib`。
+
+| 检查 | 结果 |
+| --- | --- |
+| HF/PBE 独立 ETF 差分、能隙/原子顺序/态交换 | 4 passed |
+| 四方法、普通/DF 联合帧、重复调用及缓存失败处理 | 8 passed |
+| 完整/ETF scanner、DF 多梯度联合帧、DF 完整 NAC 差分、FSSH | 34 passed，13 subtests passed |
+| 修改的 Python 文件 Ruff、`git diff --check` | 通过 |
+
+在上述环境中运行以下定向命令；没有运行全库测试：
+
+```bash
+python -m pytest gpu4pyscf/nac/tests/test_nttda_etf.py \
+  gpu4pyscf/grad/tests/test_nttda_methods.py -k 'etf or joint_frame' -q
+python -m pytest \
+  gpu4pyscf/grad/tests/test_nttda_native.py::test_nac_scanner_uses_the_new_electronic_solution \
+  gpu4pyscf/grad/tests/test_ensemble_roks_nttda_df.py::test_compute_frame_batches_multiple_gradients_and_nac \
+  gpu4pyscf/grad/tests/test_ensemble_roks_nttda_df.py::test_df_nac_wavefunction_difference_and_joint_frame \
+  gpu4pyscf/fssh/tests/test_fssh_nttda.py -q
+```
+
+ETF 现在也执行已有的 CSF 轨道响应求解，计算量相应增加；本次未测量大型体系性能。
+DFT 仍采用不含网格响应的导数模型。本次修正未扩展 GPU 的自旋通道支持范围。
